@@ -355,6 +355,10 @@ def eval_steering_single_task(args_tuple):
         lm_model, winrate_baseline, lm_caches, steer_dataset_type = args_tuple
     
     # Create LanguageModel instance within the worker process
+    openai_base_url = os.environ.get("OPENAI_BASE_URL") or os.environ.get("OPENAI_API_BASE")
+    client_kwargs = {}
+    if openai_base_url:
+        client_kwargs["base_url"] = openai_base_url
     client = AsyncOpenAI(
         api_key=os.environ.get("OPENAI_API_KEY"),
         timeout=60.0,
@@ -366,6 +370,7 @@ def eval_steering_single_task(args_tuple):
             headers={"Connection": "close"},
         ),
         max_retries=3,
+        **client_kwargs,
     )
     lm_model = LanguageModel(
         lm_model,

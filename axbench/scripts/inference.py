@@ -292,6 +292,10 @@ def infer_steering(args, rank, world_size, device, logger, training_args, genera
         return
 
     # Create a new OpenAI client.
+    openai_base_url = os.environ.get("OPENAI_BASE_URL") or os.environ.get("OPENAI_API_BASE")
+    client_kwargs = {}
+    if openai_base_url:
+        client_kwargs["base_url"] = openai_base_url
     lm_client = AsyncOpenAI(
         api_key=os.environ.get("OPENAI_API_KEY"),
         timeout=60.0,
@@ -303,6 +307,7 @@ def infer_steering(args, rank, world_size, device, logger, training_args, genera
             headers={"Connection": "close"},
         ),
         max_retries=3,
+        **client_kwargs,
     )
 
     # Initialize the dataset factory with the tokenizer.
@@ -560,6 +565,10 @@ def infer_latent(args, rank, world_size, device, logger, training_args, generate
         return
 
     # Create a new OpenAI client.
+    openai_base_url = os.environ.get("OPENAI_BASE_URL") or os.environ.get("OPENAI_API_BASE")
+    client_kwargs = {}
+    if openai_base_url:
+        client_kwargs["base_url"] = openai_base_url
     client = AsyncOpenAI(
         api_key=os.environ.get("OPENAI_API_KEY"),
         timeout=60.0,
@@ -571,6 +580,7 @@ def infer_latent(args, rank, world_size, device, logger, training_args, generate
             headers={"Connection": "close"},
         ),
         max_retries=3,
+        **client_kwargs,
     )
 
     # Load tokenizer
@@ -766,6 +776,10 @@ def infer_latent_imbalance(args, rank, world_size, device, logger, training_args
     concept_ids = [metadata[i]["concept_id"] for i in range(len(metadata))]
 
     # Create a new OpenAI client.
+    openai_base_url = os.environ.get("OPENAI_BASE_URL") or os.environ.get("OPENAI_API_BASE")
+    client_kwargs = {}
+    if openai_base_url:
+        client_kwargs["base_url"] = openai_base_url
     client = AsyncOpenAI(
         api_key=os.environ.get("OPENAI_API_KEY"),
         timeout=60.0,
@@ -777,6 +791,7 @@ def infer_latent_imbalance(args, rank, world_size, device, logger, training_args
             headers={"Connection": "close"},
         ),
         max_retries=3,
+        **client_kwargs,
     )
 
     # Load tokenizer
@@ -926,6 +941,10 @@ def infer_latent_on_train_data(args, rank, world_size, device, logger, training_
         return
 
     # Create a new OpenAI client.
+    openai_base_url = os.environ.get("OPENAI_BASE_URL") or os.environ.get("OPENAI_API_BASE")
+    client_kwargs = {}
+    if openai_base_url:
+        client_kwargs["base_url"] = openai_base_url
     client = AsyncOpenAI(
         api_key=os.environ.get("OPENAI_API_KEY"),
         timeout=60.0,
@@ -937,6 +956,7 @@ def infer_latent_on_train_data(args, rank, world_size, device, logger, training_
             headers={"Connection": "close"},
         ),
         max_retries=3,
+        **client_kwargs,
     )
 
     dump_dir = Path(dump_dir) / "inference_on_train_data"

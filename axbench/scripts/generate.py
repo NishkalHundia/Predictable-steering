@@ -314,6 +314,10 @@ def generate_latent(generate_args, args):
         return
 
     # Create a new OpenAI client.
+    openai_base_url = os.environ.get("OPENAI_BASE_URL") or os.environ.get("OPENAI_API_BASE")
+    client_kwargs = {}
+    if openai_base_url:
+        client_kwargs["base_url"] = openai_base_url
     client = AsyncOpenAI(
         api_key=os.environ.get("OPENAI_API_KEY"),
         timeout=60.0,
@@ -325,6 +329,7 @@ def generate_latent(generate_args, args):
             headers={"Connection": "close"},
         ),
         max_retries=3,
+        **client_kwargs,
     )
 
     # Load tokenizer
@@ -387,6 +392,10 @@ def generate_training(args, generate_args):
         return
 
     # Create a new OpenAI client.
+    openai_base_url = os.environ.get("OPENAI_BASE_URL") or os.environ.get("OPENAI_API_BASE")
+    client_kwargs = {}
+    if openai_base_url:
+        client_kwargs["base_url"] = openai_base_url
     client = AsyncOpenAI(
         api_key=os.environ.get("OPENAI_API_KEY"),
         timeout=60.0,
@@ -398,6 +407,7 @@ def generate_training(args, generate_args):
             headers={"Connection": "close"},
         ),
         max_retries=3,
+        **client_kwargs,
     )
 
     # Load lm and tokenizer.
@@ -562,6 +572,10 @@ def generate_dpo_training(args, inference_args):
         return
 
     # Create a new OpenAI client.
+    openai_base_url = os.environ.get("OPENAI_BASE_URL") or os.environ.get("OPENAI_API_BASE")
+    client_kwargs = {}
+    if openai_base_url:
+        client_kwargs["base_url"] = openai_base_url
     client = AsyncOpenAI(
         api_key=os.environ.get("OPENAI_API_KEY"),
         timeout=60.0,
@@ -573,6 +587,7 @@ def generate_dpo_training(args, inference_args):
             headers={"Connection": "close"},
         ),
         max_retries=3,
+        **client_kwargs,
     )
 
     # Init the dataset factory.
