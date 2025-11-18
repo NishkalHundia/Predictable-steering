@@ -140,15 +140,19 @@ def main():
         concept_entries = concept_entries[: int(training_args.max_concepts)]
 
     logger.warning(f"Training GemmaScopeSAEDiffMean for {len(concept_entries)} concepts.")
+    new_concept_id = 0
     for entry in concept_entries:
-        concept_id = entry["concept_id"]
+        orig_concept_id = entry["concept_id"]
         concept_name = entry["concept"]
-        logger.warning(f"Processing concept_id={concept_id} ({concept_name})")
+        logger.warning(f"Processing concept (orig_id={orig_concept_id}) -> new_id={new_concept_id} ({concept_name})")
 
-        concept_df = all_df[all_df["concept_id"] == concept_id].copy()
+        concept_df = all_df[all_df["concept_id"] == orig_concept_id].copy()
         if concept_df.empty:
-            logger.warning(f"No training data for concept_id {concept_id}, skipping.")
+            logger.warning(f"No training data for concept_id {orig_concept_id}, skipping.")
             continue
+
+        concept_df = concept_df.copy()
+        concept_df["concept_id"] = new_concept_id
 
         prepared_df = prepare_df(
             concept_df,
@@ -168,16 +172,19 @@ def main():
         )
 
         if prepared_df.empty:
-            logger.warning(f"Prepared dataframe empty for concept_id {concept_id}, skipping.")
+            logger.warning(f"Prepared dataframe empty for concept_id {orig_concept_id}, skipping.")
             continue
 
         diffmean_model.train(prepared_df, prefix_length=prefix_length, metadata_path=str(metadata_path))
         diffmean_model.save(dump_dir, model_name=diffmean_model.__str__())
 
+        entry_copy = dict(entry)
+        entry_copy["concept_id"] = new_concept_id
         with open(metadata_out_path, "a", encoding="utf-8") as fout:
-            fout.write(json.dumps(entry) + "\n")
+            fout.write(json.dumps(entry_copy) + "\n")
 
         torch.cuda.empty_cache()
+        new_concept_id += 1
 
     logger.warning("GemmaScopeSAEDiffMean training completed.")
 
