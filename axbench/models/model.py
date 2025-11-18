@@ -312,7 +312,8 @@ class Model(BaseModel):
                 input_strings = batch_examples['steered_input'].tolist()
             else:
                 input_strings = batch_examples['input'].tolist()
-            mag = torch.tensor(batch_examples['factor'].tolist()).to(self.device)
+            mag_list = [float(x) for x in batch_examples['factor'].tolist()]
+            mag = torch.tensor(mag_list, dtype=torch.float32).to(self.device)
             idx = torch.tensor(batch_examples["concept_id"].tolist()).to(self.device)
             max_acts = torch.tensor([
                 self.max_activations.get(id, 1.0) 
