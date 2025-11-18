@@ -301,7 +301,10 @@ class GemmaScopeSAEDiffMean(MeanActivation):
         positive_count = 0
         negative_count = 0
         num_training_steps = self.training_args.n_epochs * len(train_dataloader)
-        rank = torch.distributed.get_rank()
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            rank = torch.distributed.get_rank()
+        else:
+            rank = 0
         progress_bar, curr_step = tqdm(range(num_training_steps), position=rank, leave=True), 0
         
         for epoch in range(self.training_args.n_epochs):
