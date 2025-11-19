@@ -25,7 +25,7 @@ uv run bash axbench/data/download-2b.sh
 uv run bash axbench/data/download-alpaca.sh
 
 # ----- 2. Train DiffMean on 10 random Concept500 concepts (Gemma-2 2B, layer 10) -----
-uv run torchrun --nproc_per_node=1 axbench/scripts/train.py --config axbench/sweep/custom/2b/l10/diffmean.yaml --dump_dir axbench/results/top10_diffmean --overwrite_data_dir axbench/concept500/prod_2b_l10_v1/generate --max_concepts 10 --output_length 128 --use_wandb False
+uv run torchrun --nproc_per_node=1 axbench/scripts/train.py --config axbench/sweep/custom/2b/l10/diffmean.yaml --dump_dir axbench/results/top100_diffmean --overwrite_data_dir axbench/concept500/prod_2b_l10_v1/generate --max_concepts 100 --output_length 128 --use_wandb False
 
 # ----- 3. Latent (concept-detection) inference -----
 uv run torchrun --nproc_per_node=1 axbench/scripts/inference.py --config axbench/sweep/custom/2b/l10/diffmean.yaml --dump_dir axbench/results/top10_diffmean --overwrite_metadata_dir axbench/results/top10_diffmean/train --overwrite_inference_data_dir axbench/concept500/prod_2b_l10_v1/inference --mode latent

@@ -7,12 +7,12 @@ generate:
   master_data_dir: "axbench/data"
   dataset_category: "instruction"
   lm_use_cache: false
-  seed: 43
+  seed: 124
 train:
   model_name: "google/gemma-2-2b-it"
   layer: 10
   component: "res"
-  seed: 43
+  seed: 124
   use_bf16: true
   models:
     DiffMean:
@@ -34,9 +34,9 @@ inference:
   steering_output_length: 128
   steering_layers: [10]
   steering_num_of_examples: 10
-  steering_factors: [1.0, 2.0, 3.0]
+  steering_factors: [1.0, 2.0, 3.0, 3.5, 4.0, 5.0]
   master_data_dir: "axbench/data"
-  seed: 43
+  seed: 124
   lm_model: "gpt-4o-mini"
   temperature: 1.0
 evaluate:
