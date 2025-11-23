@@ -133,9 +133,9 @@ def _plot_pca(points: np.ndarray, labels: np.ndarray, title: str, output_path: P
     coords = pca.fit_transform(points)
     colors = ["#1f77b4" if label == 1 else "#d62728" for label in labels]
 
-    plt.figure()
+    plt.figure(figsize=(10, 8))
     plt.scatter(coords[:, 0], coords[:, 1], c=colors, alpha=0.75, edgecolors="k", linewidths=0.5)
-    plt.title(title)
+    plt.title(title, fontsize=10, wrap=True)
     plt.xlabel("PC1")
     plt.ylabel("PC2")
     plt.legend(
@@ -146,7 +146,7 @@ def _plot_pca(points: np.ndarray, labels: np.ndarray, title: str, output_path: P
         loc="best",
     )
     plt.tight_layout()
-    plt.savefig(output_path, dpi=300)
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
     plt.close()
 
 
