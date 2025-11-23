@@ -31,7 +31,10 @@ def _prepare_examples_from_parquet(
     num_examples: int,
     seed: int,
 ) -> pd.DataFrame:
-    """Load contrastive pairs from existing train_data.parquet by concept_id."""
+    """
+    Load contrastive pairs from existing train_data.parquet by concept_id.
+    Follows the same logic as train.py prepare_df().
+    """
     df = pd.read_parquet(train_parquet)
     
     # Filter by concept_id
@@ -40,10 +43,9 @@ def _prepare_examples_from_parquet(
     if concept_df.empty:
         raise ValueError(f"No rows found for concept_id={concept_id} in {train_parquet}.")
     
-    # Split positive/negative based on labels column (like DiffMean.train does)
-    # The parquet has a 'labels' column (not 'label')
-    positive = concept_df[concept_df["labels"] == 1]
-    negative = concept_df[concept_df["labels"] == 0]
+    # Split positive/negative based on category column (like train.py does)
+    positive = concept_df[concept_df["category"] == "positive"]
+    negative = concept_df[concept_df["category"] == "negative"]
     
     if positive.empty or negative.empty:
         raise ValueError(f"Missing positive or negative examples for concept_id={concept_id}.")
@@ -55,6 +57,8 @@ def _prepare_examples_from_parquet(
         negative = negative.sample(n=num_examples, random_state=seed)
     
     # Add a 'label' column for PCA plotting
+    positive = positive.copy()
+    negative = negative.copy()
     positive["label"] = 1
     negative["label"] = 0
     
