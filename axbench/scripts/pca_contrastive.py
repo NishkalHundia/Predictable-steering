@@ -163,7 +163,9 @@ def main():
     parser.add_argument("--metadata_jsonl", type=str, required=True, help="Path to metadata.jsonl file.")
     args = parser.parse_args()
 
-    output_dir = Path(args.output_dir)
+    # Create output directory structure: output_dir/model_name/concept_id/
+    model_name = args.model_id.replace("/", "_")
+    output_dir = Path(args.output_dir) / model_name / f"concept_{args.concept_id}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     set_seed(args.seed)
