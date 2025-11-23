@@ -1,5 +1,4 @@
 import argparse
-import json
 import os
 import random
 from pathlib import Path
@@ -8,7 +7,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
-from openai import AsyncOpenAI
 from sklearn.decomposition import PCA
 from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
 
@@ -25,20 +23,6 @@ logging.basicConfig(
     level=logging.WARN,
 )
 logger = logging.getLogger(__name__)
-
-
-def _build_openai_client(base_url: str | None):
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        raise ValueError("OPENAI_API_KEY must be set.")
-    client_kwargs = {
-        "api_key": api_key,
-        "timeout": 60.0,
-        "max_retries": 3,
-    }
-    if base_url:
-        client_kwargs["base_url"] = base_url
-    return AsyncOpenAI(**client_kwargs)
 
 
 def _select_negative_examples(negative_df: pd.DataFrame, genre: str, num: int, seed: int) -> pd.DataFrame:
@@ -71,6 +55,33 @@ def _prepare_contrastive_examples(
     negative_df["label"] = 0
 
     combined = pd.concat([positive_df, negative_df], ignore_index=True)
+    combined.reset_index(drop=True, inplace=True)
+    return combined
+
+
+def _prepare_examples_from_parquet(
+    train_parquet: Path,
+    concept: str,
+    num_examples: int,
+    seed: int,
+) -> pd.DataFrame:
+    df = pd.read_parquet(train_parquet)
+    positive_pool = df[(df["output_concept"] == concept) & (df["category"] == "positive")]
+    negative_pool = df[(df["output_concept"] == concept) & (df["category"] == "negative")]
+
+    if positive_pool.empty or negative_pool.empty:
+        raise ValueError(f"No positive/negative pairs found in {train_parquet} for concept '{concept}'.")
+
+    rng = np.random.default_rng(seed)
+    pos_indices = rng.choice(len(positive_pool), size=min(len(positive_pool), num_examples), replace=False)
+    neg_indices = rng.choice(len(negative_pool), size=min(len(negative_pool), num_examples), replace=False)
+
+    positives = positive_pool.iloc[pos_indices].copy()
+    negatives = negative_pool.iloc[neg_indices].copy()
+    positives["label"] = 1
+    negatives["label"] = 0
+
+    combined = pd.concat([positives, negatives], ignore_index=True)
     combined.reset_index(drop=True, inplace=True)
     return combined
 
@@ -179,8 +190,7 @@ def main():
     parser.add_argument("--output_dir", required=True, help="Directory to save PCA plots and CSV.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--use_bf16", action="store_true", help="Load model weights in bfloat16.")
-    parser.add_argument("--openai_model", default="gpt-4o-mini", help="Model used for generating contrastive pairs.")
-    parser.add_argument("--master_data_dir", default="axbench/data", help="Directory with seed sentences/instructions.")
+    parser.add_argument("--train_parquet", type=str, required=True, help="Path to existing train_data.parquet containing contrastive pairs.")
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -211,32 +221,13 @@ def main():
         raise ValueError(f"concept_index {args.concept_index} out of range (0-{len(concepts)-1})")
     concept = concepts[args.concept_index]
 
-    base_url = os.environ.get("OPENAI_BASE_URL") or os.environ.get("OPENAI_API_BASE")
-    client = _build_openai_client(base_url)
-    cache_dir = output_dir / "contrastive_cache"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-
-    dataset_factory = DatasetFactory(
-        base_model,
-        client,
-        tokenizer,
-        args.dataset_category,
-        args.num_examples,
-        args.output_length,
-        str(cache_dir),
-        use_cache=True,
-        master_data_dir=args.master_data_dir,
-        lm_model=args.openai_model,
-        seed=args.seed,
-    )
-
-    examples = _prepare_contrastive_examples(
-        dataset_factory,
+    examples = _prepare_examples_from_parquet(
+        Path(args.train_parquet),
         concept,
         args.num_examples,
-        args.output_length,
         args.seed,
     )
+
     logger.warning(f"Prepared {len(examples)} contrastive rows (concept={concept}).")
 
     last_vecs, mean_vecs, labels = _collect_activations(
