@@ -1,7 +1,9 @@
+"""
+PCA analysis script for contrastive pair activations.
+Follows the same data loading logic as train.py.
+"""
 import argparse
-import json
 import os
-import random
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -12,8 +14,7 @@ from sklearn.decomposition import PCA
 from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
 
 from axbench.utils.constants import CHAT_MODELS
-from axbench.utils.model_utils import gather_residual_activations
-from axbench.scripts.generate import load_concepts
+from axbench.utils.model_utils import gather_residual_activations, get_prefix_length
 
 import logging
 
@@ -25,45 +26,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def _prepare_examples_from_parquet(
-    train_parquet: Path,
-    concept_id: int,
-    num_examples: int,
-    seed: int,
-) -> pd.DataFrame:
-    """
-    Load contrastive pairs from existing train_data.parquet by concept_id.
-    Follows the same logic as train.py prepare_df().
-    """
+def load_concept_data(train_parquet: Path, concept_id: int) -> pd.DataFrame:
+    """Load data for a specific concept_id from train_data.parquet."""
     df = pd.read_parquet(train_parquet)
-    
-    # Filter by concept_id
-    concept_df = df[df["concept_id"] == concept_id].copy()
-    
+    concept_df = df[df['concept_id'] == concept_id]
     if concept_df.empty:
         raise ValueError(f"No rows found for concept_id={concept_id} in {train_parquet}.")
-    
-    # Split positive/negative based on category column (like train.py does)
-    positive = concept_df[concept_df["category"] == "positive"]
-    negative = concept_df[concept_df["category"] == "negative"]
-    
-    if positive.empty or negative.empty:
-        raise ValueError(f"Missing positive or negative examples for concept_id={concept_id}.")
-    
-    # Sample
-    if len(positive) > num_examples:
-        positive = positive.sample(n=num_examples, random_state=seed)
-    if len(negative) > num_examples:
-        negative = negative.sample(n=num_examples, random_state=seed)
-    
-    # Add a 'label' column for PCA plotting
-    positive = positive.copy()
-    negative = negative.copy()
-    positive["label"] = 1
-    negative["label"] = 0
-    
-    combined = pd.concat([positive, negative], ignore_index=True)
-    return combined
+    return concept_df
 
 
 def _collect_activations(
@@ -71,9 +40,13 @@ def _collect_activations(
     tokenizer,
     examples: pd.DataFrame,
     layer: int,
+    prefix_length: int,
     device,
-    is_chat_model: bool,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Collect activations from the model for given examples.
+    Returns last token vectors, mean output vectors, and labels.
+    """
     last_vectors = []
     mean_vectors = []
     labels = []
@@ -82,61 +55,53 @@ def _collect_activations(
         prompt = row.input
         completion = row.output or ""
 
-        if is_chat_model:
-            messages_prompt = [{"role": "user", "content": prompt}]
-            prompt_ids = tokenizer.apply_chat_template(
-                messages_prompt,
-                tokenize=True,
-                add_generation_prompt=True,
-            )
+        # Apply chat template
+        messages_prompt = [{"role": "user", "content": prompt}]
+        prompt_ids = tokenizer.apply_chat_template(
+            messages_prompt,
+            tokenize=True,
+            add_generation_prompt=True,
+        )
 
-            messages_full = [
-                {"role": "user", "content": prompt},
-                {"role": "assistant", "content": completion},
-            ]
-            full_ids = tokenizer.apply_chat_template(
-                messages_full,
-                tokenize=True,
-                add_generation_prompt=False,
-            )
+        messages_full = [
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": completion},
+        ]
+        full_ids = tokenizer.apply_chat_template(
+            messages_full,
+            tokenize=True,
+            add_generation_prompt=False,
+        )
 
-            prompt_tensor = torch.tensor([prompt_ids], dtype=torch.long, device=device)
-            full_tensor = torch.tensor([full_ids], dtype=torch.long, device=device)
-        else:
-            prompt_tokens = tokenizer(prompt, return_tensors="pt", add_special_tokens=True)
-            completion_text = tokenizer.eos_token.join([prompt.rstrip(), completion.rstrip()])
-            combined_tokens = tokenizer(
-                completion_text,
-                return_tensors="pt",
-                add_special_tokens=True,
-            )
-            prompt_tensor = {k: v.to(device) for k, v in prompt_tokens.items()}
-            full_tensor = {k: v.to(device) for k, v in combined_tokens.items()}
-
-        if is_chat_model:
-            prompt_len = prompt_tensor.shape[1]
-            combined_len = full_tensor.shape[1]
-            attention_mask = torch.ones_like(full_tensor)
-            inputs = {"input_ids": full_tensor, "attention_mask": attention_mask}
-        else:
-            prompt_len = prompt_tensor["input_ids"].shape[1]
-            combined_len = full_tensor["input_ids"].shape[1]
-            inputs = full_tensor
-
+        prompt_tensor = torch.tensor([prompt_ids], dtype=torch.long, device=device)
+        full_tensor = torch.tensor([full_ids], dtype=torch.long, device=device)
+        
+        prompt_len = prompt_tensor.shape[1]
+        combined_len = full_tensor.shape[1]
         output_len = combined_len - prompt_len
+
         if output_len <= 0:
             logger.warning("Skipping example with non-positive generated length.")
             continue
 
+        attention_mask = torch.ones_like(full_tensor)
+        inputs = {"input_ids": full_tensor, "attention_mask": attention_mask}
+
+        # Gather activations at target layer
         activations = gather_residual_activations(model, layer, inputs).squeeze(0).detach().cpu().numpy()
-        last_vectors.append(activations[-1])
-        mean_vectors.append(activations[-output_len:].mean(axis=0))
+        
+        # Extract output token activations (after prefix_length)
+        output_activations = activations[prefix_length:]
+        
+        last_vectors.append(output_activations[-1])
+        mean_vectors.append(output_activations[-output_len:].mean(axis=0))
         labels.append(row.label)
 
     return np.stack(last_vectors), np.stack(mean_vectors), np.array(labels)
 
 
 def _plot_pca(points: np.ndarray, labels: np.ndarray, title: str, output_path: Path):
+    """Generate and save a PCA plot."""
     pca = PCA(n_components=2)
     coords = pca.fit_transform(points)
     colors = ["#1f77b4" if label == 1 else "#d62728" for label in labels]
@@ -174,7 +139,6 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     set_seed(args.seed)
-    random.seed(args.seed)
 
     logger.warning(f"Loading base model {args.model_id}")
     base_model = AutoModelForCausalLM.from_pretrained(
@@ -192,14 +156,33 @@ def main():
         base_model.resize_token_embeddings(len(tokenizer))
 
     is_chat_model = args.model_id in CHAT_MODELS
+    prefix_length = get_prefix_length(tokenizer) if is_chat_model else 1
 
-    examples = _prepare_examples_from_parquet(
-        Path(args.train_parquet),
-        args.concept_id,
-        args.num_examples,
-        args.seed,
-    )
-
+    # Load concept data
+    concept_df = load_concept_data(Path(args.train_parquet), args.concept_id)
+    
+    # Split positive/negative (following train.py logic)
+    positive_df = concept_df[concept_df["category"] == "positive"]
+    negative_df = concept_df[concept_df["category"] == "negative"]
+    
+    logger.warning(f"Found {len(positive_df)} positive and {len(negative_df)} negative examples for concept_id={args.concept_id}")
+    
+    if positive_df.empty or negative_df.empty:
+        raise ValueError(f"Missing positive or negative examples for concept_id={args.concept_id}.")
+    
+    # Sample
+    if len(positive_df) > args.num_examples:
+        positive_df = positive_df.sample(n=args.num_examples, random_state=args.seed)
+    if len(negative_df) > args.num_examples:
+        negative_df = negative_df.sample(n=args.num_examples, random_state=args.seed)
+    
+    # Add label column
+    positive_df = positive_df.copy()
+    negative_df = negative_df.copy()
+    positive_df["label"] = 1
+    negative_df["label"] = 0
+    
+    examples = pd.concat([positive_df, negative_df], ignore_index=True)
     logger.warning(f"Prepared {len(examples)} contrastive rows for concept_id={args.concept_id}.")
 
     last_vecs, mean_vecs, labels = _collect_activations(
@@ -207,8 +190,8 @@ def main():
         tokenizer,
         examples,
         args.layer,
+        prefix_length,
         device,
-        is_chat_model,
     )
 
     _plot_pca(
@@ -238,4 +221,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
