@@ -40,9 +40,10 @@ def _prepare_examples_from_parquet(
     if concept_df.empty:
         raise ValueError(f"No rows found for concept_id={concept_id} in {train_parquet}.")
     
-    # Split positive/negative based on label column (like DiffMean.train does)
-    positive = concept_df[concept_df["label"] == 1]
-    negative = concept_df[concept_df["label"] == 0]
+    # Split positive/negative based on labels column (like DiffMean.train does)
+    # The parquet has a 'labels' column (not 'label')
+    positive = concept_df[concept_df["labels"] == 1]
+    negative = concept_df[concept_df["labels"] == 0]
     
     if positive.empty or negative.empty:
         raise ValueError(f"Missing positive or negative examples for concept_id={concept_id}.")
@@ -52,6 +53,10 @@ def _prepare_examples_from_parquet(
         positive = positive.sample(n=num_examples, random_state=seed)
     if len(negative) > num_examples:
         negative = negative.sample(n=num_examples, random_state=seed)
+    
+    # Add a 'label' column for PCA plotting
+    positive["label"] = 1
+    negative["label"] = 0
     
     combined = pd.concat([positive, negative], ignore_index=True)
     return combined
