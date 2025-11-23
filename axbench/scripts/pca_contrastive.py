@@ -154,7 +154,7 @@ def main():
     parser = argparse.ArgumentParser(description="PCA analysis of contrastive pairs at a target model layer.")
     parser.add_argument("--model_id", required=True, help="HuggingFace model identifier (e.g. google/gemma-2-2b-it).")
     parser.add_argument("--layer", type=int, required=True, help="Target layer index for activations.")
-    parser.add_argument("--concept_id", type=int, required=True, help="Concept ID to analyze (from train_data.parquet).")
+    parser.add_argument("--concept_ids", type=int, nargs="+", required=True, help="Concept ID(s) to analyze (from train_data.parquet). Can specify multiple.")
     parser.add_argument("--num_examples", type=int, default=20, help="Number of positive (and negative) examples.")
     parser.add_argument("--output_dir", required=True, help="Directory to save PCA plots and CSV.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
@@ -162,11 +162,6 @@ def main():
     parser.add_argument("--train_parquet", type=str, required=True, help="Path to existing train_data.parquet containing contrastive pairs.")
     parser.add_argument("--metadata_jsonl", type=str, required=True, help="Path to metadata.jsonl file.")
     args = parser.parse_args()
-
-    # Create output directory structure: output_dir/model_name/concept_id/
-    model_name = args.model_id.replace("/", "_")
-    output_dir = Path(args.output_dir) / model_name / f"concept_{args.concept_id}"
-    output_dir.mkdir(parents=True, exist_ok=True)
 
     set_seed(args.seed)
 
@@ -188,65 +183,78 @@ def main():
     is_chat_model = args.model_id in CHAT_MODELS
     prefix_length = get_prefix_length(tokenizer) if is_chat_model else 1
 
-    # Load concept data (following train.py logic exactly)
-    positive_df, negative_df, concept = load_concept_data(
-        Path(args.train_parquet),
-        Path(args.metadata_jsonl),
-        args.concept_id
-    )
+    model_name = args.model_id.replace("/", "_")
     
-    logger.warning(f"Found {len(positive_df)} positive and {len(negative_df)} negative examples for concept_id={args.concept_id} ({concept})")
-    
-    if positive_df.empty or negative_df.empty:
-        raise ValueError(f"Missing positive or negative examples for concept_id={args.concept_id}.")
-    
-    # Sample
-    if len(positive_df) > args.num_examples:
-        positive_df = positive_df.sample(n=args.num_examples, random_state=args.seed)
-    if len(negative_df) > args.num_examples:
-        negative_df = negative_df.sample(n=args.num_examples, random_state=args.seed)
-    
-    # Add label column
-    positive_df = positive_df.copy()
-    negative_df = negative_df.copy()
-    positive_df["label"] = 1
-    negative_df["label"] = 0
-    
-    examples = pd.concat([positive_df, negative_df], ignore_index=True)
-    logger.warning(f"Prepared {len(examples)} contrastive rows for concept_id={args.concept_id}.")
+    # Process each concept_id
+    for concept_id in args.concept_ids:
+        logger.warning(f"\n{'='*60}\nProcessing concept_id={concept_id}\n{'='*60}")
+        
+        # Create output directory structure: output_dir/model_name/concept_id/
+        output_dir = Path(args.output_dir) / model_name / f"concept_{concept_id}"
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-    last_vecs, mean_vecs, labels = _collect_activations(
-        base_model,
-        tokenizer,
-        examples,
-        args.layer,
-        prefix_length,
-        device,
-    )
+        # Load concept data (following train.py logic exactly)
+        positive_df, negative_df, concept = load_concept_data(
+            Path(args.train_parquet),
+            Path(args.metadata_jsonl),
+            concept_id
+        )
+        
+        logger.warning(f"Found {len(positive_df)} positive and {len(negative_df)} negative examples for concept_id={concept_id} ({concept})")
+        
+        if positive_df.empty or negative_df.empty:
+            logger.warning(f"Skipping concept_id={concept_id}: Missing positive or negative examples.")
+            continue
+        
+        # Sample
+        if len(positive_df) > args.num_examples:
+            positive_df = positive_df.sample(n=args.num_examples, random_state=args.seed)
+        if len(negative_df) > args.num_examples:
+            negative_df = negative_df.sample(n=args.num_examples, random_state=args.seed)
+        
+        # Add label column
+        positive_df = positive_df.copy()
+        negative_df = negative_df.copy()
+        positive_df["label"] = 1
+        negative_df["label"] = 0
+        
+        examples = pd.concat([positive_df, negative_df], ignore_index=True)
+        logger.warning(f"Prepared {len(examples)} contrastive rows for concept_id={concept_id}.")
 
-    _plot_pca(
-        last_vecs,
-        labels,
-        f"Concept {args.concept_id}: {concept} – Last Token PCA",
-        output_dir / "pca_last_token.png",
-    )
-    _plot_pca(
-        mean_vecs,
-        labels,
-        f"Concept {args.concept_id}: {concept} – Mean Output Tokens PCA",
-        output_dir / "pca_mean_output.png",
-    )
+        last_vecs, mean_vecs, labels = _collect_activations(
+            base_model,
+            tokenizer,
+            examples,
+            args.layer,
+            prefix_length,
+            device,
+        )
 
-    last_coords = PCA(n_components=2).fit_transform(last_vecs)
-    mean_coords = PCA(n_components=2).fit_transform(mean_vecs)
-    csv_df = pd.DataFrame({
-        "label": np.concatenate([labels, labels]),
-        "type": ["last"] * len(labels) + ["mean"] * len(labels),
-        "pc1": np.concatenate([last_coords[:, 0], mean_coords[:, 0]]),
-        "pc2": np.concatenate([last_coords[:, 1], mean_coords[:, 1]]),
-    })
-    csv_df.to_csv(output_dir / "pca_projection.csv", index=False)
-    logger.warning(f"PCA artifacts saved to {output_dir}")
+        _plot_pca(
+            last_vecs,
+            labels,
+            f"Concept {concept_id}: {concept} – Last Token PCA",
+            output_dir / "pca_last_token.png",
+        )
+        _plot_pca(
+            mean_vecs,
+            labels,
+            f"Concept {concept_id}: {concept} – Mean Output Tokens PCA",
+            output_dir / "pca_mean_output.png",
+        )
+
+        last_coords = PCA(n_components=2).fit_transform(last_vecs)
+        mean_coords = PCA(n_components=2).fit_transform(mean_vecs)
+        csv_df = pd.DataFrame({
+            "label": np.concatenate([labels, labels]),
+            "type": ["last"] * len(labels) + ["mean"] * len(labels),
+            "pc1": np.concatenate([last_coords[:, 0], mean_coords[:, 0]]),
+            "pc2": np.concatenate([last_coords[:, 1], mean_coords[:, 1]]),
+        })
+        csv_df.to_csv(output_dir / "pca_projection.csv", index=False)
+        logger.warning(f"PCA artifacts saved to {output_dir}")
+    
+    logger.warning(f"\n{'='*60}\nCompleted PCA analysis for {len(args.concept_ids)} concept(s)\n{'='*60}")
 
 
 if __name__ == "__main__":
