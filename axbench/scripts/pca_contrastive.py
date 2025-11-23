@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import random
 from pathlib import Path
@@ -12,7 +13,6 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
 
 from axbench.utils.constants import CHAT_MODELS
 from axbench.utils.model_utils import gather_residual_activations
-from axbench.utils.dataset import DatasetFactory
 from axbench.scripts.generate import load_concepts
 
 import logging
@@ -25,59 +25,49 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def _select_negative_examples(negative_df: pd.DataFrame, genre: str, num: int, seed: int) -> pd.DataFrame:
-    genre_pool = negative_df[negative_df["concept_genre"] == genre]
-    if genre_pool.empty:
-        raise ValueError(f"No negative examples available for genre '{genre}'.")
-    replace = len(genre_pool) < num
-    return genre_pool.sample(n=num, replace=replace, random_state=seed).copy()
-
-
-def _prepare_contrastive_examples(
-    dataset_factory: DatasetFactory,
-    concept: str,
-    num_examples: int,
-    output_length: int,
-    seed: int,
-) -> pd.DataFrame:
-    concept_genres = dataset_factory.prepare_genre_concepts([concept])
-    genre = concept_genres[concept][0]
-
-    positive_df = dataset_factory.create_train_df(
-        concept,
-        num_examples,
-        concept_genres,
-        output_length=output_length,
-    )
-    negative_df = _select_negative_examples(dataset_factory.negative_df, genre, num_examples, seed)
-
-    positive_df["label"] = 1
-    negative_df["label"] = 0
-
-    combined = pd.concat([positive_df, negative_df], ignore_index=True)
-    combined.reset_index(drop=True, inplace=True)
-    return combined
-
-
 def _prepare_examples_from_parquet(
     train_parquet: Path,
+    metadata_jsonl: Path,
     concept: str,
     num_examples: int,
     seed: int,
 ) -> pd.DataFrame:
     df = pd.read_parquet(train_parquet)
-    positive_pool = df[(df["output_concept"] == concept) & (df["category"] == "positive")]
-    negative_pool = df[(df["output_concept"] == concept) & (df["category"] == "negative")]
+
+    concept_id = None
+    with open(metadata_jsonl, "r", encoding="utf-8") as f:
+        for line in f:
+            entry = json.loads(line)
+            if entry["concept"] == concept:
+                concept_id = entry["concept_id"]
+                break
+    if concept_id is None:
+        raise ValueError(f"Concept '{concept}' not found in metadata {metadata_jsonl}.")
+
+    concept_df = df[df["concept_id"] == concept_id]
+    if concept_df.empty:
+        raise ValueError(f"No rows found for concept_id {concept_id} in {train_parquet}.")
+
+    positive_pool = concept_df[concept_df["category"] == "positive"]
+    negative_pool = concept_df[concept_df["category"] == "negative"]
+    if negative_pool.empty:
+        negative_pool = concept_df[concept_df["category"].isin(["negative", "hard negative"])]
 
     if positive_pool.empty or negative_pool.empty:
-        raise ValueError(f"No positive/negative pairs found in {train_parquet} for concept '{concept}'.")
+        raise ValueError(f"No positive/negative rows available for concept '{concept}' (id {concept_id}).")
 
     rng = np.random.default_rng(seed)
-    pos_indices = rng.choice(len(positive_pool), size=min(len(positive_pool), num_examples), replace=False)
-    neg_indices = rng.choice(len(negative_pool), size=min(len(negative_pool), num_examples), replace=False)
 
-    positives = positive_pool.iloc[pos_indices].copy()
-    negatives = negative_pool.iloc[neg_indices].copy()
+    def _sample(pool: pd.DataFrame, n: int) -> pd.DataFrame:
+        if len(pool) >= n:
+            idx = rng.choice(len(pool), size=n, replace=False)
+        else:
+            idx = rng.choice(len(pool), size=n, replace=True)
+        return pool.iloc[idx].copy()
+
+    positives = _sample(positive_pool, num_examples)
+    negatives = _sample(negative_pool, num_examples)
+
     positives["label"] = 1
     negatives["label"] = 0
 
@@ -184,13 +174,12 @@ def main():
     parser.add_argument("--layer", type=int, required=True, help="Target layer index for activations.")
     parser.add_argument("--concept_path", required=True, help="Path to concept list (txt/csv/json).")
     parser.add_argument("--concept_index", type=int, required=True, help="Index of the concept to analyze.")
-    parser.add_argument("--dataset_category", default="instruction", choices=["instruction", "continuation"])
     parser.add_argument("--num_examples", type=int, default=20, help="Number of positive (and negative) examples.")
-    parser.add_argument("--output_length", type=int, default=128, help="Max generation length for each example.")
     parser.add_argument("--output_dir", required=True, help="Directory to save PCA plots and CSV.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--use_bf16", action="store_true", help="Load model weights in bfloat16.")
     parser.add_argument("--train_parquet", type=str, required=True, help="Path to existing train_data.parquet containing contrastive pairs.")
+    parser.add_argument("--metadata_jsonl", type=str, required=True, help="Metadata jsonl mapping concept ids (e.g. .../metadata.jsonl).")
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -223,6 +212,7 @@ def main():
 
     examples = _prepare_examples_from_parquet(
         Path(args.train_parquet),
+        Path(args.metadata_jsonl),
         concept,
         args.num_examples,
         args.seed,
