@@ -27,52 +27,33 @@ logger = logging.getLogger(__name__)
 
 def _prepare_examples_from_parquet(
     train_parquet: Path,
-    metadata_jsonl: Path,
-    concept: str,
+    concept_id: int,
     num_examples: int,
     seed: int,
 ) -> pd.DataFrame:
+    """Load contrastive pairs from existing train_data.parquet by concept_id."""
     df = pd.read_parquet(train_parquet)
-
-    concept_id = None
-    with open(metadata_jsonl, "r", encoding="utf-8") as f:
-        for line in f:
-            entry = json.loads(line)
-            if entry["concept"] == concept:
-                concept_id = entry["concept_id"]
-                break
-    if concept_id is None:
-        raise ValueError(f"Concept '{concept}' not found in metadata {metadata_jsonl}.")
-
-    concept_df = df[df["concept_id"] == concept_id]
+    
+    # Filter by concept_id
+    concept_df = df[df["concept_id"] == concept_id].copy()
+    
     if concept_df.empty:
-        raise ValueError(f"No rows found for concept_id {concept_id} in {train_parquet}.")
-
-    positive_pool = concept_df[concept_df["category"] == "positive"]
-    negative_pool = concept_df[concept_df["category"] == "negative"]
-    if negative_pool.empty:
-        negative_pool = concept_df[concept_df["category"].isin(["negative", "hard negative"])]
-
-    if positive_pool.empty or negative_pool.empty:
-        raise ValueError(f"No positive/negative rows available for concept '{concept}' (id {concept_id}).")
-
-    rng = np.random.default_rng(seed)
-
-    def _sample(pool: pd.DataFrame, n: int) -> pd.DataFrame:
-        if len(pool) >= n:
-            idx = rng.choice(len(pool), size=n, replace=False)
-        else:
-            idx = rng.choice(len(pool), size=n, replace=True)
-        return pool.iloc[idx].copy()
-
-    positives = _sample(positive_pool, num_examples)
-    negatives = _sample(negative_pool, num_examples)
-
-    positives["label"] = 1
-    negatives["label"] = 0
-
-    combined = pd.concat([positives, negatives], ignore_index=True)
-    combined.reset_index(drop=True, inplace=True)
+        raise ValueError(f"No rows found for concept_id={concept_id} in {train_parquet}.")
+    
+    # Split positive/negative based on label column (like DiffMean.train does)
+    positive = concept_df[concept_df["label"] == 1]
+    negative = concept_df[concept_df["label"] == 0]
+    
+    if positive.empty or negative.empty:
+        raise ValueError(f"Missing positive or negative examples for concept_id={concept_id}.")
+    
+    # Sample
+    if len(positive) > num_examples:
+        positive = positive.sample(n=num_examples, random_state=seed)
+    if len(negative) > num_examples:
+        negative = negative.sample(n=num_examples, random_state=seed)
+    
+    combined = pd.concat([positive, negative], ignore_index=True)
     return combined
 
 
@@ -172,14 +153,12 @@ def main():
     parser = argparse.ArgumentParser(description="PCA analysis of contrastive pairs at a target model layer.")
     parser.add_argument("--model_id", required=True, help="HuggingFace model identifier (e.g. google/gemma-2-2b-it).")
     parser.add_argument("--layer", type=int, required=True, help="Target layer index for activations.")
-    parser.add_argument("--concept_path", required=True, help="Path to concept list (txt/csv/json).")
-    parser.add_argument("--concept_index", type=int, required=True, help="Index of the concept to analyze.")
+    parser.add_argument("--concept_id", type=int, required=True, help="Concept ID to analyze (from train_data.parquet).")
     parser.add_argument("--num_examples", type=int, default=20, help="Number of positive (and negative) examples.")
     parser.add_argument("--output_dir", required=True, help="Directory to save PCA plots and CSV.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--use_bf16", action="store_true", help="Load model weights in bfloat16.")
     parser.add_argument("--train_parquet", type=str, required=True, help="Path to existing train_data.parquet containing contrastive pairs.")
-    parser.add_argument("--metadata_jsonl", type=str, required=True, help="Metadata jsonl mapping concept ids (e.g. .../metadata.jsonl).")
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -205,20 +184,14 @@ def main():
 
     is_chat_model = args.model_id in CHAT_MODELS
 
-    concepts, refs = load_concepts(args.concept_path)
-    if args.concept_index < 0 or args.concept_index >= len(concepts):
-        raise ValueError(f"concept_index {args.concept_index} out of range (0-{len(concepts)-1})")
-    concept = concepts[args.concept_index]
-
     examples = _prepare_examples_from_parquet(
         Path(args.train_parquet),
-        Path(args.metadata_jsonl),
-        concept,
+        args.concept_id,
         args.num_examples,
         args.seed,
     )
 
-    logger.warning(f"Prepared {len(examples)} contrastive rows (concept={concept}).")
+    logger.warning(f"Prepared {len(examples)} contrastive rows for concept_id={args.concept_id}.")
 
     last_vecs, mean_vecs, labels = _collect_activations(
         base_model,
@@ -232,13 +205,13 @@ def main():
     _plot_pca(
         last_vecs,
         labels,
-        f"{concept} – Last Token PCA",
+        f"Concept {args.concept_id} – Last Token PCA",
         output_dir / "pca_last_token.png",
     )
     _plot_pca(
         mean_vecs,
         labels,
-        f"{concept} – Mean Output Tokens PCA",
+        f"Concept {args.concept_id} – Mean Output Tokens PCA",
         output_dir / "pca_mean_output.png",
     )
 
