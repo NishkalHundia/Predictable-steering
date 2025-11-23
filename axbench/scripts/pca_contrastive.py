@@ -225,13 +225,13 @@ def main():
     _plot_pca(
         last_vecs,
         labels,
-        f"Concept {args.concept_id} – Last Token PCA",
+        f"Concept {args.concept_id}: {concept} – Last Token PCA",
         output_dir / "pca_last_token.png",
     )
     _plot_pca(
         mean_vecs,
         labels,
-        f"Concept {args.concept_id} – Mean Output Tokens PCA",
+        f"Concept {args.concept_id}: {concept} – Mean Output Tokens PCA",
         output_dir / "pca_mean_output.png",
     )
 
