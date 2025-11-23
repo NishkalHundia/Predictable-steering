@@ -3,6 +3,7 @@ PCA analysis script for contrastive pair activations.
 Follows the same data loading logic as train.py.
 """
 import argparse
+import json
 import os
 from pathlib import Path
 
@@ -13,7 +14,7 @@ import torch
 from sklearn.decomposition import PCA
 from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
 
-from axbench.utils.constants import CHAT_MODELS
+from axbench.utils.constants import CHAT_MODELS, EMPTY_CONCEPT
 from axbench.utils.model_utils import gather_residual_activations, get_prefix_length
 
 import logging
@@ -26,13 +27,39 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def load_concept_data(train_parquet: Path, concept_id: int) -> pd.DataFrame:
-    """Load data for a specific concept_id from train_data.parquet."""
-    df = pd.read_parquet(train_parquet)
-    concept_df = df[df['concept_id'] == concept_id]
-    if concept_df.empty:
-        raise ValueError(f"No rows found for concept_id={concept_id} in {train_parquet}.")
-    return concept_df
+def load_metadata(metadata_path):
+    """Load metadata from a JSON lines file."""
+    metadata = []
+    with open(metadata_path, 'r') as f:
+        for line in f:
+            data = json.loads(line)
+            metadata += [data]
+    return metadata
+
+
+def load_concept_data(train_parquet: Path, metadata_path: Path, concept_id: int) -> tuple[pd.DataFrame, pd.DataFrame, str]:
+    """
+    Load data for a specific concept_id from train_data.parquet.
+    Returns: (positive_df, negative_df, concept_name)
+    Follows train.py logic exactly.
+    """
+    # Load all data
+    all_df = pd.read_parquet(train_parquet)
+    
+    # Load metadata to get concept name and genre
+    metadata = load_metadata(metadata_path)
+    concept = metadata[concept_id]["concept"]
+    genre = metadata[concept_id]["concept_genres_map"][concept][0]
+    
+    # Get positive examples for this concept
+    concept_df = all_df[all_df['concept_id'] == concept_id]
+    positive_df = concept_df[(concept_df["output_concept"] == concept) & (concept_df["category"] == "positive")]
+    
+    # Get negative examples from the entire dataset (filtered by genre)
+    negative_df = all_df[(all_df["output_concept"] == EMPTY_CONCEPT) & (all_df["category"] == "negative")]
+    negative_df = negative_df[negative_df["concept_genre"] == genre]
+    
+    return positive_df, negative_df, concept
 
 
 def _collect_activations(
@@ -133,6 +160,7 @@ def main():
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--use_bf16", action="store_true", help="Load model weights in bfloat16.")
     parser.add_argument("--train_parquet", type=str, required=True, help="Path to existing train_data.parquet containing contrastive pairs.")
+    parser.add_argument("--metadata_jsonl", type=str, required=True, help="Path to metadata.jsonl file.")
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -158,14 +186,14 @@ def main():
     is_chat_model = args.model_id in CHAT_MODELS
     prefix_length = get_prefix_length(tokenizer) if is_chat_model else 1
 
-    # Load concept data
-    concept_df = load_concept_data(Path(args.train_parquet), args.concept_id)
+    # Load concept data (following train.py logic exactly)
+    positive_df, negative_df, concept = load_concept_data(
+        Path(args.train_parquet),
+        Path(args.metadata_jsonl),
+        args.concept_id
+    )
     
-    # Split positive/negative (following train.py logic)
-    positive_df = concept_df[concept_df["category"] == "positive"]
-    negative_df = concept_df[concept_df["category"] == "negative"]
-    
-    logger.warning(f"Found {len(positive_df)} positive and {len(negative_df)} negative examples for concept_id={args.concept_id}")
+    logger.warning(f"Found {len(positive_df)} positive and {len(negative_df)} negative examples for concept_id={args.concept_id} ({concept})")
     
     if positive_df.empty or negative_df.empty:
         raise ValueError(f"Missing positive or negative examples for concept_id={args.concept_id}.")
