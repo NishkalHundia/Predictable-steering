@@ -1,3 +1,5 @@
+pca_outputs/
+
 axbench/axbench_paper_results/
 axbench/concept500_v1/
 axbench/hypersteer_paper_results/
