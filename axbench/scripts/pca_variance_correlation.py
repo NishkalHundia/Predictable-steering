@@ -118,7 +118,7 @@ def collect_activations(
         attention_mask = torch.ones_like(full_tensor)
         inputs = {"input_ids": full_tensor, "attention_mask": attention_mask}
 
-        activations = gather_residual_activations(model, layer, inputs).squeeze(0).detach().cpu().numpy()
+        activations = gather_residual_activations(model, layer, inputs).squeeze(0).detach().cpu().float().numpy()
         output_activations = activations[prefix_length:]
         
         last_vectors.append(output_activations[-1])
