@@ -175,13 +175,15 @@ def main():
     parser.add_argument("--max_new_tokens", type=int, default=20)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--steering_factors", type=str, default="-2,-1.5,-1,-0.5,0,0.5,1,1.5,2",
+                        help="Comma-separated list of steering factors to evaluate")
     args = parser.parse_args()
     
     torch.manual_seed(args.seed)
     
-    # Steering factors - using larger range since DiffMean is unit-normalized
-    # Typical activation norms are ~50-200, so we may need larger factors
-    steering_factors = [-2.0, -1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0]
+    # Parse steering factors from command line
+    steering_factors = [float(x.strip()) for x in args.steering_factors.split(",")]
+    logger.warning(f"Using steering factors: {steering_factors}")
     
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
