@@ -9,9 +9,10 @@ import torch
 import pandas as pd
 from pathlib import Path
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from torch.utils.data import DataLoader
+from tqdm import tqdm
 
-from axbench.models.mean import DiffMean
-from axbench.utils.model_utils import get_prefix_length
+from axbench.utils.model_utils import get_prefix_length, gather_residual_activations, set_decoder_norm_to_unit_norm
 from axbench.utils.constants import CHAT_MODELS
 
 import logging
@@ -72,13 +73,85 @@ def prepare_training_data(data, tokenizer, model_name):
     return df
 
 
-class TrainingArgs:
-    """Simple training args to match axbench interface."""
-    def __init__(self):
-        self.batch_size = 4
-        self.n_epochs = 1
-        self.lr = 1e-3
-        self.weight_decay = 0.0
+@torch.no_grad()
+def train_diffmean(model, tokenizer, df, layer, prefix_length, device, batch_size=4):
+    """
+    Train DiffMean directly - compute mean activations for positive and negative examples.
+    This is a cleaner implementation following the exact axbench pattern.
+    """
+    model.eval()
+    
+    positive_activations = []
+    negative_activations = []
+    
+    logger.warning(f"Training DiffMean on {len(df)} examples...")
+    logger.warning(f"Positive examples: {len(df[df['labels'] == 1])}")
+    logger.warning(f"Negative examples: {len(df[df['labels'] == 0])}")
+    
+    # Process in batches
+    for batch_start in tqdm(range(0, len(df), batch_size), desc="Collecting activations"):
+        batch_end = min(batch_start + batch_size, len(df))
+        batch_df = df.iloc[batch_start:batch_end]
+        
+        # Tokenize
+        inputs = tokenizer(
+            batch_df["input"].tolist(),
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=512
+        ).to(device)
+        
+        # Get activations at the target layer
+        activations = gather_residual_activations(
+            model, layer, 
+            {"input_ids": inputs["input_ids"], "attention_mask": inputs["attention_mask"]}
+        ).detach()
+        
+        # Process each example in the batch
+        for i, (_, row) in enumerate(batch_df.iterrows()):
+            # Get non-padding positions after prefix
+            attention_mask = inputs["attention_mask"][i]
+            seq_len = attention_mask.sum().item()
+            
+            # Get activations for non-prefix positions
+            # Skip prefix tokens and only use actual content
+            act = activations[i, prefix_length:seq_len]
+            
+            if len(act) > 0:
+                if row["labels"] == 1:
+                    positive_activations.append(act)
+                else:
+                    negative_activations.append(act)
+    
+    # Compute mean activations
+    logger.warning(f"Computing mean activations...")
+    logger.warning(f"Positive activation chunks: {len(positive_activations)}")
+    logger.warning(f"Negative activation chunks: {len(negative_activations)}")
+    
+    all_positive = torch.cat(positive_activations, dim=0)
+    all_negative = torch.cat(negative_activations, dim=0)
+    
+    logger.warning(f"Total positive activation tokens: {all_positive.shape[0]}")
+    logger.warning(f"Total negative activation tokens: {all_negative.shape[0]}")
+    
+    mean_positive = all_positive.mean(dim=0)
+    mean_negative = all_negative.mean(dim=0)
+    
+    # Compute difference
+    steering_vector = mean_positive - mean_negative
+    
+    logger.warning(f"Steering vector shape: {steering_vector.shape}")
+    logger.warning(f"Steering vector norm (before normalization): {steering_vector.norm().item():.4f}")
+    logger.warning(f"Steering vector mean: {steering_vector.mean().item():.6f}")
+    logger.warning(f"Steering vector std: {steering_vector.std().item():.6f}")
+    
+    # Normalize to unit norm (like axbench does)
+    steering_vector = steering_vector / steering_vector.norm()
+    
+    logger.warning(f"Steering vector norm (after normalization): {steering_vector.norm().item():.4f}")
+    
+    return steering_vector
 
 
 def main():
@@ -89,6 +162,7 @@ def main():
     parser.add_argument("--dataset_path", type=str, default="datasets/raw/survival-instinct/dataset.json")
     parser.add_argument("--output_dir", type=str, default="results/survival-instinct")
     parser.add_argument("--use_bf16", action="store_true", default=True)
+    parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
     
@@ -123,6 +197,11 @@ def main():
     df = prepare_training_data(data, tokenizer, args.model_name)
     logger.warning(f"Prepared {len(df)} training rows (positive + negative)")
     
+    # Print sample data for debugging
+    logger.warning("\n--- Sample training data ---")
+    logger.warning(f"Positive example (first 200 chars): {df[df['labels']==1].iloc[0]['input'][:200]}...")
+    logger.warning(f"Negative example (first 200 chars): {df[df['labels']==0].iloc[0]['input'][:200]}...")
+    
     # Get prefix length for chat model
     is_chat_model = args.model_name in CHAT_MODELS
     prefix_length = 1
@@ -130,40 +209,21 @@ def main():
         prefix_length = get_prefix_length(tokenizer)
         logger.warning(f"Chat model prefix length: {prefix_length}")
     
-    # Create training args
-    training_args = TrainingArgs()
-    
-    # Initialize DiffMean model
-    logger.warning("Initializing DiffMean model...")
-    diffmean_model = DiffMean(
-        model, tokenizer, layer=args.layer,
-        training_args=training_args,
-        lm_model_name=args.model_name,
-        device=device, seed=args.seed
-    )
-    
-    # Make model for training
-    diffmean_model.make_model(
-        mode="train",
-        embed_dim=model.config.hidden_size,
-        low_rank_dimension=1,
-        dtype=torch.bfloat16 if args.use_bf16 else None,
-        intervention_type="addition"
-    )
-    
-    # Train
+    # Train DiffMean
     logger.warning("Training DiffMean...")
-    diffmean_model.train(df, prefix_length=prefix_length)
+    steering_vector = train_diffmean(
+        model, tokenizer, df, args.layer, prefix_length, device, args.batch_size
+    )
     
-    # Save the steering vector
+    # Save the steering vector (with shape [1, hidden_size] for compatibility)
     weight_path = output_dir / "DiffMean_weight.pt"
     bias_path = output_dir / "DiffMean_bias.pt"
     
-    torch.save(diffmean_model.ax.proj.weight.data, weight_path)
-    torch.save(diffmean_model.ax.proj.bias.data, bias_path)
+    torch.save(steering_vector.unsqueeze(0).cpu(), weight_path)
+    torch.save(torch.zeros(1), bias_path)
     
     logger.warning(f"Saved steering vector to {weight_path}")
-    logger.warning(f"Steering vector shape: {diffmean_model.ax.proj.weight.data.shape}")
+    logger.warning(f"Saved steering vector shape: {steering_vector.unsqueeze(0).shape}")
     
     # Save config
     config = {
@@ -171,7 +231,8 @@ def main():
         "layer": args.layer,
         "dataset_path": args.dataset_path,
         "num_train_examples": len(data),
-        "seed": args.seed
+        "seed": args.seed,
+        "steering_vector_norm": steering_vector.norm().item()
     }
     with open(output_dir / "config.json", "w") as f:
         json.dump(config, f, indent=2)
@@ -181,4 +242,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
