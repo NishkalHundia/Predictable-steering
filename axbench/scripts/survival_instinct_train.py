@@ -172,6 +172,8 @@ def main():
     parser.add_argument("--use_bf16", action="store_true", default=True)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--max_examples", type=int, default=None,
+                        help="Maximum number of examples (pairs) to use for training. Default: use all.")
     args = parser.parse_args()
     
     torch.manual_seed(args.seed)
@@ -201,6 +203,11 @@ def main():
     logger.warning(f"Loading dataset from {args.dataset_path}...")
     data = load_dataset(args.dataset_path)
     logger.warning(f"Loaded {len(data)} examples")
+    
+    # Limit examples if requested
+    if args.max_examples is not None and args.max_examples < len(data):
+        logger.warning(f"Limiting to {args.max_examples} examples (from {len(data)})")
+        data = data[:args.max_examples]
     
     df = prepare_training_data(data, tokenizer, args.model_name)
     logger.warning(f"Prepared {len(df)} training rows (positive + negative)")
@@ -239,6 +246,7 @@ def main():
         "layer": args.layer,
         "dataset_path": args.dataset_path,
         "num_train_examples": len(data),
+        "max_examples": args.max_examples,
         "seed": args.seed,
         "steering_vector_norm": steering_vector.norm().item()
     }
