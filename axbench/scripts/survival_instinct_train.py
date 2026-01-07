@@ -77,12 +77,16 @@ def prepare_training_data(data, tokenizer, model_name):
 def train_diffmean(model, tokenizer, df, layer, prefix_length, device, batch_size=4):
     """
     Train DiffMean directly - compute mean activations for positive and negative examples.
-    This is a cleaner implementation following the exact axbench pattern.
+    Uses online/streaming mean computation to avoid OOM on large datasets.
     """
     model.eval()
     
-    positive_activations = []
-    negative_activations = []
+    # Use online mean computation to avoid storing all activations
+    hidden_size = model.config.hidden_size
+    positive_sum = torch.zeros(hidden_size, dtype=torch.float32, device=device)
+    negative_sum = torch.zeros(hidden_size, dtype=torch.float32, device=device)
+    positive_count = 0
+    negative_count = 0
     
     logger.warning(f"Training DiffMean on {len(df)} examples...")
     logger.warning(f"Positive examples: {len(df[df['labels'] == 1])}")
@@ -106,7 +110,7 @@ def train_diffmean(model, tokenizer, df, layer, prefix_length, device, batch_siz
         activations = gather_residual_activations(
             model, layer, 
             {"input_ids": inputs["input_ids"], "attention_mask": inputs["attention_mask"]}
-        ).detach()
+        ).detach().float()  # Convert to float32 for accumulation
         
         # Process each example in the batch
         for i, (_, row) in enumerate(batch_df.iterrows()):
@@ -115,41 +119,45 @@ def train_diffmean(model, tokenizer, df, layer, prefix_length, device, batch_siz
             seq_len = attention_mask.sum().item()
             
             # Get activations for non-prefix positions
-            # Skip prefix tokens and only use actual content
             act = activations[i, prefix_length:seq_len]
             
             if len(act) > 0:
+                # Sum activations and count tokens (online mean)
+                act_sum = act.sum(dim=0)
+                act_count = act.shape[0]
+                
                 if row["labels"] == 1:
-                    positive_activations.append(act)
+                    positive_sum += act_sum
+                    positive_count += act_count
                 else:
-                    negative_activations.append(act)
+                    negative_sum += act_sum
+                    negative_count += act_count
+        
+        # Clear cache periodically
+        if batch_start % (batch_size * 50) == 0:
+            torch.cuda.empty_cache()
     
     # Compute mean activations
     logger.warning(f"Computing mean activations...")
-    logger.warning(f"Positive activation chunks: {len(positive_activations)}")
-    logger.warning(f"Negative activation chunks: {len(negative_activations)}")
+    logger.warning(f"Total positive activation tokens: {positive_count}")
+    logger.warning(f"Total negative activation tokens: {negative_count}")
     
-    all_positive = torch.cat(positive_activations, dim=0)
-    all_negative = torch.cat(negative_activations, dim=0)
-    
-    logger.warning(f"Total positive activation tokens: {all_positive.shape[0]}")
-    logger.warning(f"Total negative activation tokens: {all_negative.shape[0]}")
-    
-    mean_positive = all_positive.mean(dim=0)
-    mean_negative = all_negative.mean(dim=0)
+    mean_positive = positive_sum / positive_count
+    mean_negative = negative_sum / negative_count
     
     # Compute difference
     steering_vector = mean_positive - mean_negative
     
     logger.warning(f"Steering vector shape: {steering_vector.shape}")
-    logger.warning(f"Steering vector norm (before normalization): {steering_vector.norm().item():.4f}")
+    logger.warning(f"Steering vector norm: {steering_vector.norm().item():.4f}")
     logger.warning(f"Steering vector mean: {steering_vector.mean().item():.6f}")
     logger.warning(f"Steering vector std: {steering_vector.std().item():.6f}")
     
-    # Normalize to unit norm (like axbench does)
-    steering_vector = steering_vector / steering_vector.norm()
-    
-    logger.warning(f"Steering vector norm (after normalization): {steering_vector.norm().item():.4f}")
+    # NOTE: We do NOT normalize to unit norm here.
+    # The original CAA paper (Rimsky et al., 2023) keeps the raw difference-in-means.
+    # This way, steering factors of 1-2 work as expected.
+    # If you want unit-normalized vectors (axbench style), uncomment below:
+    # steering_vector = steering_vector / steering_vector.norm()
     
     return steering_vector
 
