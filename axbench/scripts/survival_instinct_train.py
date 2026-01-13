@@ -132,16 +132,15 @@ def train_diffmean(model, tokenizer, df, layer, prefix_length, device, batch_siz
             attention_mask = inputs["attention_mask"][i]
             seq_len = int(attention_mask.sum().item())
             
-            # Sanity check: print the token at position -2 for the first example
+            # Sanity check: print the last few tokens for the first example
             if not first_example_logged:
-                token_id_at_minus2 = inputs["input_ids"][i, seq_len - 2].item()
-                token_at_minus2 = tokenizer.decode([token_id_at_minus2])
-                token_id_at_minus1 = inputs["input_ids"][i, seq_len - 1].item()
-                token_at_minus1 = tokenizer.decode([token_id_at_minus1])
-                logger.warning(f"=== SANITY CHECK: Token at position -2 ===")
-                logger.warning(f"  Token at -2: '{token_at_minus2}' (id={token_id_at_minus2})")
-                logger.warning(f"  Token at -1: '{token_at_minus1}' (id={token_id_at_minus1})")
-                logger.warning(f"  Expected: A or B at position -2, ) at position -1")
+                logger.warning(f"=== SANITY CHECK: Last 6 tokens ===")
+                for offset in range(6, 0, -1):
+                    pos = seq_len - offset
+                    if pos >= 0:
+                        token_id = inputs["input_ids"][i, pos].item()
+                        token_str = tokenizer.decode([token_id])
+                        logger.warning(f"  Position -{offset}: '{token_str}' (id={token_id})")
                 logger.warning(f"  Label: {row['labels']} ({'positive' if row['labels'] == 1 else 'negative'})")
                 first_example_logged = True
             
