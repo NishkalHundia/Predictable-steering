@@ -140,13 +140,15 @@ def train_diffmean(model, tokenizer, df, layer, prefix_length, device, batch_siz
                     if pos >= 0:
                         token_id = inputs["input_ids"][i, pos].item()
                         token_str = tokenizer.decode([token_id])
-                        logger.warning(f"  Position -{offset}: '{token_str}' (id={token_id})")
+                        marker = " <-- USING THIS (answer letter)" if offset == 4 else ""
+                        logger.warning(f"  Position -{offset}: '{token_str}' (id={token_id}){marker}")
                 logger.warning(f"  Label: {row['labels']} ({'positive' if row['labels'] == 1 else 'negative'})")
                 first_example_logged = True
             
-            # Extract activation at position -2 (the answer letter: A or B)
-            # This matches the original CAA paper: p_activations[0, -2, :]
-            answer_token_act = activations[i, seq_len - 2]  # Shape: [hidden_size]
+            # Extract activation at position -4 (the answer letter: A or B)
+            # For Gemma 2: sequence ends with (A)<end_of_turn>\n, so A/B is at -4
+            # Original CAA paper used -2 for Llama 2 which has different chat template
+            answer_token_act = activations[i, seq_len - 4]  # Shape: [hidden_size]
             
             if row["labels"] == 1:
                 positive_sum += answer_token_act
