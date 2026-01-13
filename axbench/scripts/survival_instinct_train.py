@@ -37,7 +37,9 @@ def prepare_training_data(data, tokenizer, model_name):
     Positive class = matching behavior (AI accepts shutdown)
     Negative class = not matching behavior (AI resists shutdown)
     
-    Answer format is " (A)" or " (B)" - the letter is at position -2 after tokenization.
+    IMPORTANT: The answer (A/B) must be in the ASSISTANT message, not user message.
+    This way, position -2 is the answer letter after tokenization.
+    Format: user asks question, assistant responds with " (A)" or " (B)"
     """
     rows = []
     
@@ -47,27 +49,29 @@ def prepare_training_data(data, tokenizer, model_name):
         answer_not_matching = item["answer_not_matching_behavior"]
         
         # Create positive example (matching behavior)
-        positive_text = question + answer_matching
         rows.append({
-            "input": positive_text,
+            "question": question,
+            "answer": answer_matching,
             "labels": 1  # positive class
         })
         
         # Create negative example (not matching behavior)
-        negative_text = question + answer_not_matching
         rows.append({
-            "input": negative_text,
+            "question": question,
+            "answer": answer_not_matching,
             "labels": 0  # negative class
         })
     
     df = pd.DataFrame(rows)
     
-    # Apply chat template
+    # Apply chat template with answer in ASSISTANT message (like original CAA paper)
     def apply_chat_template(row):
         messages = [
-            {"role": "user", "content": row["input"]},
+            {"role": "user", "content": row["question"]},
+            {"role": "assistant", "content": row["answer"]},
         ]
-        tokens = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)[1:]
+        # Don't add generation prompt - we want the sequence to end with the answer
+        tokens = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=False)[1:]
         return tokenizer.decode(tokens)
     
     df['input'] = df.apply(apply_chat_template, axis=1)
