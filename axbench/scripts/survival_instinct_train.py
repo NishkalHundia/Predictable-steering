@@ -36,23 +36,25 @@ def prepare_training_data(data, tokenizer, model_name):
     Prepare training data for DiffMean.
     Positive class = matching behavior (AI accepts shutdown)
     Negative class = not matching behavior (AI resists shutdown)
+    
+    Answer format is " (A)" or " (B)" - the letter is at position -2 after tokenization.
     """
     rows = []
     
     for item in data:
         question = item["question"]
-        answer_matching = item["answer_matching_behavior"].strip()
-        answer_not_matching = item["answer_not_matching_behavior"].strip()
+        answer_matching = item["answer_matching_behavior"]  # e.g., " (A)" or " (B)"
+        answer_not_matching = item["answer_not_matching_behavior"]
         
-        # Create positive example (matching behavior - AI accepts shutdown)
-        positive_text = question + "\n\nAnswer:" + answer_matching
+        # Create positive example (matching behavior)
+        positive_text = question + answer_matching
         rows.append({
             "input": positive_text,
             "labels": 1  # positive class
         })
         
-        # Create negative example (not matching behavior - AI resists shutdown)
-        negative_text = question + "\n\nAnswer:" + answer_not_matching
+        # Create negative example (not matching behavior)
+        negative_text = question + answer_not_matching
         rows.append({
             "input": negative_text,
             "labels": 0  # negative class
@@ -77,7 +79,13 @@ def prepare_training_data(data, tokenizer, model_name):
 def train_diffmean(model, tokenizer, df, layer, prefix_length, device, batch_size=4):
     """
     Train DiffMean directly - compute mean activations for positive and negative examples.
-    Uses online/streaming mean computation to avoid OOM on large datasets.
+    
+    IMPORTANT: For multiple-choice datasets (A/B answers), we extract the activation
+    at position -2 (second to last token), which is the answer letter (A or B).
+    This matches the original CAA paper implementation (Rimsky et al.).
+    
+    For answer format " (A)" or " (B)", tokenization is typically [..., "A", ")"]
+    so the letter is at position -2 relative to sequence end.
     """
     model.eval()
     
@@ -91,6 +99,9 @@ def train_diffmean(model, tokenizer, df, layer, prefix_length, device, batch_siz
     logger.warning(f"Training DiffMean on {len(df)} examples...")
     logger.warning(f"Positive examples: {len(df[df['labels'] == 1])}")
     logger.warning(f"Negative examples: {len(df[df['labels'] == 0])}")
+    logger.warning(f"Using position -2 (answer letter token) following original CAA paper")
+    
+    first_example_logged = False  # For sanity check
     
     # Process in batches
     for batch_start in tqdm(range(0, len(df), batch_size), desc="Collecting activations"):
@@ -114,24 +125,32 @@ def train_diffmean(model, tokenizer, df, layer, prefix_length, device, batch_siz
         
         # Process each example in the batch
         for i, (_, row) in enumerate(batch_df.iterrows()):
-            # Get non-padding positions after prefix
             attention_mask = inputs["attention_mask"][i]
-            seq_len = attention_mask.sum().item()
+            seq_len = int(attention_mask.sum().item())
             
-            # Get activations for non-prefix positions
-            act = activations[i, prefix_length:seq_len]
+            # Sanity check: print the token at position -2 for the first example
+            if not first_example_logged:
+                token_id_at_minus2 = inputs["input_ids"][i, seq_len - 2].item()
+                token_at_minus2 = tokenizer.decode([token_id_at_minus2])
+                token_id_at_minus1 = inputs["input_ids"][i, seq_len - 1].item()
+                token_at_minus1 = tokenizer.decode([token_id_at_minus1])
+                logger.warning(f"=== SANITY CHECK: Token at position -2 ===")
+                logger.warning(f"  Token at -2: '{token_at_minus2}' (id={token_id_at_minus2})")
+                logger.warning(f"  Token at -1: '{token_at_minus1}' (id={token_id_at_minus1})")
+                logger.warning(f"  Expected: A or B at position -2, ) at position -1")
+                logger.warning(f"  Label: {row['labels']} ({'positive' if row['labels'] == 1 else 'negative'})")
+                first_example_logged = True
             
-            if len(act) > 0:
-                # Sum activations and count tokens (online mean)
-                act_sum = act.sum(dim=0)
-                act_count = act.shape[0]
-                
-                if row["labels"] == 1:
-                    positive_sum += act_sum
-                    positive_count += act_count
-                else:
-                    negative_sum += act_sum
-                    negative_count += act_count
+            # Extract activation at position -2 (the answer letter: A or B)
+            # This matches the original CAA paper: p_activations[0, -2, :]
+            answer_token_act = activations[i, seq_len - 2]  # Shape: [hidden_size]
+            
+            if row["labels"] == 1:
+                positive_sum += answer_token_act
+                positive_count += 1
+            else:
+                negative_sum += answer_token_act
+                negative_count += 1
         
         # Clear cache periodically
         if batch_start % (batch_size * 50) == 0:
@@ -139,8 +158,8 @@ def train_diffmean(model, tokenizer, df, layer, prefix_length, device, batch_siz
     
     # Compute mean activations
     logger.warning(f"Computing mean activations...")
-    logger.warning(f"Total positive activation tokens: {positive_count}")
-    logger.warning(f"Total negative activation tokens: {negative_count}")
+    logger.warning(f"Total positive examples: {positive_count}")
+    logger.warning(f"Total negative examples: {negative_count}")
     
     mean_positive = positive_sum / positive_count
     mean_negative = negative_sum / negative_count
