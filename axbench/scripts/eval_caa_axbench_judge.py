@@ -8,13 +8,19 @@ Scores on:
 
 Final score = harmonic_mean(behavior, instruction, fluency) out of 2.
 
-Usage:
+Usage (generate + score):
     uv run python axbench/scripts/eval_caa_axbench_judge.py \
         --behavior sycophancy \
         --model_name google/gemma-2-9b-it \
         --layer 20 \
         --steering_vector_path results/gemma-2-9b-it/sycophancy-open-ended/DiffMean_weight.pt \
         --test_dataset_path datasets/generated/sycophancy/test_contrastive.json \
+        --output_dir results/gemma-2-9b-it/sycophancy-open-ended/eval-axbench
+
+Usage (score existing generations from previous eval run):
+    uv run python axbench/scripts/eval_caa_axbench_judge.py \
+        --behavior sycophancy \
+        --generations_path results/gemma-2-9b-it/sycophancy-open-ended/eval/eval_results.parquet \
         --output_dir results/gemma-2-9b-it/sycophancy-open-ended/eval-axbench
 """
 import os
@@ -375,56 +381,127 @@ async def evaluate_with_axbench_judge(
     return all_results
 
 
+async def score_existing_generations(
+    judge: AsyncAxbenchJudge,
+    generations_df: pd.DataFrame,
+    behavior: str,
+) -> list:
+    """Score existing generations with axbench 3-metric judge."""
+    
+    all_results = []
+    steering_factors = sorted(generations_df["steering_factor"].unique())
+    
+    for factor in steering_factors:
+        logger.warning(f"\n{'='*50}")
+        logger.warning(f"Scoring factor: {factor}")
+        logger.warning(f"{'='*50}")
+        
+        factor_df = generations_df[generations_df["steering_factor"] == factor]
+        
+        # Score all generations
+        tasks = []
+        for _, row in factor_df.iterrows():
+            task = judge.score_response(row["question"], row["generation"], behavior)
+            tasks.append(task)
+        
+        logger.warning(f"Scoring {len(tasks)} responses (3 metrics each)...")
+        scores = await asyncio.gather(*tasks)
+        
+        # Collect results
+        for (_, row), score_result in zip(factor_df.iterrows(), scores):
+            result = {
+                "question_idx": row.get("question_idx", 0),
+                "question": row["question"],
+                "steering_factor": factor,
+                "generation": row["generation"],
+                "behavior_score": score_result["behavior_score"],
+                "instruction_score": score_result["instruction_score"],
+                "fluency_score": score_result["fluency_score"],
+                "harmonic_mean": score_result["harmonic_mean"],
+                "behavior_explanation": score_result["behavior_explanation"],
+                "instruction_explanation": score_result["instruction_explanation"],
+                "fluency_explanation": score_result["fluency_explanation"],
+            }
+            all_results.append(result)
+        
+        # Print summary
+        avg_behavior = np.mean([r["behavior_score"] for r in all_results if r["steering_factor"] == factor])
+        avg_instruction = np.mean([r["instruction_score"] for r in all_results if r["steering_factor"] == factor])
+        avg_fluency = np.mean([r["fluency_score"] for r in all_results if r["steering_factor"] == factor])
+        avg_harmonic = np.mean([r["harmonic_mean"] for r in all_results if r["steering_factor"] == factor])
+        
+        logger.warning(f"Factor {factor}: Behavior={avg_behavior:.2f}, Instruction={avg_instruction:.2f}, "
+                      f"Fluency={avg_fluency:.2f}, Harmonic={avg_harmonic:.2f}")
+    
+    return all_results
+
+
 async def main_async(args):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.warning(f"Using device: {device}")
-    
-    steering_factors = [float(x.strip()) for x in args.steering_factors.split(",")]
-    logger.warning(f"Steering factors: {steering_factors}")
-    
-    # Load test dataset
-    logger.warning(f"Loading test dataset from {args.test_dataset_path}...")
-    with open(args.test_dataset_path, 'r') as f:
-        test_data = json.load(f)
-    logger.warning(f"Loaded {len(test_data)} test examples")
-    
-    # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name, model_max_length=1024)
-    tokenizer.padding_side = "left"
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    
-    # Load model
-    logger.warning(f"Loading model {args.model_name}...")
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_name,
-        torch_dtype=torch.bfloat16 if args.use_bf16 else None,
-        device_map=device
-    )
-    model.eval()
-    
-    # Load steering vector
-    logger.warning(f"Loading steering vector from {args.steering_vector_path}...")
-    steering_vector = torch.load(args.steering_vector_path, map_location=device)
-    
-    # Get prefix length
-    prefix_length = 1
-    if args.model_name in CHAT_MODELS:
-        prefix_length = get_prefix_length(tokenizer)
-    
-    # Create steering model and judge
-    steering_model = SteeringModel(model, tokenizer, args.layer, steering_vector, device)
-    judge = AsyncAxbenchJudge(model=args.judge_model, max_concurrent=args.max_concurrent)
-    
     # Create output directory
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
+    # Create judge
+    judge = AsyncAxbenchJudge(model=args.judge_model, max_concurrent=args.max_concurrent)
+    
     try:
-        all_results = await evaluate_with_axbench_judge(
-            steering_model, judge, test_data, args.behavior, steering_factors,
-            tokenizer, args.max_new_tokens, prefix_length, args.batch_size
-        )
+        # Check if using existing generations
+        if args.generations_path:
+            logger.warning(f"Loading existing generations from {args.generations_path}...")
+            generations_df = pd.read_parquet(args.generations_path)
+            logger.warning(f"Loaded {len(generations_df)} generations")
+            
+            steering_factors = sorted(generations_df["steering_factor"].unique())
+            logger.warning(f"Steering factors found: {steering_factors}")
+            
+            all_results = await score_existing_generations(
+                judge, generations_df, args.behavior
+            )
+        else:
+            # Generate new responses
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            logger.warning(f"Using device: {device}")
+            
+            steering_factors = [float(x.strip()) for x in args.steering_factors.split(",")]
+            logger.warning(f"Steering factors: {steering_factors}")
+            
+            # Load test dataset
+            logger.warning(f"Loading test dataset from {args.test_dataset_path}...")
+            with open(args.test_dataset_path, 'r') as f:
+                test_data = json.load(f)
+            logger.warning(f"Loaded {len(test_data)} test examples")
+            
+            # Load tokenizer
+            tokenizer = AutoTokenizer.from_pretrained(args.model_name, model_max_length=1024)
+            tokenizer.padding_side = "left"
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
+            
+            # Load model
+            logger.warning(f"Loading model {args.model_name}...")
+            model = AutoModelForCausalLM.from_pretrained(
+                args.model_name,
+                torch_dtype=torch.bfloat16 if args.use_bf16 else None,
+                device_map=device
+            )
+            model.eval()
+            
+            # Load steering vector
+            logger.warning(f"Loading steering vector from {args.steering_vector_path}...")
+            steering_vector = torch.load(args.steering_vector_path, map_location=device)
+            
+            # Get prefix length
+            prefix_length = 1
+            if args.model_name in CHAT_MODELS:
+                prefix_length = get_prefix_length(tokenizer)
+            
+            # Create steering model
+            steering_model = SteeringModel(model, tokenizer, args.layer, steering_vector, device)
+            
+            all_results = await evaluate_with_axbench_judge(
+                steering_model, judge, test_data, args.behavior, steering_factors,
+                tokenizer, args.max_new_tokens, prefix_length, args.batch_size
+            )
     finally:
         await judge.close()
     
@@ -464,19 +541,33 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--behavior", type=str, required=True,
                         choices=list(BEHAVIOR_DESCRIPTIONS.keys()))
-    parser.add_argument("--model_name", type=str, default="google/gemma-2-9b-it")
-    parser.add_argument("--layer", type=int, default=20)
-    parser.add_argument("--steering_vector_path", type=str, required=True)
-    parser.add_argument("--test_dataset_path", type=str, required=True)
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--judge_model", type=str, default="gpt-4o-mini")
+    parser.add_argument("--max_concurrent", type=int, default=10)
+    parser.add_argument("--seed", type=int, default=42)
+    
+    # Option 1: Score existing generations (fast, no GPU needed)
+    parser.add_argument("--generations_path", type=str, default=None,
+                        help="Path to existing eval_results.parquet from previous eval run")
+    
+    # Option 2: Generate new responses (requires GPU + steering vector)
+    parser.add_argument("--model_name", type=str, default="google/gemma-2-9b-it")
+    parser.add_argument("--layer", type=int, default=20)
+    parser.add_argument("--steering_vector_path", type=str, default=None)
+    parser.add_argument("--test_dataset_path", type=str, default=None)
     parser.add_argument("--use_bf16", action="store_true", default=True)
     parser.add_argument("--max_new_tokens", type=int, default=150)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--steering_factors", type=str, default="-2,-1,0,1,2")
-    parser.add_argument("--max_concurrent", type=int, default=10)
-    parser.add_argument("--seed", type=int, default=42)
+    
     args = parser.parse_args()
+    
+    # Validate arguments
+    if not args.generations_path and not args.steering_vector_path:
+        parser.error("Must provide either --generations_path (to score existing) or --steering_vector_path (to generate new)")
+    
+    if not args.generations_path and not args.test_dataset_path:
+        parser.error("Must provide --test_dataset_path when generating new responses")
     
     torch.manual_seed(args.seed)
     
