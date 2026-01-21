@@ -34,6 +34,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def supports_chat_template(tokenizer) -> bool:
+    """Return True if tokenizer has a chat template configured."""
+    return getattr(tokenizer, "chat_template", None) not in (None, "")
+
+
 def load_dataset(dataset_path):
     """Load the open-ended contrastive dataset."""
     with open(dataset_path, 'r') as f:
@@ -75,20 +80,29 @@ def prepare_training_data(data, tokenizer):
     
     df = pd.DataFrame(rows)
     
-    # Apply chat template - question as user, answer as assistant
+    # Apply chat template - question as user, answer as assistant (if available)
     def format_conversation(row):
-        messages = [
-            {"role": "user", "content": row["question"]},
-            {"role": "assistant", "content": row["answer"]},
-        ]
-        # Full conversation
-        full_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
-        
-        # Question only (to find where response starts)
-        question_messages = [
-            {"role": "user", "content": row["question"]},
-        ]
-        question_only = tokenizer.apply_chat_template(question_messages, tokenize=False, add_generation_prompt=True)
+        if supports_chat_template(tokenizer):
+            # Chat models: use chat template
+            messages = [
+                {"role": "user", "content": row["question"]},
+                {"role": "assistant", "content": row["answer"]},
+            ]
+            # Full conversation
+            full_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+
+            # Question only (to find where response starts)
+            question_messages = [
+                {"role": "user", "content": row["question"]},
+            ]
+            question_only = tokenizer.apply_chat_template(
+                question_messages, tokenize=False, add_generation_prompt=True
+            )
+        else:
+            # Base models: simple text format
+            # Use the same tokenizer on question_text and full_text so lengths line up
+            question_only = row["question"]
+            full_text = row["question"] + "\n\n" + row["answer"]
         
         return pd.Series({
             "full_text": full_text,
@@ -239,8 +253,7 @@ def main():
     logger.warning(f"Using device: {device}")
     
     # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name, model_max_length=1024)
-    tokenizer.padding_side = "right"
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name, model_max_length=1024, padding_side="right")
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     

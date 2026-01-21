@@ -149,11 +149,11 @@ def train_diffmean(model, tokenizer, df, layer, prefix_length, device, batch_siz
             # For Gemma 2: sequence ends with (A)<end_of_turn>\n, so A/B is at -4
             # Original CAA paper used -2 for Llama 2 which has different chat template
             answer_token_act = activations[i, seq_len - 4]  # Shape: [hidden_size]
-            
-            if row["labels"] == 1:
+                
+                if row["labels"] == 1:
                 positive_sum += answer_token_act
                 positive_count += 1
-            else:
+                else:
                 negative_sum += answer_token_act
                 negative_count += 1
         

@@ -271,9 +271,17 @@ async def evaluate_steering(
     
     # Prepare prompts
     prompts = []
+    use_chat_template = getattr(tokenizer, "chat_template", None) not in (None, "")
     for item in test_data:
-        messages = [{"role": "user", "content": item["question"]}]
-        prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        question = item["question"]
+        if use_chat_template:
+            messages = [{"role": "user", "content": question}]
+            prompt = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+        else:
+            # Base models: plain instruction-style prompt
+            prompt = question + "\n\nAnswer:"
         prompts.append(prompt)
     
     for factor in steering_factors:

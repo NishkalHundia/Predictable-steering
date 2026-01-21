@@ -35,6 +35,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def supports_chat_template(tokenizer) -> bool:
+    """Return True if tokenizer has a chat template configured."""
+    return getattr(tokenizer, "chat_template", None) not in (None, "")
+
+
 # ============================================================================
 # Behavior descriptions for the modification prompt
 # ============================================================================
@@ -162,24 +167,34 @@ def generate_base_completions(
     for batch_start in tqdm(range(0, len(prompts), batch_size), desc="Generating base completions"):
         batch_end = min(batch_start + batch_size, len(prompts))
         batch_prompts = prompts[batch_start:batch_end]
-        
-        # Apply chat template
-        formatted_prompts = []
-        for prompt in batch_prompts:
-            messages = [{"role": "user", "content": prompt}]
-            formatted = tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
-            formatted_prompts.append(formatted)
-        
-        # Tokenize
-        inputs = tokenizer(
-            formatted_prompts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=1024
-        ).to(device)
+
+        # Build model inputs
+        if supports_chat_template(tokenizer):
+            # Chat models: use chat template
+            formatted_prompts = []
+            for prompt in batch_prompts:
+                messages = [{"role": "user", "content": prompt}]
+                formatted = tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+                formatted_prompts.append(formatted)
+
+            inputs = tokenizer(
+                formatted_prompts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=1024
+            ).to(device)
+        else:
+            # Base models: use raw text prompt
+            inputs = tokenizer(
+                batch_prompts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=1024
+            ).to(device)
         
         # Generate
         outputs = model.generate(
