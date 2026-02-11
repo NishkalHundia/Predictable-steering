@@ -167,6 +167,9 @@ def main():
     parser.add_argument("--train_parquet", type=str,
                         default="axbench/concept500/prod_9b_l20_v1/generate/train_data.parquet",
                         help="Path to concept500 training parquet")
+    parser.add_argument("--eval_parquet", type=str,
+                        default="axbench/concept500/prod_9b_l20_v1/inference/latent_eval_data.parquet",
+                        help="Path to concept500 eval parquet (used for test prompts)")
     parser.add_argument("--metadata_jsonl", type=str,
                         default="axbench/concept500/prod_9b_l20_v1/generate/metadata.jsonl",
                         help="Path to concept500 metadata JSONL")
@@ -182,10 +185,12 @@ def main():
     set_seed(args.seed)
 
     # Load data
-    logger.warning(f"Loading data from {args.train_parquet}...")
+    logger.warning(f"Loading train data from {args.train_parquet}...")
     train_df = pd.read_parquet(args.train_parquet)
+    logger.warning(f"Loading eval data from {args.eval_parquet}...")
+    eval_df = pd.read_parquet(args.eval_parquet)
     metadata = load_metadata(args.metadata_jsonl)
-    logger.warning(f"Loaded {len(train_df)} rows, {len(metadata)} concepts")
+    logger.warning(f"Loaded {len(train_df)} train rows, {len(eval_df)} eval rows, {len(metadata)} concepts")
 
     # Select concept IDs
     if args.concept_ids:
@@ -246,7 +251,7 @@ def main():
 
         logger.warning(f"  Positive examples: {len(positive_df)}, Negative examples: {len(negative_df)}")
 
-        # Compute DiffMean steering vector
+        # Compute DiffMean steering vector (from TRAIN data)
         try:
             steering_vector = compute_diffmean_vector(
                 model, tokenizer, positive_df, negative_df, args.layer, device, is_chat_model
@@ -262,8 +267,18 @@ def main():
         torch.save(torch.zeros(1), bias_path)
         logger.warning(f"  Saved steering vector to {weight_path}")
 
-        # Create and save test JSON
-        test_data = create_test_json(positive_df)
+        # Create test JSON from EVAL data (not train) to avoid data leakage
+        eval_positive_df = eval_df[
+            (eval_df["concept_id"] == concept_id)
+            & (eval_df["output_concept"] == concept)
+            & (eval_df["category"] == "positive")
+        ]
+        if eval_positive_df.empty:
+            logger.warning(f"  No eval positives found, falling back to train positives for test prompts")
+            eval_positive_df = positive_df
+        else:
+            logger.warning(f"  Using {len(eval_positive_df)} eval-set positives for test prompts")
+        test_data = create_test_json(eval_positive_df)
         test_path = concept_dir / "test_prompts.json"
         with open(test_path, 'w') as f:
             json.dump(test_data, f, indent=2)

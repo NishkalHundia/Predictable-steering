@@ -22,6 +22,14 @@ Usage (score existing generations from previous eval run):
         --behavior sycophancy \
         --generations_path results/gemma-2-9b-it/sycophancy-open-ended/eval/eval_results.parquet \
         --output_dir results/gemma-2-9b-it/sycophancy-open-ended/eval-axbench
+
+Usage (all AxBench concepts in a directory):
+    uv run python axbench/scripts/eval_caa_axbench_judge.py \
+        --behavior axbench \
+        --model_name google/gemma-2-9b-it \
+        --layer 20 \
+        --axbench_dir results/gemma-2-9b-it/axbench_concepts \
+        --output_dir results/gemma-2-9b-it/axbench_concepts
 """
 import os
 import sys
@@ -444,48 +452,177 @@ async def score_existing_generations(
     return all_results
 
 
+def discover_axbench_concepts(axbench_dir):
+    """
+    Discover concept subdirectories produced by prepare_axbench_concepts.py.
+    Each must contain DiffMean_weight.pt and test_prompts.json.
+    Returns list of (concept_label, concept_name, concept_dir) tuples.
+    """
+    axbench_dir = Path(axbench_dir)
+    concepts = []
+
+    for subdir in sorted(axbench_dir.iterdir()):
+        if not subdir.is_dir():
+            continue
+        weight_path = subdir / "DiffMean_weight.pt"
+        test_path = subdir / "test_prompts.json"
+        if not (weight_path.exists() and test_path.exists()):
+            continue
+
+        config_path = subdir / "config.json"
+        if config_path.exists():
+            with open(config_path) as f:
+                config = json.load(f)
+            concept_name = config.get("concept_name", subdir.name)
+            concept_id = config.get("concept_id", "")
+            label = f"axbench_{concept_id}" if concept_id else subdir.name
+        else:
+            concept_name = subdir.name
+            label = subdir.name
+
+        concepts.append((label, concept_name, subdir))
+
+    return concepts
+
+
+async def run_single_concept_judge(
+    model, tokenizer, device, judge,
+    behavior_label, behavior_description,
+    layer, steering_vector_path, test_dataset_path,
+    output_dir, steering_factors, max_new_tokens,
+    prefix_length, batch_size,
+):
+    """Run axbench judge evaluation for a single concept. Returns (all_results, summary_rows)."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Load steering vector
+    logger.warning(f"Loading steering vector from {steering_vector_path}...")
+    steering_vector = torch.load(steering_vector_path, map_location=device)
+
+    # Load test dataset
+    logger.warning(f"Loading test dataset from {test_dataset_path}...")
+    with open(test_dataset_path, 'r') as f:
+        test_data = json.load(f)
+    logger.warning(f"Loaded {len(test_data)} test examples")
+
+    # Temporarily inject the behavior description so the judge can use it
+    original_desc = BEHAVIOR_DESCRIPTIONS.get(behavior_label)
+    BEHAVIOR_DESCRIPTIONS[behavior_label] = behavior_description
+
+    # Create steering model
+    steering_model = SteeringModel(model, tokenizer, layer, steering_vector, device)
+
+    all_results = await evaluate_with_axbench_judge(
+        steering_model, judge, test_data, behavior_label, steering_factors,
+        tokenizer, max_new_tokens, prefix_length, batch_size
+    )
+
+    # Restore original description
+    if original_desc is not None:
+        BEHAVIOR_DESCRIPTIONS[behavior_label] = original_desc
+    else:
+        BEHAVIOR_DESCRIPTIONS.pop(behavior_label, None)
+
+    # Save per-concept results
+    results_df = pd.DataFrame(all_results)
+    results_df.to_parquet(output_dir / "axbench_eval_results.parquet", engine='pyarrow')
+
+    # Summary per factor
+    summary_rows = []
+    for factor in steering_factors:
+        factor_df = results_df[results_df["steering_factor"] == factor]
+        summary_rows.append({
+            "behavior": behavior_label,
+            "behavior_description": behavior_description,
+            "steering_factor": factor,
+            "behavior_score": factor_df["behavior_score"].mean(),
+            "instruction_score": factor_df["instruction_score"].mean(),
+            "fluency_score": factor_df["fluency_score"].mean(),
+            "harmonic_mean": factor_df["harmonic_mean"].mean(),
+            "harmonic_std": factor_df["harmonic_mean"].std(),
+            "n_examples": len(factor_df),
+        })
+
+    summary_df = pd.DataFrame(summary_rows)
+    summary_df.to_csv(output_dir / "axbench_summary.csv", index=False)
+    summary_df.to_json(output_dir / "axbench_summary.json", orient='records', indent=2)
+
+    logger.warning(f"\n{'='*70}")
+    logger.warning(f"SUMMARY: {behavior_label} ({behavior_description[:60]})")
+    logger.warning(f"{'='*70}")
+    print(summary_df.to_string(index=False))
+
+    # Clean up pyvene hooks
+    del steering_model
+    torch.cuda.empty_cache()
+
+    return summary_rows
+
+
 async def main_async(args):
     # Create output directory
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    
+
     # Create judge
     judge = AsyncAxbenchJudge(model=args.judge_model, max_concurrent=args.max_concurrent)
-    
+
     try:
-        # Check if using existing generations
+        # Check if using existing generations (only for single-concept mode)
         if args.generations_path:
             logger.warning(f"Loading existing generations from {args.generations_path}...")
             generations_df = pd.read_parquet(args.generations_path)
             logger.warning(f"Loaded {len(generations_df)} generations")
-            
+
             steering_factors = sorted(generations_df["steering_factor"].unique())
             logger.warning(f"Steering factors found: {steering_factors}")
-            
+
             all_results = await score_existing_generations(
                 judge, generations_df, args.behavior
             )
+
+            # Save results
+            results_df = pd.DataFrame(all_results)
+            results_df.to_parquet(output_dir / "axbench_eval_results.parquet", engine='pyarrow')
+
+            summary = []
+            for factor in steering_factors:
+                factor_df = results_df[results_df["steering_factor"] == factor]
+                summary.append({
+                    "steering_factor": factor,
+                    "behavior_score": factor_df["behavior_score"].mean(),
+                    "instruction_score": factor_df["instruction_score"].mean(),
+                    "fluency_score": factor_df["fluency_score"].mean(),
+                    "harmonic_mean": factor_df["harmonic_mean"].mean(),
+                    "harmonic_std": factor_df["harmonic_mean"].std(),
+                    "n_examples": len(factor_df)
+                })
+
+            summary_df = pd.DataFrame(summary)
+            summary_df.to_csv(output_dir / "axbench_summary.csv", index=False)
+            summary_df.to_json(output_dir / "axbench_summary.json", orient='records', indent=2)
+
+            logger.warning("\n" + "="*80)
+            logger.warning(f"AXBENCH-STYLE EVALUATION SUMMARY: {args.behavior}")
+            logger.warning("="*80)
+            print(summary_df.to_string(index=False))
+
         else:
-            # Generate new responses
+            # Generate new responses (requires GPU + steering vector)
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             logger.warning(f"Using device: {device}")
-            
+
             steering_factors = [float(x.strip()) for x in args.steering_factors.split(",")]
             logger.warning(f"Steering factors: {steering_factors}")
-            
-            # Load test dataset
-            logger.warning(f"Loading test dataset from {args.test_dataset_path}...")
-            with open(args.test_dataset_path, 'r') as f:
-                test_data = json.load(f)
-            logger.warning(f"Loaded {len(test_data)} test examples")
-            
-            # Load tokenizer
+
+            # Load tokenizer (ONCE)
             tokenizer = AutoTokenizer.from_pretrained(args.model_name, model_max_length=1024)
             tokenizer.padding_side = "left"
             if tokenizer.pad_token is None:
                 tokenizer.pad_token = tokenizer.eos_token
-            
-            # Load model
+
+            # Load model (ONCE)
             logger.warning(f"Loading model {args.model_name}...")
             model = AutoModelForCausalLM.from_pretrained(
                 args.model_name,
@@ -493,54 +630,111 @@ async def main_async(args):
                 device_map=device
             )
             model.eval()
-            
-            # Load steering vector
-            logger.warning(f"Loading steering vector from {args.steering_vector_path}...")
-            steering_vector = torch.load(args.steering_vector_path, map_location=device)
-            
+
             # Get prefix length
             prefix_length = 1
             if args.model_name in CHAT_MODELS:
                 prefix_length = get_prefix_length(tokenizer)
-            
-            # Create steering model
-            steering_model = SteeringModel(model, tokenizer, args.layer, steering_vector, device)
-            
-            all_results = await evaluate_with_axbench_judge(
-                steering_model, judge, test_data, args.behavior, steering_factors,
-                tokenizer, args.max_new_tokens, prefix_length, args.batch_size
-            )
+
+            if args.behavior == "axbench":
+                # ==========================================================
+                # AXBENCH MODE: iterate over all concept subdirs
+                # ==========================================================
+                concepts = discover_axbench_concepts(args.axbench_dir)
+                if not concepts:
+                    print(f"ERROR: No concept subdirs found in {args.axbench_dir}")
+                    print("Each subdir must contain DiffMean_weight.pt and test_prompts.json")
+                    return
+
+                logger.warning(f"Found {len(concepts)} AxBench concepts in {args.axbench_dir}")
+                for label, cname, cdir in concepts:
+                    logger.warning(f"  {label}: {cname} ({cdir})")
+
+                all_concept_summaries = []
+
+                for i, (label, concept_name, concept_dir) in enumerate(concepts):
+                    logger.warning(f"\n{'#'*70}")
+                    logger.warning(f"# Concept {i+1}/{len(concepts)}: {label} — {concept_name}")
+                    logger.warning(f"{'#'*70}")
+
+                    judge_output_dir = concept_dir / "axbench_judge_eval"
+
+                    summary_rows = await run_single_concept_judge(
+                        model, tokenizer, device, judge,
+                        behavior_label=label,
+                        behavior_description=concept_name,
+                        layer=args.layer,
+                        steering_vector_path=str(concept_dir / "DiffMean_weight.pt"),
+                        test_dataset_path=str(concept_dir / "test_prompts.json"),
+                        output_dir=judge_output_dir,
+                        steering_factors=steering_factors,
+                        max_new_tokens=args.max_new_tokens,
+                        prefix_length=prefix_length,
+                        batch_size=args.batch_size,
+                    )
+                    all_concept_summaries.extend(summary_rows)
+
+                # Save combined summary
+                combined_df = pd.DataFrame(all_concept_summaries)
+                combined_path = output_dir / "axbench_judge_all_concepts_summary.csv"
+                combined_df.to_csv(combined_path, index=False)
+                combined_df.to_json(
+                    output_dir / "axbench_judge_all_concepts_summary.json",
+                    orient='records', indent=2
+                )
+
+                logger.warning(f"\n{'='*70}")
+                logger.warning(f"COMBINED SUMMARY ({len(concepts)} concepts)")
+                logger.warning(f"{'='*70}")
+                print(combined_df.to_string(index=False))
+                logger.warning(f"\nSaved combined summary to {combined_path}")
+
+            else:
+                # ==========================================================
+                # SINGLE CONCEPT MODE (original behavior)
+                # ==========================================================
+                logger.warning(f"Loading test dataset from {args.test_dataset_path}...")
+                with open(args.test_dataset_path, 'r') as f:
+                    test_data = json.load(f)
+                logger.warning(f"Loaded {len(test_data)} test examples")
+
+                steering_vector = torch.load(args.steering_vector_path, map_location=device)
+                steering_model = SteeringModel(model, tokenizer, args.layer, steering_vector, device)
+
+                all_results = await evaluate_with_axbench_judge(
+                    steering_model, judge, test_data, args.behavior, steering_factors,
+                    tokenizer, args.max_new_tokens, prefix_length, args.batch_size
+                )
+
+                # Save results
+                results_df = pd.DataFrame(all_results)
+                results_df.to_parquet(output_dir / "axbench_eval_results.parquet", engine='pyarrow')
+
+                summary = []
+                for factor in steering_factors:
+                    factor_df = results_df[results_df["steering_factor"] == factor]
+                    summary.append({
+                        "steering_factor": factor,
+                        "behavior_score": factor_df["behavior_score"].mean(),
+                        "instruction_score": factor_df["instruction_score"].mean(),
+                        "fluency_score": factor_df["fluency_score"].mean(),
+                        "harmonic_mean": factor_df["harmonic_mean"].mean(),
+                        "harmonic_std": factor_df["harmonic_mean"].std(),
+                        "n_examples": len(factor_df)
+                    })
+
+                summary_df = pd.DataFrame(summary)
+                summary_df.to_csv(output_dir / "axbench_summary.csv", index=False)
+                summary_df.to_json(output_dir / "axbench_summary.json", orient='records', indent=2)
+
+                logger.warning("\n" + "="*80)
+                logger.warning(f"AXBENCH-STYLE EVALUATION SUMMARY: {args.behavior}")
+                logger.warning("="*80)
+                print(summary_df.to_string(index=False))
+
     finally:
         await judge.close()
-    
-    # Save results
-    results_df = pd.DataFrame(all_results)
-    results_df.to_parquet(output_dir / "axbench_eval_results.parquet", engine='pyarrow')
-    
-    # Compute summary
-    summary = []
-    for factor in steering_factors:
-        factor_df = results_df[results_df["steering_factor"] == factor]
-        summary.append({
-            "steering_factor": factor,
-            "behavior_score": factor_df["behavior_score"].mean(),
-            "instruction_score": factor_df["instruction_score"].mean(),
-            "fluency_score": factor_df["fluency_score"].mean(),
-            "harmonic_mean": factor_df["harmonic_mean"].mean(),
-            "harmonic_std": factor_df["harmonic_mean"].std(),
-            "n_examples": len(factor_df)
-        })
-    
-    summary_df = pd.DataFrame(summary)
-    summary_df.to_csv(output_dir / "axbench_summary.csv", index=False)
-    summary_df.to_json(output_dir / "axbench_summary.json", orient='records', indent=2)
-    
-    # Print summary
-    logger.warning("\n" + "="*80)
-    logger.warning(f"AXBENCH-STYLE EVALUATION SUMMARY: {args.behavior}")
-    logger.warning("="*80)
-    print(summary_df.to_string(index=False))
-    
+
     logger.warning("\nEvaluation complete!")
 
 
@@ -548,41 +742,50 @@ def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--behavior", type=str, required=True,
-                        choices=list(BEHAVIOR_DESCRIPTIONS.keys()))
+                        help="Target behavior name, or 'axbench' to run all concepts "
+                             "in --axbench_dir. Standard behaviors: "
+                             + ", ".join(BEHAVIOR_DESCRIPTIONS.keys()))
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--judge_model", type=str, default="gpt-4o-mini")
     parser.add_argument("--max_concurrent", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
-    
+
     # Option 1: Score existing generations (fast, no GPU needed)
     parser.add_argument("--generations_path", type=str, default=None,
                         help="Path to existing eval_results.parquet from previous eval run")
-    
+
     # Option 2: Generate new responses (requires GPU + steering vector)
     parser.add_argument("--model_name", type=str, default="google/gemma-2-9b-it")
     parser.add_argument("--layer", type=int, default=20)
     parser.add_argument("--steering_vector_path", type=str, default=None)
     parser.add_argument("--test_dataset_path", type=str, default=None)
+    parser.add_argument("--axbench_dir", type=str, default=None,
+                        help="Directory containing concept subdirs from "
+                             "prepare_axbench_concepts.py. Required when --behavior axbench.")
     parser.add_argument("--use_bf16", action="store_true", default=True)
     parser.add_argument("--max_new_tokens", type=int, default=150)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--steering_factors", type=str, default="-2,-1,0,1,2")
-    
+
     args = parser.parse_args()
-    
+
     # Validate arguments
-    if not args.generations_path and not args.steering_vector_path:
-        parser.error("Must provide either --generations_path (to score existing) or --steering_vector_path (to generate new)")
-    
-    if not args.generations_path and not args.test_dataset_path:
-        parser.error("Must provide --test_dataset_path when generating new responses")
-    
+    if args.behavior == "axbench":
+        if not args.axbench_dir:
+            parser.error("--axbench_dir is required when --behavior is 'axbench'")
+    elif not args.generations_path:
+        if not args.steering_vector_path:
+            parser.error("Must provide either --generations_path (to score existing) "
+                         "or --steering_vector_path (to generate new)")
+        if not args.test_dataset_path:
+            parser.error("Must provide --test_dataset_path when generating new responses")
+
     torch.manual_seed(args.seed)
-    
+
     if not os.environ.get("OPENAI_API_KEY"):
         logger.error("OPENAI_API_KEY not set!")
         sys.exit(1)
-    
+
     asyncio.run(main_async(args))
 
 
