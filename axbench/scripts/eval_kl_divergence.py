@@ -307,8 +307,7 @@ def main():
         description="Compute KL divergence between steered and unsteered first-token distributions."
     )
     parser.add_argument("--behavior", type=str, required=True,
-                        choices=BEHAVIORS,
-                        help="Target behavior / concept name")
+                        help="Target behavior / concept name (used as label in output)")
     parser.add_argument("--model_name", type=str, default="google/gemma-2-9b-it")
     parser.add_argument("--layer", type=int, default=20)
     parser.add_argument("--steering_vector_path", type=str, required=True,
