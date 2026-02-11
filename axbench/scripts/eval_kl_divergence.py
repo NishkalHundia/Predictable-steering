@@ -11,6 +11,7 @@ This is a model-internal metric that requires NO external judge — it directly
 measures how much the steering vector perturbs the next-token distribution.
 
 Usage:
+    # Single concept:
     uv run python axbench/scripts/eval_kl_divergence.py \
         --behavior sycophancy \
         --model_name google/gemma-2-9b-it \
@@ -18,6 +19,14 @@ Usage:
         --steering_vector_path results/gemma-2-9b-it/sycophancy-open-ended/DiffMean_weight.pt \
         --test_dataset_path datasets/generated/sycophancy/test_contrastive.json \
         --output_dir results/gemma-2-9b-it/sycophancy-open-ended/kl_eval
+
+    # All AxBench concepts in a directory (from prepare_axbench_concepts.py):
+    uv run python axbench/scripts/eval_kl_divergence.py \
+        --behavior axbench \
+        --model_name google/gemma-2-9b-it \
+        --layer 20 \
+        --axbench_dir results/gemma-2-9b-it/axbench_concepts \
+        --output_dir results/gemma-2-9b-it/axbench_concepts
 """
 import os
 import sys
@@ -301,89 +310,38 @@ def evaluate_kl_divergence(
     return all_results
 
 
-def main():
-    import argparse
-    parser = argparse.ArgumentParser(
-        description="Compute KL divergence between steered and unsteered first-token distributions."
-    )
-    parser.add_argument("--behavior", type=str, required=True,
-                        help="Target behavior / concept name (used as label in output)")
-    parser.add_argument("--model_name", type=str, default="google/gemma-2-9b-it")
-    parser.add_argument("--layer", type=int, default=20)
-    parser.add_argument("--steering_vector_path", type=str, required=True,
-                        help="Path to saved DiffMean steering vector (.pt)")
-    parser.add_argument("--test_dataset_path", type=str, required=True,
-                        help="Path to test dataset JSON")
-    parser.add_argument("--output_dir", type=str, required=True)
-    parser.add_argument("--use_bf16", action="store_true", default=True)
-    parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--steering_factors", type=str, default="-2,-1,0,1,2",
-                        help="Comma-separated steering factors to evaluate")
-    parser.add_argument("--top_k_tokens", type=int, default=10,
-                        help="Number of top boosted/suppressed tokens to report")
-    parser.add_argument("--seed", type=int, default=42)
-    args = parser.parse_args()
+def run_single_concept(
+    model, tokenizer, device, behavior, layer, steering_vector_path,
+    test_dataset_path, output_dir, steering_factors, prefix_length,
+    batch_size, top_k_tokens,
+):
+    """Run KL divergence evaluation for a single concept. Returns summary rows."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    torch.manual_seed(args.seed)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.warning(f"Using device: {device}")
-
-    # Parse steering factors
-    steering_factors = [float(x.strip()) for x in args.steering_factors.split(",")]
-    logger.warning(f"Steering factors: {steering_factors}")
+    # Load steering vector
+    logger.warning(f"Loading steering vector from {steering_vector_path}...")
+    steering_vector = torch.load(steering_vector_path, map_location=device)
+    logger.warning(f"Steering vector shape: {steering_vector.shape}")
 
     # Load test dataset
-    logger.warning(f"Loading test dataset from {args.test_dataset_path}...")
-    with open(args.test_dataset_path, 'r') as f:
+    logger.warning(f"Loading test dataset from {test_dataset_path}...")
+    with open(test_dataset_path, 'r') as f:
         test_data = json.load(f)
     logger.warning(f"Loaded {len(test_data)} test examples")
 
-    # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name, model_max_length=1024)
-    tokenizer.padding_side = "left"
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    # Load model
-    logger.warning(f"Loading model {args.model_name}...")
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_name,
-        torch_dtype=torch.bfloat16 if args.use_bf16 else None,
-        device_map=device
-    )
-    model.eval()
-
-    # Load steering vector
-    logger.warning(f"Loading steering vector from {args.steering_vector_path}...")
-    steering_vector = torch.load(args.steering_vector_path, map_location=device)
-    logger.warning(f"Steering vector shape: {steering_vector.shape}")
-
-    # Get prefix length
-    prefix_length = 1
-    if args.model_name in CHAT_MODELS:
-        prefix_length = get_prefix_length(tokenizer)
-        logger.warning(f"Chat model prefix length: {prefix_length}")
-
     # Create steering model
-    steering_model = SteeringModel(model, tokenizer, args.layer, steering_vector, device)
-
-    # Create output directory
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    steering_model = SteeringModel(model, tokenizer, layer, steering_vector, device)
 
     # Run evaluation
     all_results = evaluate_kl_divergence(
-        steering_model, test_data, args.behavior, steering_factors,
-        tokenizer, prefix_length, args.batch_size, args.top_k_tokens
+        steering_model, test_data, behavior, steering_factors,
+        tokenizer, prefix_length, batch_size, top_k_tokens
     )
 
-    # ======================================================================
     # Save results
-    # ======================================================================
     results_df = pd.DataFrame(all_results)
 
-    # Per-prompt results
     parquet_path = output_dir / "kl_results.parquet"
     results_df.to_parquet(parquet_path, engine='pyarrow')
     logger.warning(f"Saved per-prompt results to {parquet_path}")
@@ -395,7 +353,7 @@ def main():
         kl_vals = factor_df["kl_divergence"]
         js_vals = factor_df["js_divergence"]
         summary_rows.append({
-            "behavior": args.behavior,
+            "behavior": behavior,
             "steering_factor": factor,
             "effective_strength": factor * steering_model.vector_norm,
             "vector_norm": steering_model.vector_norm,
@@ -413,16 +371,188 @@ def main():
 
     summary_path = output_dir / "kl_summary.csv"
     summary_df.to_csv(summary_path, index=False)
+    summary_df.to_json(output_dir / "kl_summary.json", orient='records', indent=2)
     logger.warning(f"Saved summary to {summary_path}")
 
     # Print summary table
     logger.warning("\n" + "=" * 70)
-    logger.warning(f"KL DIVERGENCE SUMMARY: {args.behavior}")
+    logger.warning(f"KL DIVERGENCE SUMMARY: {behavior}")
     logger.warning("=" * 70)
     print(summary_df.to_string(index=False))
 
-    # Save as JSON too
-    summary_df.to_json(output_dir / "kl_summary.json", orient='records', indent=2)
+    # Clean up pyvene hooks so the model can be reused
+    del steering_model
+    torch.cuda.empty_cache()
+
+    return summary_rows
+
+
+def discover_axbench_concepts(axbench_dir):
+    """
+    Discover concept subdirectories produced by prepare_axbench_concepts.py.
+    Each must contain DiffMean_weight.pt and test_prompts.json.
+    Returns list of (concept_label, concept_dir) tuples.
+    """
+    axbench_dir = Path(axbench_dir)
+    concepts = []
+
+    for subdir in sorted(axbench_dir.iterdir()):
+        if not subdir.is_dir():
+            continue
+        weight_path = subdir / "DiffMean_weight.pt"
+        test_path = subdir / "test_prompts.json"
+        if weight_path.exists() and test_path.exists():
+            # Try to load config for a nice label
+            config_path = subdir / "config.json"
+            if config_path.exists():
+                with open(config_path) as f:
+                    config = json.load(f)
+                label = f"axbench_{config.get('concept_id', subdir.name)}"
+            else:
+                label = subdir.name
+            concepts.append((label, subdir))
+
+    return concepts
+
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="Compute KL divergence between steered and unsteered first-token distributions."
+    )
+    parser.add_argument("--behavior", type=str, required=True,
+                        help="Target behavior / concept name. Use 'axbench' to run all "
+                             "concepts in --axbench_dir.")
+    parser.add_argument("--model_name", type=str, default="google/gemma-2-9b-it")
+    parser.add_argument("--layer", type=int, default=20)
+    parser.add_argument("--steering_vector_path", type=str, default=None,
+                        help="Path to saved DiffMean steering vector (.pt). "
+                             "Not needed when --behavior axbench.")
+    parser.add_argument("--test_dataset_path", type=str, default=None,
+                        help="Path to test dataset JSON. "
+                             "Not needed when --behavior axbench.")
+    parser.add_argument("--axbench_dir", type=str, default=None,
+                        help="Directory containing concept subdirs from "
+                             "prepare_axbench_concepts.py. Required when --behavior axbench.")
+    parser.add_argument("--output_dir", type=str, required=True)
+    parser.add_argument("--use_bf16", action="store_true", default=True)
+    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--steering_factors", type=str, default="-2,-1,0,1,2",
+                        help="Comma-separated steering factors to evaluate")
+    parser.add_argument("--top_k_tokens", type=int, default=10,
+                        help="Number of top boosted/suppressed tokens to report")
+    parser.add_argument("--seed", type=int, default=42)
+    args = parser.parse_args()
+
+    torch.manual_seed(args.seed)
+
+    # Validate args
+    if args.behavior == "axbench":
+        if not args.axbench_dir:
+            print("ERROR: --axbench_dir is required when --behavior is 'axbench'")
+            sys.exit(1)
+    else:
+        if not args.steering_vector_path or not args.test_dataset_path:
+            print("ERROR: --steering_vector_path and --test_dataset_path are required "
+                  "for single-concept mode")
+            sys.exit(1)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.warning(f"Using device: {device}")
+
+    # Parse steering factors
+    steering_factors = [float(x.strip()) for x in args.steering_factors.split(",")]
+    logger.warning(f"Steering factors: {steering_factors}")
+
+    # Load tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name, model_max_length=1024)
+    tokenizer.padding_side = "left"
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # Load model (ONCE — reused across all concepts)
+    logger.warning(f"Loading model {args.model_name}...")
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_name,
+        torch_dtype=torch.bfloat16 if args.use_bf16 else None,
+        device_map=device
+    )
+    model.eval()
+
+    # Get prefix length
+    prefix_length = 1
+    if args.model_name in CHAT_MODELS:
+        prefix_length = get_prefix_length(tokenizer)
+        logger.warning(f"Chat model prefix length: {prefix_length}")
+
+    if args.behavior == "axbench":
+        # ==================================================================
+        # AXBENCH MODE: iterate over all concept subdirs
+        # ==================================================================
+        concepts = discover_axbench_concepts(args.axbench_dir)
+        if not concepts:
+            print(f"ERROR: No concept subdirs found in {args.axbench_dir}")
+            print("Each subdir must contain DiffMean_weight.pt and test_prompts.json")
+            sys.exit(1)
+
+        logger.warning(f"Found {len(concepts)} AxBench concepts in {args.axbench_dir}")
+        for label, cdir in concepts:
+            logger.warning(f"  {label}: {cdir}")
+
+        all_concept_summaries = []
+
+        for i, (label, concept_dir) in enumerate(concepts):
+            logger.warning(f"\n{'#'*70}")
+            logger.warning(f"# Concept {i+1}/{len(concepts)}: {label}")
+            logger.warning(f"{'#'*70}")
+
+            kl_output_dir = concept_dir / "kl_eval"
+
+            summary_rows = run_single_concept(
+                model, tokenizer, device,
+                behavior=label,
+                layer=args.layer,
+                steering_vector_path=str(concept_dir / "DiffMean_weight.pt"),
+                test_dataset_path=str(concept_dir / "test_prompts.json"),
+                output_dir=kl_output_dir,
+                steering_factors=steering_factors,
+                prefix_length=prefix_length,
+                batch_size=args.batch_size,
+                top_k_tokens=args.top_k_tokens,
+            )
+            all_concept_summaries.extend(summary_rows)
+
+        # Save combined summary across all concepts
+        combined_df = pd.DataFrame(all_concept_summaries)
+        output_dir = Path(args.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        combined_path = output_dir / "kl_all_concepts_summary.csv"
+        combined_df.to_csv(combined_path, index=False)
+        combined_df.to_json(output_dir / "kl_all_concepts_summary.json", orient='records', indent=2)
+
+        logger.warning(f"\n{'='*70}")
+        logger.warning(f"COMBINED SUMMARY ({len(concepts)} concepts)")
+        logger.warning(f"{'='*70}")
+        print(combined_df.to_string(index=False))
+        logger.warning(f"\nSaved combined summary to {combined_path}")
+
+    else:
+        # ==================================================================
+        # SINGLE CONCEPT MODE (original behavior)
+        # ==================================================================
+        run_single_concept(
+            model, tokenizer, device,
+            behavior=args.behavior,
+            layer=args.layer,
+            steering_vector_path=args.steering_vector_path,
+            test_dataset_path=args.test_dataset_path,
+            output_dir=args.output_dir,
+            steering_factors=steering_factors,
+            prefix_length=prefix_length,
+            batch_size=args.batch_size,
+            top_k_tokens=args.top_k_tokens,
+        )
 
     logger.warning("\nKL divergence evaluation complete!")
 

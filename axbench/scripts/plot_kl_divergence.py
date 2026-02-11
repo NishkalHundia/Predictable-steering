@@ -1,9 +1,10 @@
 """
 Plot KL divergence results from eval_kl_divergence.py.
 
-Two modes:
+Three modes:
 1. Single-concept: Plot KL vs. steering factor for one behavior
 2. Multi-concept:  Overlay multiple behaviors on the same plot using effective_strength
+3. AxBench auto:   --axbench --axbench_dir <dir> auto-discovers all concept subdirs
 
 Usage:
     # Single concept:
@@ -17,8 +18,13 @@ Usage:
                        results/gemma-2-9b-it/hallucination-open-ended/kl_eval \
                        results/gemma-2-9b-it/myopic-reward-open-ended/kl_eval \
         --behaviors sycophancy hallucination myopic-reward
+
+    # AxBench auto-discover:
+    uv run python axbench/scripts/plot_kl_divergence.py \
+        --axbench --axbench_dir results/gemma-2-9b-it/axbench_concepts
 """
 import argparse
+import json
 import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
@@ -309,27 +315,90 @@ def print_summary_table(all_summaries):
         print(summary_df[cols].to_string(index=False))
 
 
+def discover_axbench_kl_results(axbench_dir):
+    """
+    Auto-discover concept subdirs that have kl_eval/kl_summary.csv.
+    Returns list of (label, kl_eval_dir) tuples.
+    """
+    axbench_dir = Path(axbench_dir)
+    concepts = []
+
+    for subdir in sorted(axbench_dir.iterdir()):
+        if not subdir.is_dir():
+            continue
+        kl_eval_dir = subdir / "kl_eval"
+        summary_path = kl_eval_dir / "kl_summary.csv"
+        if not summary_path.exists():
+            continue
+
+        # Try to load config for a nice label
+        config_path = subdir / "config.json"
+        if config_path.exists():
+            with open(config_path) as f:
+                config = json.load(f)
+            concept_name = config.get("concept_name", subdir.name)
+            concept_id = config.get("concept_id", "")
+            label = f"{concept_id}_{concept_name}" if concept_id else concept_name
+        else:
+            label = subdir.name
+
+        concepts.append((label, kl_eval_dir))
+
+    return concepts
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Plot KL divergence results (single or multi-concept)."
+        description="Plot KL divergence results (single, multi-concept, or axbench auto)."
     )
-    parser.add_argument("--results_dirs", type=str, nargs='+', required=True,
+    parser.add_argument("--results_dirs", type=str, nargs='+', default=None,
                         help="One or more directories containing kl_summary.csv")
-    parser.add_argument("--behaviors", type=str, nargs='+', required=True,
+    parser.add_argument("--behaviors", type=str, nargs='+', default=None,
                         help="Behavior name(s), one per results_dir")
+    parser.add_argument("--axbench", action="store_true",
+                        help="Auto-discover all AxBench concept results in --axbench_dir")
+    parser.add_argument("--axbench_dir", type=str, default=None,
+                        help="Directory containing concept subdirs with kl_eval/ results")
     parser.add_argument("--output_dir", type=str, default=None,
                         help="Where to save plots. Defaults to first results_dir for single, "
+                             "axbench_dir/kl_comparison for axbench, "
                              "or a shared parent for multi.")
     args = parser.parse_args()
 
-    if len(args.results_dirs) != len(args.behaviors):
-        print("ERROR: Must provide the same number of --results_dirs and --behaviors")
-        return
+    # ------------------------------------------------------------------
+    # Resolve which mode we're in and build results_dirs / behaviors
+    # ------------------------------------------------------------------
+    if args.axbench:
+        if not args.axbench_dir:
+            print("ERROR: --axbench_dir is required when --axbench is set")
+            return
+        discovered = discover_axbench_kl_results(args.axbench_dir)
+        if not discovered:
+            print(f"ERROR: No concept subdirs with kl_eval/kl_summary.csv found in {args.axbench_dir}")
+            return
+        logger.warning(f"Auto-discovered {len(discovered)} AxBench concepts in {args.axbench_dir}")
+        behaviors = [label for label, _ in discovered]
+        results_dirs = [str(kl_dir) for _, kl_dir in discovered]
 
+        if args.output_dir is None:
+            args.output_dir = str(Path(args.axbench_dir) / "kl_comparison")
+    else:
+        if not args.results_dirs or not args.behaviors:
+            print("ERROR: --results_dirs and --behaviors are required "
+                  "(or use --axbench --axbench_dir)")
+            return
+        if len(args.results_dirs) != len(args.behaviors):
+            print("ERROR: Must provide the same number of --results_dirs and --behaviors")
+            return
+        results_dirs = args.results_dirs
+        behaviors = args.behaviors
+
+    # ------------------------------------------------------------------
     # Load all results
+    # ------------------------------------------------------------------
     all_summaries = {}
     all_details = {}
-    for rdir, behavior in zip(args.results_dirs, args.behaviors):
+    for rdir, behavior in zip(results_dirs, behaviors):
         summary_df, detail_df = load_results(rdir, behavior)
         all_summaries[behavior] = summary_df
         all_details[behavior] = detail_df
@@ -337,16 +406,15 @@ def main():
     # Determine output dir
     if args.output_dir:
         output_dir = Path(args.output_dir)
-    elif len(args.results_dirs) == 1:
-        output_dir = Path(args.results_dirs[0])
+    elif len(results_dirs) == 1:
+        output_dir = Path(results_dirs[0])
     else:
-        # Use parent of first results dir
-        output_dir = Path(args.results_dirs[0]).parent / "kl_comparison"
+        output_dir = Path(results_dirs[0]).parent / "kl_comparison"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    if len(args.behaviors) == 1:
+    if len(behaviors) == 1:
         # ── Single-concept plots ──
-        behavior = args.behaviors[0]
+        behavior = behaviors[0]
         summary_df = all_summaries[behavior]
         detail_df = all_details[behavior]
 
