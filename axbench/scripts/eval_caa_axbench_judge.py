@@ -575,6 +575,17 @@ async def main_async(args):
             generations_df = pd.read_parquet(args.generations_path)
             logger.warning(f"Loaded {len(generations_df)} generations")
 
+            # Optional factor filtering
+            if args.factor_min is not None or args.factor_max is not None:
+                fmin = args.factor_min if args.factor_min is not None else -float("inf")
+                fmax = args.factor_max if args.factor_max is not None else float("inf")
+                before = len(generations_df)
+                generations_df = generations_df[
+                    (generations_df["steering_factor"] >= fmin) &
+                    (generations_df["steering_factor"] <= fmax)
+                ]
+                logger.warning(f"Filtered factors to [{fmin}, {fmax}]: {before} -> {len(generations_df)} rows")
+
             steering_factors = sorted(generations_df["steering_factor"].unique())
             logger.warning(f"Steering factors found: {steering_factors}")
 
@@ -766,6 +777,10 @@ def main():
     parser.add_argument("--max_new_tokens", type=int, default=150)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--steering_factors", type=str, default="-2,-1,0,1,2")
+    parser.add_argument("--factor_min", type=float, default=None,
+                        help="Min steering factor to keep (for --generations_path mode)")
+    parser.add_argument("--factor_max", type=float, default=None,
+                        help="Max steering factor to keep (for --generations_path mode)")
 
     args = parser.parse_args()
 
