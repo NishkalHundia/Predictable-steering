@@ -538,9 +538,9 @@ def plot_sweep_summary(sweep_summary, behavior, output_dir):
         for factor_label in ["factor_0_avg", "factor_max_avg", "factor_min_avg"]:
             vals = [s.get(factor_label) for s in sweep_summary]
             if all(v is not None for v in vals):
-                style = {"factor_0_avg": ("Baseline (0)", "gray", "--"),
-                         "factor_max_avg": ("Max positive factor", "#E94F37", "-"),
-                         "factor_min_avg": ("Max negative factor", "#2E86AB", "-")}
+                style = {"factor_0_avg": ("Baseline (factor=0)", "gray", "--"),
+                         "factor_max_avg": ("Best score (max across factors)", "#E94F37", "-"),
+                         "factor_min_avg": ("Worst score (min across factors)", "#2E86AB", "-")}
                 label, color, ls = style[factor_label]
                 ax.plot(layers, vals, "o-", label=label, color=color, linestyle=ls,
                         linewidth=2, markersize=6)
@@ -711,10 +711,14 @@ async def main_async(args):
                     f0 = summary_df[summary_df["steering_factor"] == 0]
                     if not f0.empty:
                         entry["factor_0_avg"] = float(f0["avg_score"].values[0])
-                    fmax = summary_df.loc[summary_df["steering_factor"].idxmax()]
-                    fmin = summary_df.loc[summary_df["steering_factor"].idxmin()]
-                    entry["factor_max_avg"] = float(fmax["avg_score"])
-                    entry["factor_min_avg"] = float(fmin["avg_score"])
+                    entry["factor_max_avg"] = float(summary_df["avg_score"].max())
+                    entry["factor_min_avg"] = float(summary_df["avg_score"].min())
+                    entry["best_positive_factor"] = float(
+                        summary_df.loc[summary_df["avg_score"].idxmax(), "steering_factor"]
+                    )
+                    entry["best_negative_factor"] = float(
+                        summary_df.loc[summary_df["avg_score"].idxmin(), "steering_factor"]
+                    )
 
                 sweep_summary.append(entry)
                 logger.warning(
