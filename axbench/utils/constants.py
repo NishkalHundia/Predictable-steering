@@ -26,6 +26,8 @@ CHAT_MODELS = {
     "google/gemma-3-12b-it",
     "google/gemma-3-27b-it",
     "meta-llama/Llama-3.1-8B-Instruct",
+    "meta-llama/Llama-3.2-1B-Instruct",
+    "meta-llama/Llama-3.2-3B-Instruct",
 }
 
 BASE_MODELS = {

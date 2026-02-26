@@ -281,22 +281,22 @@ class LLMJudge:
         if judge_response is None:
             return None
         
-        # Look for Score: [[X]] pattern (can be 0-10)
-        match = re.search(r'Score:\s*\[\[(\d+)\]\]', judge_response)
+        # Try [[X]] first (requested format)
+        match = re.search(r'\[\[(\d+)\]\]', judge_response)
+        if match:
+            score = int(match.group(1))
+            if 0 <= score <= 10:
+                return score
+        
+        # Try [X] (common GPT variant)
+        match = re.search(r'\[(\d+)\]', judge_response)
         if match:
             score = int(match.group(1))
             if 0 <= score <= 10:
                 return score
         
         # Fallback: look for Score: X pattern
-        match = re.search(r'Score:\s*(\d+)', judge_response)
-        if match:
-            score = int(match.group(1))
-            if 0 <= score <= 10:
-                return score
-        
-        # Fallback: look for just [[X]] pattern
-        match = re.search(r'\[\[(\d+)\]\]', judge_response)
+        match = re.search(r'[Ss]core:\s*(\d+)', judge_response)
         if match:
             score = int(match.group(1))
             if 0 <= score <= 10:

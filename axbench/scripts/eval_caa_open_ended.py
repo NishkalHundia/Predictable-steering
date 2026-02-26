@@ -160,21 +160,31 @@ class AsyncLLMJudge:
                 )
                 
                 result = completion.choices[0].message.content.strip()
-                
-                # Extract score from [[X]] format
-                match = re.search(r'\[\[(\d+(?:\.\d+)?)\]\]', result)
-                if match:
-                    score = float(match.group(1))
-                else:
-                    # Fallback: try to find "Score: X" pattern
-                    match = re.search(r'Score:\s*(\d+(?:\.\d+)?)', result)
-                    score = float(match.group(1)) if match else None
-                
+                score = self._extract_score(result)
                 return {"score": score, "explanation": result}
             except Exception as e:
                 logger.error(f"Error scoring response: {e}")
                 return {"score": None, "explanation": str(e)}
     
+    @staticmethod
+    def _extract_score(text: str):
+        """Extract numeric score from judge output, handling [[X]], [X], and bare Score: X."""
+        m = re.search(r'\[\[(\d+(?:\.\d+)?)\]\]', text)
+        if m:
+            return float(m.group(1))
+        m = re.search(r'\[(\d+(?:\.\d+)?)\]', text)
+        if m:
+            return float(m.group(1))
+        m = re.search(r'[Ss]core:\s*(\d+(?:\.\d+)?)', text)
+        if m:
+            return float(m.group(1))
+        m = re.search(r'\b(\d+(?:\.\d+)?)\s*$', text)
+        if m:
+            val = float(m.group(1))
+            if 0 <= val <= 10:
+                return val
+        return None
+
     async def close(self):
         await self.client.close()
 

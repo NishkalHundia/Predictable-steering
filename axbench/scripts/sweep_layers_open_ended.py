@@ -313,16 +313,34 @@ class AsyncLLMJudge:
                     max_tokens=300,
                 )
                 result = completion.choices[0].message.content.strip()
-                match = re.search(r"\[\[(\d+(?:\.\d+)?)\]\]", result)
-                if match:
-                    score = float(match.group(1))
-                else:
-                    match = re.search(r"Score:\s*(\d+(?:\.\d+)?)", result)
-                    score = float(match.group(1)) if match else None
+                score = self._extract_score(result)
                 return {"score": score, "explanation": result}
             except Exception as e:
                 logger.error(f"Judge error: {e}")
                 return {"score": None, "explanation": str(e)}
+
+    @staticmethod
+    def _extract_score(text: str):
+        """Extract numeric score from judge output, handling [[X]], [X], and bare Score: X."""
+        # Try [[X]] first (requested format)
+        m = re.search(r"\[\[(\d+(?:\.\d+)?)\]\]", text)
+        if m:
+            return float(m.group(1))
+        # Try [X] (common GPT variant)
+        m = re.search(r"\[(\d+(?:\.\d+)?)\]", text)
+        if m:
+            return float(m.group(1))
+        # Try Score: X (bare number after "Score:")
+        m = re.search(r"[Ss]core:\s*(\d+(?:\.\d+)?)", text)
+        if m:
+            return float(m.group(1))
+        # Last resort: any standalone number 0-10 at end of text
+        m = re.search(r"\b(\d+(?:\.\d+)?)\s*$", text)
+        if m:
+            val = float(m.group(1))
+            if 0 <= val <= 10:
+                return val
+        return None
 
     async def close(self):
         await self.client.close()
