@@ -112,10 +112,10 @@ def sample_category(
     Sample n rows matching exact (behavior_score, fluency_score) from random
     (behavior, layer) pairs. Returns sampled rows.
     """
-    # Filter to exact matches, excluding already-used rows
+    # Filter to exact matches (handle both int and float representations)
     mask = (
-        (pool["behavior_score"] == behavior_score)
-        & (pool["fluency_score"] == fluency_score)
+        (pool["behavior_score"].isin([behavior_score, float(behavior_score)]))
+        & (pool["fluency_score"].isin([fluency_score, float(fluency_score)]))
         & (~pool.index.isin(used_indices))
     )
     candidates = pool[mask]
