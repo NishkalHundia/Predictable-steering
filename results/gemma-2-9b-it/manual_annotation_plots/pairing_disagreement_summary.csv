@@ -1,9 +1,9 @@
 metric,pairing,n,original_mean,human_mean,mean_delta,mae
-Behavior score,high_behavior_low_fluency,88,10.0,1.2954545454545454,-8.704545454545455,8.704545454545455
-Behavior score,high_behavior_high_fluency,97,10.0,3.2731958762886597,-6.72680412371134,6.72680412371134
-Behavior score,low_behavior_high_fluency,100,0.0,0.87,0.87,1.85
-Behavior score,low_behavior_low_fluency,90,0.0,0.6166666666666667,0.6166666666666667,0.8166666666666667
-Fluence score,low_behavior_low_fluency,100,0.0,0.35,0.35,0.35
-Fluence score,high_behavior_low_fluency,100,0.0,0.3,0.3,0.3
-Fluence score,high_behavior_high_fluency,99,2.0,1.8686868686868687,-0.13131313131313133,0.13131313131313133
-Fluence score,low_behavior_high_fluency,100,2.0,1.99,-0.01,0.01
+Behavior score,low_behavior_low_fluency,3,-5.0,-1.0,4.0,4.0
+Behavior score,high_behavior_low_fluency,31,5.0,1.7580645161290323,-3.2419354838709675,3.2419354838709675
+Behavior score,low_behavior_high_fluency,15,-5.0,-3.6,1.4,1.4
+Behavior score,high_behavior_high_fluency,54,5.0,4.944444444444445,-0.05555555555555555,0.05555555555555555
+Fluence score,high_behavior_low_fluency,39,0.0,0.23076923076923078,0.23076923076923078,0.23076923076923078
+Fluence score,high_behavior_high_fluency,54,2.0,2.0,0.0,0.0
+Fluence score,low_behavior_high_fluency,15,2.0,2.0,0.0,0.0
+Fluence score,low_behavior_low_fluency,3,0.0,0.0,0.0,0.0
