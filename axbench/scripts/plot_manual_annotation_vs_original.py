@@ -89,8 +89,10 @@ def _prepare_metric_pairs(
         human_slice = human_df[human_keep].copy()
 
         merged = original_slice.merge(human_slice, on=usable_keys, how="inner", suffixes=("_original", "_human"))
-        merged["original_score"] = pd.to_numeric(merged[orig_metric], errors="coerce")
-        merged["human_score"] = pd.to_numeric(merged[human_metric], errors="coerce")
+        orig_metric_merged = _resolve_merged_col(merged, orig_metric, prefer="original")
+        human_metric_merged = _resolve_merged_col(merged, human_metric, prefer="human")
+        merged["original_score"] = pd.to_numeric(merged[orig_metric_merged], errors="coerce")
+        merged["human_score"] = pd.to_numeric(merged[human_metric_merged], errors="coerce")
         merged = merged.dropna(subset=["original_score", "human_score"]).copy()
 
         if merged.empty:
@@ -108,6 +110,21 @@ def _prepare_metric_pairs(
         out.append(merged[["annotator", "pairing", "metric", "original_score", "human_score"]])
 
     return out
+
+
+def _resolve_merged_col(df: pd.DataFrame, base_col: str, prefer: str) -> str:
+    if base_col in df.columns:
+        return base_col
+    preferred = f"{base_col}_{prefer}"
+    if preferred in df.columns:
+        return preferred
+    if prefer == "original":
+        fallback = f"{base_col}_human"
+    else:
+        fallback = f"{base_col}_original"
+    if fallback in df.columns:
+        return fallback
+    raise KeyError(f"Could not resolve merged column for '{base_col}' (prefer={prefer}).")
 
 
 def _derive_pairing_labels(
@@ -160,28 +177,60 @@ def _plot_pairs(all_pairs: pd.DataFrame, output_path: Path) -> None:
     axes = axes[0]
 
     for ax, metric in zip(axes, metrics_present):
-        metric_df = all_pairs[all_pairs["metric"] == metric]
-        annotators = sorted(metric_df["annotator"].unique())
-
-        for annotator in annotators:
-            sub = metric_df[metric_df["annotator"] == annotator]
-            ax.scatter(
-                sub["original_score"],
-                sub["human_score"],
-                alpha=0.75,
-                s=28,
-                label=f"{annotator} (n={len(sub)})",
-            )
-
+        metric_df = all_pairs[all_pairs["metric"] == metric].copy()
         corr = metric_df["original_score"].corr(metric_df["human_score"])
-        ax.plot([0, 10], [0, 10], linestyle="--", linewidth=1.2, color="black", alpha=0.7)
-        ax.set_xlim(0, 10)
-        ax.set_ylim(0, 10)
+
+        max_score = float(
+            max(
+                metric_df["original_score"].max(),
+                metric_df["human_score"].max(),
+            )
+        )
+        max_unique = max(metric_df["original_score"].nunique(), metric_df["human_score"].nunique())
+        if max_unique > 40:
+            bin_size = 0.5
+        elif max_unique > 20:
+            bin_size = 0.25
+        else:
+            bin_size = 0.0
+
+        if bin_size > 0:
+            metric_df["original_plot"] = np.round(metric_df["original_score"] / bin_size) * bin_size
+            metric_df["human_plot"] = np.round(metric_df["human_score"] / bin_size) * bin_size
+            bin_text = f"bin={bin_size:g}"
+        else:
+            metric_df["original_plot"] = metric_df["original_score"]
+            metric_df["human_plot"] = metric_df["human_score"]
+            bin_text = "bin=exact"
+
+        bubbles = (
+            metric_df.groupby(["original_plot", "human_plot"], as_index=False)
+            .size()
+            .rename(columns={"size": "count"})
+        )
+        marker_size = 35 + 22 * np.sqrt(bubbles["count"])
+        sc = ax.scatter(
+            bubbles["original_plot"],
+            bubbles["human_plot"],
+            s=marker_size,
+            c=bubbles["count"],
+            cmap="viridis",
+            alpha=0.85,
+            edgecolors="black",
+            linewidths=0.4,
+        )
+
+        axis_upper = 10.5 if max_score > 2.5 else 2.2
+        ax.plot([0, axis_upper], [0, axis_upper], linestyle="--", linewidth=1.2, color="black", alpha=0.7)
+        ax.set_xlim(0, axis_upper)
+        ax.set_ylim(0, axis_upper)
         ax.set_xlabel("Original LM judge score")
         ax.set_ylabel("Human score")
-        ax.set_title(f"{metric} (all annotators)\nN={len(metric_df)}, r={corr:.3f}")
+        ax.set_title(
+            f"{metric} (bubble=count)\nN={len(metric_df)}, r={corr:.3f}, {bin_text}"
+        )
         ax.grid(alpha=0.25)
-        ax.legend(fontsize=9, loc="best")
+        plt.colorbar(sc, ax=ax, fraction=0.046, pad=0.04, label="Overlapping points")
 
     plt.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -328,7 +377,7 @@ def main() -> None:
     out_summary = output_dir / "original_vs_human_summary.csv"
     summary.to_csv(out_summary, index=False)
 
-    out_plot = output_dir / "original_vs_human_scatter.png"
+    out_plot = output_dir / "original_vs_human_bubble.png"
     _plot_pairs(all_pairs, out_plot)
 
     pairing_summary = None
