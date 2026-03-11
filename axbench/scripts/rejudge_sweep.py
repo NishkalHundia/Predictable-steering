@@ -281,7 +281,7 @@ class AsyncJudge:
                     model=self.model,
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0,
-                    max_tokens=400,
+                    max_completion_tokens=400,
                 )
                 return completion.choices[0].message.content.strip()
             except Exception as e:
