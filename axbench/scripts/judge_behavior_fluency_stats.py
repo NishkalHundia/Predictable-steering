@@ -10,15 +10,16 @@ Key metrics:
 - Distribution of behavior when fluency=0
 - Cross-tab of behavior × fluency
 
-Structure: {results_dir}/{behavior}/layer_{N}/eval/eval_results.parquet
-           {results_dir}/{behavior}/layer_{N}/eval_axbench/eval_results.parquet
+Structure:
+  Old judge: {results_dir}/{behavior}-sweep/layer_{N}/eval/...
+  New judge: {results_dir}/{behavior}/layer_{N}/eval/...  (no -sweep suffix)
 
 Usage:
     uv run python axbench/scripts/judge_behavior_fluency_stats.py
 
     uv run python axbench/scripts/judge_behavior_fluency_stats.py \
-        --old_dir results/gemma-2-9b-it/old_judge/behavior-sweep \
-        --new_dir results/gemma-2-9b-it/new_judge/behavior-sweep
+        --old_dir results/gemma-2-9b-it/old_judge \
+        --new_dir results/gemma-2-9b-it/new_judge
 """
 import argparse
 import re
@@ -27,14 +28,25 @@ from pathlib import Path
 import pandas as pd
 
 
-def load_all_data(results_dir: Path) -> pd.DataFrame | None:
-    """Load and merge eval + eval_axbench across all behaviors and layers."""
+def load_all_data(results_dir: Path, use_sweep_suffix: bool = True) -> pd.DataFrame | None:
+    """Load and merge eval + eval_axbench across all behaviors and layers.
+    use_sweep_suffix=True (old judge): expects {behavior}-sweep/ subdirs
+    use_sweep_suffix=False (new judge): expects {behavior}/ subdirs directly
+    """
     all_dfs = []
-    for behavior_dir in sorted(results_dir.iterdir()):
-        if not behavior_dir.is_dir():
+    for subdir in sorted(results_dir.iterdir()):
+        if not subdir.is_dir():
             continue
-        behavior = behavior_dir.name
-        for layer_dir in sorted(behavior_dir.iterdir()):
+        if use_sweep_suffix:
+            if not subdir.name.endswith("-sweep"):
+                continue
+            behavior = subdir.name[:-6]  # strip "-sweep"
+        else:
+            behavior = subdir.name
+        layer_dirs = sorted(d for d in subdir.iterdir() if d.is_dir() and re.match(r"layer_\d+", d.name))
+        if not layer_dirs:
+            continue
+        for layer_dir in layer_dirs:
             if not layer_dir.is_dir():
                 continue
             m = re.match(r"layer_(\d+)", layer_dir.name)
@@ -127,14 +139,14 @@ def main():
     parser.add_argument(
         "--old_dir",
         type=str,
-        default="results/gemma-2-9b-it/old_judge/behavior-sweep",
-        help="Path to old judge sweep results",
+        default="results/gemma-2-9b-it/old_judge",
+        help="Path to old judge dir (contains {behavior}-sweep/ subdirs)",
     )
     parser.add_argument(
         "--new_dir",
         type=str,
-        default="results/gemma-2-9b-it/new_judge/behavior-sweep",
-        help="Path to new judge sweep results",
+        default="results/gemma-2-9b-it/new_judge",
+        help="Path to new judge dir (contains {behavior}-sweep/ subdirs)",
     )
     parser.add_argument(
         "--output",
@@ -150,7 +162,7 @@ def main():
     results = []
 
     if old_path.exists():
-        old_df = load_all_data(old_path)
+        old_df = load_all_data(old_path, use_sweep_suffix=True)
         if old_df is not None:
             stats = compute_stats(old_df, "old_judge", high_beh=10.0, high_beh_label="10")
             results.append(stats)
@@ -167,7 +179,7 @@ def main():
         print(f"Old dir not found: {old_path}")
 
     if new_path.exists():
-        new_df = load_all_data(new_path)
+        new_df = load_all_data(new_path, use_sweep_suffix=False)
         if new_df is not None:
             stats = compute_stats(new_df, "new_judge", high_beh=5.0, high_beh_label="5")
             results.append(stats)
