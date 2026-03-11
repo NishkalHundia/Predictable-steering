@@ -8,7 +8,7 @@ Usage:
     python axbench/scripts/retrieve_eval_from_sample.py \
         --sample_csv steering_samples.csv \
         --results_dir results/gemma-2-9b-it \
-        --output retrieved_eval.parquet
+        --output retrieved_eval.csv
 """
 import argparse
 import re
@@ -46,10 +46,8 @@ def main():
                         help="Path to CSV from sample_steering_sheet.py")
     parser.add_argument("--results_dir", type=str, required=True,
                         help="Path to results root (e.g. results/gemma-2-9b-it)")
-    parser.add_argument("--output", type=str, default="retrieved_eval.parquet",
-                        help="Output parquet path")
-    parser.add_argument("--output_csv", type=str, default=None,
-                        help="Optional: also save as CSV")
+    parser.add_argument("--output", type=str, default="retrieved_eval.csv",
+                        help="Output CSV path")
     args = parser.parse_args()
 
     results_dir = Path(args.results_dir)
@@ -101,12 +99,8 @@ def main():
         raise RuntimeError("No matching entries found. Check paths and CSV columns.")
 
     out_df = pd.DataFrame(retrieved)
-    out_df.to_parquet(args.output, index=False, engine="pyarrow")
+    out_df.to_csv(args.output, index=False)
     print(f"Saved {len(out_df)} rows to {args.output}")
-
-    if args.output_csv:
-        out_df.to_csv(args.output_csv, index=False)
-        print(f"Saved {len(out_df)} rows to {args.output_csv}")
 
 
 if __name__ == "__main__":
