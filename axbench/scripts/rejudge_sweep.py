@@ -14,6 +14,12 @@ Usage:
         --behavior hallucination \
         --sweep_dir results/gemma-2-9b-it/hallucination \
         --judge_model gpt-4o-mini
+
+    # Skip axbench rejudging (use existing eval_axbench/ data if present):
+    uv run python axbench/scripts/rejudge_sweep.py ... --no_rejudge_axbench
+
+    # Only use examples with fluency_score >= 1 for metrics/plots:
+    uv run python axbench/scripts/rejudge_sweep.py ... --fluency_filter 1
 """
 import os
 import sys
@@ -558,35 +564,60 @@ async def main_async(args):
                 generations["ground_truth_negative"] = old_df["ground_truth_negative"].values
 
             # --- Axbench judge (0-2, 3 metrics) ---
-            logger.warning(f"  Running axbench judge ({n} * 3 calls)...")
-            ax_tasks = [
-                judge.axbench_score(row["question"], row["generation"], behavior)
-                for _, row in generations.iterrows()
-            ]
-            ax_results = await asyncio.gather(*ax_tasks)
+            if args.rejudge_axbench:
+                logger.warning(f"  Running axbench judge ({n} * 3 calls)...")
+                ax_tasks = [
+                    judge.axbench_score(row["question"], row["generation"], behavior)
+                    for _, row in generations.iterrows()
+                ]
+                ax_results = await asyncio.gather(*ax_tasks)
 
-            ax_df = generations[["question_idx", "question", "steering_factor", "generation"]].copy()
-            ax_df["concept_score"] = [r["concept_score"] for r in ax_results]
-            ax_df["instruct_score"] = [r["instruct_score"] for r in ax_results]
-            ax_df["fluency_score"] = [r["fluency_score"] for r in ax_results]
-            ax_df["harmonic_mean"] = [r["harmonic_mean"] for r in ax_results]
-            ax_df["concept_explanation"] = [r["concept_explanation"] for r in ax_results]
-            ax_df["instruct_explanation"] = [r["instruct_explanation"] for r in ax_results]
-            ax_df["fluency_explanation"] = [r["fluency_explanation"] for r in ax_results]
+                ax_df = generations[["question_idx", "question", "steering_factor", "generation"]].copy()
+                ax_df["concept_score"] = [r["concept_score"] for r in ax_results]
+                ax_df["instruct_score"] = [r["instruct_score"] for r in ax_results]
+                ax_df["fluency_score"] = [r["fluency_score"] for r in ax_results]
+                ax_df["harmonic_mean"] = [r["harmonic_mean"] for r in ax_results]
+                ax_df["concept_explanation"] = [r["concept_explanation"] for r in ax_results]
+                ax_df["instruct_explanation"] = [r["instruct_explanation"] for r in ax_results]
+                ax_df["fluency_explanation"] = [r["fluency_explanation"] for r in ax_results]
+
+                # --- Save axbench results ---
+                ax_df.to_parquet(axbench_dir / "eval_results.parquet", engine="pyarrow")
+                ax_for_summary = ax_df
+            else:
+                logger.warning(f"  Skipping axbench rejudge (--no_rejudge_axbench)")
+                ax_for_summary = pd.DataFrame()
+                axbench_parquet = axbench_dir / "eval_results.parquet"
+                if axbench_parquet.exists():
+                    ax_for_summary = pd.read_parquet(axbench_parquet)
+
+            # --- Apply fluency filter for metrics/plots ---
+            if args.fluency_filter is not None and not ax_for_summary.empty and "fluency_score" in ax_for_summary.columns:
+                mask = ax_for_summary["fluency_score"] >= args.fluency_filter
+                n_before, n_after = len(mask), int(mask.sum())
+                logger.warning(f"  Fluency filter >= {args.fluency_filter}: using {n_after}/{n_before} examples for metrics/plots")
+                ax_for_summary = ax_for_summary[mask].reset_index(drop=True)
+                generations_for_summary = generations.loc[mask.values].reset_index(drop=True) if len(generations) == len(mask) else generations
+                if len(generations) != len(mask):
+                    logger.warning(f"  Row count mismatch (gen={len(generations)}, ax={len(mask)}), skipping fluency filter for behavior")
+            else:
+                generations_for_summary = generations
+
+            if not ax_for_summary.empty:
+                ax_summary = summarize_axbench(ax_for_summary)
+                if args.rejudge_axbench:
+                    ax_summary.to_csv(axbench_dir / "axbench_summary.csv", index=False)
+                    ax_summary.to_json(axbench_dir / "axbench_summary.json", orient="records", indent=2)
+                plot_axbench_per_layer(ax_summary, behavior, layer, axbench_dir / "axbench_plot.png")
+            else:
+                ax_summary = pd.DataFrame()
 
             # --- Save behavior results (overwrite old) ---
             generations.to_parquet(eval_dir / "eval_results.parquet", engine="pyarrow")
-            beh_summary = summarize_behavior(generations)
+            beh_summary = summarize_behavior(generations_for_summary)
             beh_summary.to_csv(eval_dir / "summary.csv", index=False)
             beh_summary.to_json(eval_dir / "summary.json", orient="records", indent=2)
             plot_behavior_per_layer(beh_summary, behavior, layer, eval_dir / "steering_plot.png")
-
-            # --- Save axbench results ---
-            ax_df.to_parquet(axbench_dir / "eval_results.parquet", engine="pyarrow")
-            ax_summary = summarize_axbench(ax_df)
-            ax_summary.to_csv(axbench_dir / "axbench_summary.csv", index=False)
-            ax_summary.to_json(axbench_dir / "axbench_summary.json", orient="records", indent=2)
-            plot_axbench_per_layer(ax_summary, behavior, layer, axbench_dir / "axbench_plot.png")
 
             # --- Build sweep summary entry ---
             sep_path = layer_dir / "separability.json"
@@ -609,8 +640,8 @@ async def main_async(args):
             sweep_summary.append(entry)
 
             null_beh = generations["behavior_score"].isna().sum()
-            logger.warning(f"  Layer {layer} done — behavior nulls: {null_beh}/{n}, "
-                           f"axbench avg HM: {ax_df['harmonic_mean'].mean():.2f}")
+            ax_msg = f"axbench avg HM: {ax_summary['harmonic_mean'].mean():.2f}" if not ax_summary.empty else "axbench skipped"
+            logger.warning(f"  Layer {layer} done — behavior nulls: {null_beh}/{n}, {ax_msg}")
 
     finally:
         await judge.close()
@@ -631,9 +662,14 @@ def main():
                         choices=list(BEHAVIOR_JUDGE_PROMPTS.keys()))
     parser.add_argument("--sweep_dir", type=str, required=True,
                         help="Path to sweep output dir (contains layer_N/ subdirs)")
-    parser.add_argument("--judge_model", type=str, default="gpt-4o-mini")
-    parser.add_argument("--max_concurrent", type=int, default=10)
+    parser.add_argument("--judge_model", type=str, default="gpt-5-mini")
+    parser.add_argument("--max_concurrent", type=int, default=128)
+    parser.add_argument("--no_rejudge_axbench", action="store_true",
+                        help="Skip axbench rejudging; use existing eval_axbench/ data if present")
+    parser.add_argument("--fluency_filter", type=float, default=None,
+                        help="Only use examples with fluency_score >= this value for metrics/plots (requires axbench data)")
     args = parser.parse_args()
+    args.rejudge_axbench = not args.no_rejudge_axbench
 
     if not os.environ.get("OPENAI_API_KEY"):
         logger.error("OPENAI_API_KEY not set!")
