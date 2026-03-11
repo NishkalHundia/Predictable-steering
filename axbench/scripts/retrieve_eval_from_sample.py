@@ -66,34 +66,32 @@ def main():
             raise ValueError(f"Sample CSV missing column: {c}")
 
     retrieved = []
-    seen = set()
+    merged_cache = {}
 
-    for (behavior, layer), group in sample.groupby(["behavior", "layer"]):
-        merged = discover_and_merge(results_dir, str(behavior), int(layer))
+    for _, row in sample.iterrows():
+        behavior = str(row["behavior"])
+        layer = int(row["layer"])
+        cache_key = (behavior, layer)
+        if cache_key not in merged_cache:
+            merged_cache[cache_key] = discover_and_merge(results_dir, behavior, layer)
+        merged = merged_cache[cache_key]
         if merged is None:
             print(f"Warning: no data for {behavior}/layer_{layer}")
             continue
 
-        for _, row in group.iterrows():
-            q = str(row["question"]).strip() if pd.notna(row["question"]) else ""
-            g = str(row["generation"]).strip() if pd.notna(row["generation"]) else ""
-            sf = row["steering_factor"]
-            mask = (
-                (merged["question"].astype(str).str.strip() == q)
-                & (merged["generation"].astype(str).str.strip() == g)
-                & (merged["steering_factor"] == sf)
-            )
-            matches = merged[mask]
-            if len(matches) == 0:
-                print(f"Warning: no match for {behavior}/layer_{layer} steering_factor={row['steering_factor']}")
-                continue
-            if len(matches) > 1:
-                matches = matches.head(1)
-            key = (behavior, layer, row["question"], row["generation"], row["steering_factor"])
-            if key in seen:
-                continue
-            seen.add(key)
-            retrieved.append(matches.iloc[0])
+        q = str(row["question"]).strip() if pd.notna(row["question"]) else ""
+        g = str(row["generation"]).strip() if pd.notna(row["generation"]) else ""
+        sf = row["steering_factor"]
+        mask = (
+            (merged["question"].astype(str).str.strip() == q)
+            & (merged["generation"].astype(str).str.strip() == g)
+            & (merged["steering_factor"] == sf)
+        )
+        matches = merged[mask]
+        if len(matches) == 0:
+            print(f"Warning: no match for {behavior}/layer_{layer} steering_factor={sf}")
+            continue
+        retrieved.append(matches.iloc[0])
 
     if not retrieved:
         raise RuntimeError("No matching entries found. Check paths and CSV columns.")
