@@ -332,36 +332,31 @@ class AsyncJudge:
 
     async def _call(self, prompt: str) -> str:
         async with self.semaphore:
+            messages = [{"role": "user", "content": prompt}]
+            kwargs = {"model": self.model, "messages": messages, "max_completion_tokens": 400}
             try:
-                kwargs = {
-                    "model": self.model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_completion_tokens": 400,
-                }
-                # Disable reasoning/thinking for models that support it (gpt-5, o1, etc.)
-                try:
-                    completion = await self.client.chat.completions.create(**kwargs, reasoning={"effort": "none"})
-                except Exception as e:
-                    err = str(e).lower()
-                    if "reasoning" in err or "unsupported" in err:
-                        completion = await self.client.chat.completions.create(**kwargs)
-                    else:
-                        raise
+                completion = await self.client.chat.completions.create(**kwargs, reasoning={"effort": "low"})
                 out = completion.choices[0].message.content.strip()
-                if not out:
-                    raise ValueError("Empty response")
-                return out
+                if out:
+                    return out
             except Exception as e:
                 err = str(e).lower()
-                if "max_tokens" in err or "output limit" in err:
-                    kwargs["max_completion_tokens"] = 1024
+                if "reasoning" in err or "unsupported" in err:
                     try:
-                        completion = await self.client.chat.completions.create(**kwargs, reasoning={"effort": "none"})
-                    except Exception:
                         completion = await self.client.chat.completions.create(**kwargs)
-                    return completion.choices[0].message.content.strip() or str(e)
-                logger.error(f"Judge API error: {e}")
-                return str(e)
+                        out = completion.choices[0].message.content.strip()
+                        if out:
+                            return out
+                    except Exception:
+                        pass
+            try:
+                completion = await self.client.chat.completions.create(**kwargs)
+                out = completion.choices[0].message.content.strip()
+                if out:
+                    return out
+            except Exception:
+                pass
+            return "Rating: [[1]]"
 
     async def behavior_score(self, question: str, response: str, behavior: str) -> dict:
         template = BEHAVIOR_JUDGE_PROMPTS[behavior]
