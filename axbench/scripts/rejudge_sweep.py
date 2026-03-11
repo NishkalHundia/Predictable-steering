@@ -347,8 +347,19 @@ class AsyncJudge:
                         completion = await self.client.chat.completions.create(**kwargs)
                     else:
                         raise
-                return completion.choices[0].message.content.strip()
+                out = completion.choices[0].message.content.strip()
+                if not out:
+                    raise ValueError("Empty response")
+                return out
             except Exception as e:
+                err = str(e).lower()
+                if "max_tokens" in err or "output limit" in err:
+                    kwargs["max_completion_tokens"] = 1024
+                    try:
+                        completion = await self.client.chat.completions.create(**kwargs, reasoning={"effort": "none"})
+                    except Exception:
+                        completion = await self.client.chat.completions.create(**kwargs)
+                    return completion.choices[0].message.content.strip() or str(e)
                 logger.error(f"Judge API error: {e}")
                 return str(e)
 
