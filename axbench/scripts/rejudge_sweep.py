@@ -20,6 +20,9 @@ Usage:
 
     # Only use examples with fluency_score >= 1 for metrics/plots:
     uv run python axbench/scripts/rejudge_sweep.py ... --fluency_filter 1
+
+    # Remake plots only (no rejudging, uses existing data, applies fluency_filter if set):
+    uv run python axbench/scripts/rejudge_sweep.py ... --replot_only
 """
 import os
 import sys
@@ -455,6 +458,13 @@ def plot_behavior_per_layer(summary_df, behavior, layer, output_path):
         summary_df["steering_factor"], summary_df["avg_score"],
         yerr=summary_df["std_score"], marker="o", linewidth=2, capsize=4, color="#2E86AB",
     )
+    if "n_examples" in summary_df.columns:
+        for _, row in summary_df.iterrows():
+            ax.annotate(
+                f"n={int(row['n_examples'])}",
+                (row["steering_factor"], row["avg_score"]),
+                xytext=(0, 8), textcoords="offset points", fontsize=7, ha="center",
+            )
     if ref_line is not None:
         ax.axhline(y=ref_line, color="gray", linestyle="--", alpha=0.5)
     ax.axvline(x=0, color="gray", linestyle=":", alpha=0.5)
@@ -477,6 +487,13 @@ def plot_axbench_per_layer(summary_df, behavior, layer, output_path):
     ax1.plot(summary_df["steering_factor"], summary_df["instruct_score"], "s-", label="Instruct", color=colors[1], linewidth=2)
     ax1.plot(summary_df["steering_factor"], summary_df["fluency_score"], "^-", label="Fluency", color=colors[2], linewidth=2)
     ax1.plot(summary_df["steering_factor"], summary_df["harmonic_mean"], "D-", label="Harmonic", color=colors[3], linewidth=2.5)
+    if "n_examples" in summary_df.columns:
+        for _, row in summary_df.iterrows():
+            ax1.annotate(
+                f"n={int(row['n_examples'])}",
+                (row["steering_factor"], row["harmonic_mean"]),
+                xytext=(0, 8), textcoords="offset points", fontsize=7, ha="center",
+            )
     ax1.axhline(y=1, color="gray", linestyle="--", alpha=0.5)
     ax1.axvline(x=0, color="gray", linestyle=":", alpha=0.5)
     ax1.set_xlabel("Steering Factor")
@@ -487,6 +504,12 @@ def plot_axbench_per_layer(summary_df, behavior, layer, output_path):
     ax2 = axes[1]
     x = np.arange(len(summary_df))
     ax2.bar(x, summary_df["harmonic_mean"], yerr=summary_df["harmonic_std"], capsize=4, color="#6B2D5C", alpha=0.8)
+    if "n_examples" in summary_df.columns:
+        for i, (_, row) in enumerate(summary_df.iterrows()):
+            y_off = row["harmonic_mean"] + 0.08
+            if pd.notna(row.get("harmonic_std")):
+                y_off += row["harmonic_std"]
+            ax2.text(i, min(y_off, 2.0), f"n={int(row['n_examples'])}", ha="center", fontsize=7)
     ax2.axhline(y=1, color="gray", linestyle="--", alpha=0.5)
     ax2.set_xticks(x)
     ax2.set_xticklabels([f"{f:.0f}" if f == int(f) else f"{f}" for f in summary_df["steering_factor"]], fontsize=7, rotation=45)
@@ -538,6 +561,10 @@ def plot_sweep_summary(sweep_summary, behavior, output_dir):
             vals = [s.get(key) for s in sweep_summary]
             if all(v is not None for v in vals):
                 ax.plot(layers, vals, "o-", label=label, color=color, linestyle=ls, linewidth=2, markersize=6)
+        if all("beh_n" in s for s in sweep_summary):
+            for lay, s in zip(layers, sweep_summary):
+                ax.annotate(f"n={s['beh_n']}", (lay, min_val), xytext=(0, -12),
+                            textcoords="offset points", fontsize=6, ha="center")
         if ref_line is not None:
             ax.axhline(y=ref_line, color="gray", linestyle="--", alpha=0.5)
         ax.set_xlabel("Layer"); ax.set_ylabel(f"Avg Behavior Score ({min_val:.0f}-{max_val:.0f})")
@@ -557,6 +584,10 @@ def plot_sweep_summary(sweep_summary, behavior, output_dir):
             vals = [s.get(key) for s in sweep_summary]
             if all(v is not None for v in vals):
                 ax.plot(layers, vals, "o-", label=label, color=color, linestyle=ls, linewidth=2, markersize=6)
+        if all("ax_n" in s for s in sweep_summary):
+            for lay, s in zip(layers, sweep_summary):
+                ax.annotate(f"n={s['ax_n']}", (lay, 0), xytext=(0, -12),
+                            textcoords="offset points", fontsize=6, ha="center")
         ax.set_xlabel("Layer"); ax.set_ylabel("Harmonic Mean (0-2)")
         ax.set_title(f"{behavior}: AxBench Harmonic Mean by Layer")
         ax.set_xticks(layers); ax.set_ylim(0, 2.1); ax.legend(); plt.tight_layout()
@@ -624,6 +655,100 @@ def plot_sweep_summary(sweep_summary, behavior, output_dir):
         plt.savefig(output_dir / "full_dashboard.png", dpi=150, bbox_inches="tight"); plt.close()
 
     logger.warning(f"Sweep plots saved to {output_dir}")
+
+
+# ============================================================================
+# Replot only (no rejudging)
+# ============================================================================
+def replot_only_main(args):
+    """Load existing data, apply fluency_filter if set, remake all plots."""
+    sweep_dir = Path(args.sweep_dir)
+    behavior = args.behavior
+
+    if behavior not in BEHAVIOR_JUDGE_PROMPTS:
+        logger.error(f"Unknown behavior: {behavior}. Choices: {list(BEHAVIOR_JUDGE_PROMPTS.keys())}")
+        sys.exit(1)
+
+    layers = discover_layers(sweep_dir)
+    if not layers:
+        logger.error(f"No layer_N/eval/eval_results.parquet found in {sweep_dir}")
+        sys.exit(1)
+    logger.warning(f"Replot only: discovered {len(layers)} layers: {layers}")
+
+    sweep_summary = []
+    for layer in layers:
+        layer_dir = sweep_dir / f"layer_{layer}"
+        eval_dir = layer_dir / "eval"
+        axbench_dir = layer_dir / "eval_axbench"
+
+        parquet_path = eval_dir / "eval_results.parquet"
+        axbench_path = axbench_dir / "eval_results.parquet"
+        if not parquet_path.exists():
+            logger.warning(f"  Layer {layer}: skipping, no {parquet_path}")
+            continue
+
+        eval_df = pd.read_parquet(parquet_path)
+        if "behavior_score" not in eval_df.columns:
+            logger.warning(f"  Layer {layer}: no behavior_score, skipping")
+            continue
+
+        ax_for_summary = pd.DataFrame()
+        generations_for_summary = eval_df[["question_idx", "question", "steering_factor", "generation", "behavior_score"]].copy()
+
+        if axbench_path.exists():
+            ax_df = pd.read_parquet(axbench_path)
+            if "fluency_score" in ax_df.columns:
+                ax_cols = ["question_idx", "steering_factor", "fluency_score"]
+                for c in ["concept_score", "instruct_score", "harmonic_mean"]:
+                    if c in ax_df.columns:
+                        ax_cols.append(c)
+                merged = eval_df.merge(
+                    ax_df[ax_cols],
+                    on=["question_idx", "steering_factor"],
+                    how="inner",
+                )
+                if args.fluency_filter is not None:
+                    mask = merged["fluency_score"] >= args.fluency_filter
+                    n_before, n_after = len(mask), int(mask.sum())
+                    logger.warning(f"  Layer {layer}: fluency filter >= {args.fluency_filter}: {n_after}/{n_before} examples")
+                    merged = merged[mask].reset_index(drop=True)
+                generations_for_summary = merged[["question_idx", "question", "steering_factor", "generation", "behavior_score"]]
+                ax_for_summary = merged
+
+        beh_summary = summarize_behavior(generations_for_summary, behavior)
+        beh_summary.to_csv(eval_dir / "summary.csv", index=False)
+        beh_summary.to_json(eval_dir / "summary.json", orient="records", indent=2)
+        plot_behavior_per_layer(beh_summary, behavior, layer, eval_dir / "steering_plot.png")
+
+        if not ax_for_summary.empty:
+            ax_summary = summarize_axbench(ax_for_summary)
+            ax_summary.to_csv(axbench_dir / "axbench_summary.csv", index=False)
+            ax_summary.to_json(axbench_dir / "axbench_summary.json", orient="records", indent=2)
+            plot_axbench_per_layer(ax_summary, behavior, layer, axbench_dir / "axbench_plot.png")
+        else:
+            ax_summary = pd.DataFrame()
+
+        sep_path = layer_dir / "separability.json"
+        sep = json.loads(sep_path.read_text()) if sep_path.exists() else {}
+        entry = {"layer": layer, "dprime": sep.get("dprime"), "auroc": sep.get("auroc"), "norm": sep.get("norm")}
+        if not beh_summary.empty:
+            f0 = beh_summary[beh_summary["steering_factor"] == 0]
+            entry["behavior_0_avg"] = float(f0["avg_score"].values[0]) if not f0.empty else None
+            entry["behavior_max_avg"] = float(beh_summary["avg_score"].max())
+            entry["behavior_min_avg"] = float(beh_summary["avg_score"].min())
+            entry["beh_n"] = int(beh_summary["n_examples"].sum())
+        if not ax_summary.empty:
+            f0 = ax_summary[ax_summary["steering_factor"] == 0]
+            entry["axbench_0_hm"] = float(f0["harmonic_mean"].values[0]) if not f0.empty else None
+            entry["axbench_max_hm"] = float(ax_summary["harmonic_mean"].max())
+            entry["axbench_min_hm"] = float(ax_summary["harmonic_mean"].min())
+            entry["ax_n"] = int(ax_summary["n_examples"].sum())
+        sweep_summary.append(entry)
+
+    with open(sweep_dir / "sweep_summary.json", "w") as f:
+        json.dump(sweep_summary, f, indent=2)
+    plot_sweep_summary(sweep_summary, behavior, sweep_dir / "sweep_plots")
+    logger.warning(f"\nReplot complete! Plots in {sweep_dir}")
 
 
 # ============================================================================
@@ -745,12 +870,14 @@ async def main_async(args):
                 entry["behavior_0_avg"] = float(f0["avg_score"].values[0]) if not f0.empty else None
                 entry["behavior_max_avg"] = float(beh_summary["avg_score"].max())
                 entry["behavior_min_avg"] = float(beh_summary["avg_score"].min())
+                entry["beh_n"] = int(beh_summary["n_examples"].sum())
 
             if not ax_summary.empty:
                 f0 = ax_summary[ax_summary["steering_factor"] == 0]
                 entry["axbench_0_hm"] = float(f0["harmonic_mean"].values[0]) if not f0.empty else None
                 entry["axbench_max_hm"] = float(ax_summary["harmonic_mean"].max())
                 entry["axbench_min_hm"] = float(ax_summary["harmonic_mean"].min())
+                entry["ax_n"] = int(ax_summary["n_examples"].sum())
 
             sweep_summary.append(entry)
 
@@ -783,14 +910,18 @@ def main():
                         help="Skip axbench rejudging; use existing eval_axbench/ data if present")
     parser.add_argument("--fluency_filter", type=float, default=None,
                         help="Only use examples with fluency_score >= this value for metrics/plots (requires axbench data)")
+    parser.add_argument("--replot_only", action="store_true",
+                        help="Skip rejudging; load existing data, apply fluency_filter if set, and remake plots only")
     args = parser.parse_args()
     args.rejudge_axbench = not args.no_rejudge_axbench
 
-    if not os.environ.get("OPENAI_API_KEY"):
-        logger.error("OPENAI_API_KEY not set!")
-        sys.exit(1)
-
-    asyncio.run(main_async(args))
+    if args.replot_only:
+        replot_only_main(args)
+    else:
+        if not os.environ.get("OPENAI_API_KEY"):
+            logger.error("OPENAI_API_KEY not set!")
+            sys.exit(1)
+        asyncio.run(main_async(args))
 
 
 if __name__ == "__main__":
