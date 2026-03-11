@@ -333,11 +333,20 @@ class AsyncJudge:
     async def _call(self, prompt: str) -> str:
         async with self.semaphore:
             try:
-                completion = await self.client.chat.completions.create(
-                    model=self.model,
-                    messages=[{"role": "user", "content": prompt}],
-                    max_completion_tokens=400,
-                )
+                kwargs = {
+                    "model": self.model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_completion_tokens": 400,
+                }
+                # Disable reasoning/thinking for models that support it (gpt-5, o1, etc.)
+                try:
+                    completion = await self.client.chat.completions.create(**kwargs, reasoning={"effort": "none"})
+                except Exception as e:
+                    err = str(e).lower()
+                    if "reasoning" in err or "unsupported" in err:
+                        completion = await self.client.chat.completions.create(**kwargs)
+                    else:
+                        raise
                 return completion.choices[0].message.content.strip()
             except Exception as e:
                 logger.error(f"Judge API error: {e}")
