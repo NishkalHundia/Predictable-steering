@@ -336,7 +336,6 @@ class AsyncJudge:
                 completion = await self.client.chat.completions.create(
                     model=self.model,
                     messages=[{"role": "user", "content": prompt}],
-                    temperature=0,
                     max_completion_tokens=400,
                 )
                 return completion.choices[0].message.content.strip()
