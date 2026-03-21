@@ -37,7 +37,8 @@ def summarize_behavior(behavior: str, sweep_path: Path):
         print(f"  No d' data found.\n")
         return None
 
-    print(f"  {'Layer':>6}  {'d\\'':>7}  {'Best Score':>11}  {'Best Factor':>12}  {'Factor=1':>9}")
+    dp_label = "d'"
+    print(f"  {'Layer':>6}  {dp_label:>7}  {'Best Score':>11}  {'Best Factor':>12}  {'Factor=1':>9}")
     print(f"  {'─'*6}  {'─'*7}  {'─'*11}  {'─'*12}  {'─'*9}")
     for l, dp, bs, bf, f1 in zip(layers, dprimes, best_scores, best_factors, f1_scores):
         bs_s = f"{bs:.3f}" if bs is not None else "—"
