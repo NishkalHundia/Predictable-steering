@@ -580,8 +580,8 @@ def plot_sweep_summary(sweep_summary, behavior, output_dir):
             ax.plot(valid_layers, valid_f1, "s--", label="Factor=1", color="#44AF69", linewidth=1.5, markersize=5)
         if all("beh_n" in s for s in sweep_summary):
             for lay, s in zip(layers, sweep_summary):
-                ax.annotate(f"n={s['beh_n']}", (lay, min_val), xytext=(0, -12),
-                            textcoords="offset points", fontsize=6, ha="center")
+                ax.annotate(f"n={s['beh_n']}", (lay, max_val), xytext=(0, -8),
+                            textcoords="offset points", fontsize=5, ha="center", color="gray")
         if ref_line is not None:
             ax.axhline(y=ref_line, color="gray", linestyle="--", alpha=0.5)
         ax.set_xlabel("Layer"); ax.set_ylabel(f"Avg Behavior Score ({min_val:.0f}-{max_val:.0f})")
@@ -603,8 +603,8 @@ def plot_sweep_summary(sweep_summary, behavior, output_dir):
                 ax.plot(layers, vals, "o-", label=label, color=color, linestyle=ls, linewidth=2, markersize=6)
         if all("ax_n" in s for s in sweep_summary):
             for lay, s in zip(layers, sweep_summary):
-                ax.annotate(f"n={s['ax_n']}", (lay, 0), xytext=(0, -12),
-                            textcoords="offset points", fontsize=6, ha="center")
+                ax.annotate(f"n={s['ax_n']}", (lay, 2.1), xytext=(0, -8),
+                            textcoords="offset points", fontsize=5, ha="center", color="gray")
         ax.set_xlabel("Layer"); ax.set_ylabel("Harmonic Mean (0-2)")
         ax.set_title(f"{behavior}: AxBench Harmonic Mean by Layer")
         ax.set_xticks(layers); ax.set_ylim(0, 2.1); ax.legend(); plt.tight_layout()
