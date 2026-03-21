@@ -129,7 +129,7 @@ def main():
     all_dp, all_bs, all_bf, all_f1, all_abf = [], [], [], [], []
 
     for behavior in args.behaviors:
-        sweep_path = results_dir / behavior / "sweep_summary.json"
+        sweep_path = results_dir / f"{behavior}-sweep" / "sweep_summary.json"
         if not sweep_path.exists():
             print(f"\n▸ {behavior}: sweep_summary.json not found at {sweep_path}")
             continue
