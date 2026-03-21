@@ -34,6 +34,7 @@ from pathlib import Path
 from openai import AsyncOpenAI
 import httpx
 import re
+from scipy import stats as scipy_stats
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -552,15 +553,31 @@ def plot_sweep_summary(sweep_summary, behavior, output_dir):
     has_beh = all("behavior_0_avg" in s for s in sweep_summary)
     if has_beh:
         min_val, max_val, ref_line = get_behavior_scale(behavior)
-        fig, ax = plt.subplots(figsize=(8, 4))
+        fig, ax = plt.subplots(figsize=(10, 5))
         for key, label, color, ls in [
             ("behavior_0_avg", "Baseline (factor=0)", "gray", "--"),
-            ("behavior_max_avg", "Best score (max across factors)", "#E94F37", "-"),
-            ("behavior_min_avg", "Worst score (min across factors)", "#2E86AB", "-"),
+            ("behavior_max_avg", "Best (valid)", "#E94F37", "-"),
+            ("behavior_min_avg", "Worst (valid)", "#2E86AB", "-"),
         ]:
             vals = [s.get(key) for s in sweep_summary]
             if all(v is not None for v in vals):
                 ax.plot(layers, vals, "o-", label=label, color=color, linestyle=ls, linewidth=2, markersize=6)
+        # Label best/worst with steering factor
+        for lay, s in zip(layers, sweep_summary):
+            if "behavior_max_factor" in s and s.get("behavior_max_avg") is not None:
+                f_best = s["behavior_max_factor"]
+                ax.annotate(f"f={f_best:g}", (lay, s["behavior_max_avg"]),
+                            xytext=(0, 8), textcoords="offset points", fontsize=6, ha="center", color="#E94F37")
+            if "behavior_min_factor" in s and s.get("behavior_min_avg") is not None:
+                f_worst = s["behavior_min_factor"]
+                ax.annotate(f"f={f_worst:g}", (lay, s["behavior_min_avg"]),
+                            xytext=(0, -12), textcoords="offset points", fontsize=6, ha="center", color="#2E86AB")
+        # Plot factor=1 if available
+        f1_vals = [s.get("behavior_f1_avg") for s in sweep_summary]
+        if any(v is not None for v in f1_vals):
+            valid_layers = [l for l, v in zip(layers, f1_vals) if v is not None]
+            valid_f1 = [v for v in f1_vals if v is not None]
+            ax.plot(valid_layers, valid_f1, "s--", label="Factor=1", color="#44AF69", linewidth=1.5, markersize=5)
         if all("beh_n" in s for s in sweep_summary):
             for lay, s in zip(layers, sweep_summary):
                 ax.annotate(f"n={s['beh_n']}", (lay, min_val), xytext=(0, -12),
@@ -569,7 +586,7 @@ def plot_sweep_summary(sweep_summary, behavior, output_dir):
             ax.axhline(y=ref_line, color="gray", linestyle="--", alpha=0.5)
         ax.set_xlabel("Layer"); ax.set_ylabel(f"Avg Behavior Score ({min_val:.0f}-{max_val:.0f})")
         ax.set_title(f"{behavior}: Behavior Score by Layer")
-        ax.set_xticks(layers); ax.set_ylim(min_val, max_val); ax.legend(); plt.tight_layout()
+        ax.set_xticks(layers); ax.set_ylim(min_val, max_val); ax.legend(fontsize=8); plt.tight_layout()
         plt.savefig(output_dir / "behavior_score_by_layer.png", dpi=150, bbox_inches="tight"); plt.close()
 
     # Axbench harmonic mean by layer
@@ -654,6 +671,71 @@ def plot_sweep_summary(sweep_summary, behavior, output_dir):
         plt.tight_layout()
         plt.savefig(output_dir / "full_dashboard.png", dpi=150, bbox_inches="tight"); plt.close()
 
+    # d' vs Steering Performance (dual y-axis)
+    if has_sep and has_beh:
+        best_vals = [s.get("behavior_max_avg") for s in sweep_summary]
+        f1_vals = [s.get("behavior_f1_avg") for s in sweep_summary]
+        min_val, max_val, ref_line = get_behavior_scale(behavior)
+
+        fig, ax_dp = plt.subplots(figsize=(10, 5))
+        ax_dp.plot(layers, dprimes, "o-", color="#E94F37", linewidth=2.5, markersize=7, label="d'")
+        ax_dp.set_xlabel("Layer", fontsize=11)
+        ax_dp.set_ylabel("d'", color="#E94F37", fontsize=11)
+        ax_dp.tick_params(axis="y", labelcolor="#E94F37")
+        ax_dp.set_xticks(layers)
+
+        ax_beh = ax_dp.twinx()
+        if any(v is not None for v in best_vals):
+            vl = [(l, v) for l, v in zip(layers, best_vals) if v is not None]
+            ax_beh.plot([x[0] for x in vl], [x[1] for x in vl], "D-", color="#6B2D5C", linewidth=2, markersize=6, label="Best (valid)")
+            for l, v, s in zip(layers, best_vals, sweep_summary):
+                if v is not None and "behavior_max_factor" in s:
+                    ax_beh.annotate(f"f={s['behavior_max_factor']:g}", (l, v),
+                                    xytext=(0, 8), textcoords="offset points", fontsize=6, ha="center", color="#6B2D5C")
+        if any(v is not None for v in f1_vals):
+            vl = [(l, v) for l, v in zip(layers, f1_vals) if v is not None]
+            ax_beh.plot([x[0] for x in vl], [x[1] for x in vl], "s--", color="#44AF69", linewidth=1.5, markersize=5, label="Factor=1")
+        ax_beh.set_ylabel(f"Behavior Score ({min_val:.0f}-{max_val:.0f})", fontsize=11)
+        ax_beh.set_ylim(min_val, max_val)
+
+        lines1, labels1 = ax_dp.get_legend_handles_labels()
+        lines2, labels2 = ax_beh.get_legend_handles_labels()
+        ax_dp.legend(lines1 + lines2, labels1 + labels2, loc="upper left", fontsize=8)
+
+        # Correlations (Pearson + Spearman)
+        corr_lines = []
+        corr_data_full = {}
+        valid_dp_best = [(d, b) for d, b in zip(dprimes, best_vals) if d is not None and b is not None]
+        if len(valid_dp_best) >= 3:
+            dp_arr = [x[0] for x in valid_dp_best]
+            b_arr = [x[1] for x in valid_dp_best]
+            r_best, p_best = scipy_stats.pearsonr(dp_arr, b_arr)
+            rho_best, sp_best = scipy_stats.spearmanr(dp_arr, b_arr)
+            corr_lines.append(f"d' vs best:  r={r_best:.3f} (p={p_best:.3f}), ρ={rho_best:.3f} (p={sp_best:.3f})")
+            corr_data_full.update({"r_dprime_best": r_best, "p_dprime_best": p_best,
+                                   "rho_dprime_best": rho_best, "sp_dprime_best": sp_best})
+        valid_dp_f1 = [(d, b) for d, b in zip(dprimes, f1_vals) if d is not None and b is not None]
+        if len(valid_dp_f1) >= 3:
+            dp_arr = [x[0] for x in valid_dp_f1]
+            b_arr = [x[1] for x in valid_dp_f1]
+            r_f1, p_f1 = scipy_stats.pearsonr(dp_arr, b_arr)
+            rho_f1, sp_f1 = scipy_stats.spearmanr(dp_arr, b_arr)
+            corr_lines.append(f"d' vs f=1:  r={r_f1:.3f} (p={p_f1:.3f}), ρ={rho_f1:.3f} (p={sp_f1:.3f})")
+            corr_data_full.update({"r_dprime_f1": r_f1, "p_dprime_f1": p_f1,
+                                   "rho_dprime_f1": rho_f1, "sp_dprime_f1": sp_f1})
+        if corr_lines:
+            ax_dp.text(0.02, 0.98, "\n".join(corr_lines), transform=ax_dp.transAxes,
+                       fontsize=7, verticalalignment="top", fontfamily="monospace",
+                       bbox=dict(boxstyle="round,pad=0.3", facecolor="wheat", alpha=0.7))
+
+        ax_dp.set_title(f"{behavior}: d' vs Steering Performance by Layer", fontsize=12, fontweight="bold")
+        plt.tight_layout()
+        plt.savefig(output_dir / "dprime_vs_performance.png", dpi=150, bbox_inches="tight"); plt.close()
+
+        if corr_data_full:
+            pd.DataFrame([corr_data_full]).to_csv(output_dir / "dprime_performance_correlation.csv", index=False)
+            logger.warning(f"Correlations: {corr_data_full}")
+
     logger.warning(f"Sweep plots saved to {output_dir}")
 
 
@@ -731,18 +813,34 @@ def replot_only_main(args):
         sep_path = layer_dir / "separability.json"
         sep = json.loads(sep_path.read_text()) if sep_path.exists() else {}
         entry = {"layer": layer, "dprime": sep.get("dprime"), "auroc": sep.get("auroc"), "norm": sep.get("norm")}
+
+        min_valid = args.min_valid
         if not beh_summary.empty:
+            valid_beh = beh_summary[beh_summary["n_examples"] >= min_valid] if min_valid else beh_summary
             f0 = beh_summary[beh_summary["steering_factor"] == 0]
             entry["behavior_0_avg"] = float(f0["avg_score"].values[0]) if not f0.empty else None
-            entry["behavior_max_avg"] = float(beh_summary["avg_score"].max())
-            entry["behavior_min_avg"] = float(beh_summary["avg_score"].min())
+            if not valid_beh.empty:
+                best_row = valid_beh.loc[valid_beh["avg_score"].idxmax()]
+                worst_row = valid_beh.loc[valid_beh["avg_score"].idxmin()]
+                entry["behavior_max_avg"] = float(best_row["avg_score"])
+                entry["behavior_max_factor"] = float(best_row["steering_factor"])
+                entry["behavior_min_avg"] = float(worst_row["avg_score"])
+                entry["behavior_min_factor"] = float(worst_row["steering_factor"])
+            f1 = beh_summary[beh_summary["steering_factor"] == 1]
+            if not f1.empty:
+                f1_valid = f1["n_examples"].values[0] >= min_valid if min_valid else True
+                entry["behavior_f1_avg"] = float(f1["avg_score"].values[0]) if f1_valid else None
             entry["beh_n"] = int(beh_summary["n_examples"].sum())
+
         if not ax_summary.empty:
+            valid_ax = ax_summary[ax_summary["n_examples"] >= min_valid] if min_valid else ax_summary
             f0 = ax_summary[ax_summary["steering_factor"] == 0]
             entry["axbench_0_hm"] = float(f0["harmonic_mean"].values[0]) if not f0.empty else None
-            entry["axbench_max_hm"] = float(ax_summary["harmonic_mean"].max())
-            entry["axbench_min_hm"] = float(ax_summary["harmonic_mean"].min())
+            if not valid_ax.empty:
+                entry["axbench_max_hm"] = float(valid_ax["harmonic_mean"].max())
+                entry["axbench_min_hm"] = float(valid_ax["harmonic_mean"].min())
             entry["ax_n"] = int(ax_summary["n_examples"].sum())
+
         sweep_summary.append(entry)
 
     with open(sweep_dir / "sweep_summary.json", "w") as f:
@@ -865,18 +963,31 @@ async def main_async(args):
 
             entry = {"layer": layer, "dprime": sep.get("dprime"), "auroc": sep.get("auroc"), "norm": sep.get("norm")}
 
+            min_valid = args.min_valid
             if not beh_summary.empty:
+                valid_beh = beh_summary[beh_summary["n_examples"] >= min_valid] if min_valid else beh_summary
                 f0 = beh_summary[beh_summary["steering_factor"] == 0]
                 entry["behavior_0_avg"] = float(f0["avg_score"].values[0]) if not f0.empty else None
-                entry["behavior_max_avg"] = float(beh_summary["avg_score"].max())
-                entry["behavior_min_avg"] = float(beh_summary["avg_score"].min())
+                if not valid_beh.empty:
+                    best_row = valid_beh.loc[valid_beh["avg_score"].idxmax()]
+                    worst_row = valid_beh.loc[valid_beh["avg_score"].idxmin()]
+                    entry["behavior_max_avg"] = float(best_row["avg_score"])
+                    entry["behavior_max_factor"] = float(best_row["steering_factor"])
+                    entry["behavior_min_avg"] = float(worst_row["avg_score"])
+                    entry["behavior_min_factor"] = float(worst_row["steering_factor"])
+                f1 = beh_summary[beh_summary["steering_factor"] == 1]
+                if not f1.empty:
+                    f1_valid = f1["n_examples"].values[0] >= min_valid if min_valid else True
+                    entry["behavior_f1_avg"] = float(f1["avg_score"].values[0]) if f1_valid else None
                 entry["beh_n"] = int(beh_summary["n_examples"].sum())
 
             if not ax_summary.empty:
+                valid_ax = ax_summary[ax_summary["n_examples"] >= min_valid] if min_valid else ax_summary
                 f0 = ax_summary[ax_summary["steering_factor"] == 0]
                 entry["axbench_0_hm"] = float(f0["harmonic_mean"].values[0]) if not f0.empty else None
-                entry["axbench_max_hm"] = float(ax_summary["harmonic_mean"].max())
-                entry["axbench_min_hm"] = float(ax_summary["harmonic_mean"].min())
+                if not valid_ax.empty:
+                    entry["axbench_max_hm"] = float(valid_ax["harmonic_mean"].max())
+                    entry["axbench_min_hm"] = float(valid_ax["harmonic_mean"].min())
                 entry["ax_n"] = int(ax_summary["n_examples"].sum())
 
             sweep_summary.append(entry)
@@ -912,6 +1023,8 @@ def main():
                         help="Only use examples with fluency_score >= this value for metrics/plots (requires axbench data)")
     parser.add_argument("--replot_only", action="store_true",
                         help="Skip rejudging; load existing data, apply fluency_filter if set, and remake plots only")
+    parser.add_argument("--min_valid", type=int, default=None,
+                        help="For sweep summary: only use steering factors with >= this many valid (post-filter) examples")
     args = parser.parse_args()
     args.rejudge_axbench = not args.no_rejudge_axbench
 
