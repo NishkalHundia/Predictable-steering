@@ -127,7 +127,8 @@ def main():
     print("d' vs Steering Performance Summary")
     print("=" * 80)
 
-    all_dp, all_bs, all_bf, all_f1, all_abf = [], [], [], [], []
+    all_pooled = []  # (behavior, layer, dp, best_score, best_factor, f1_score)
+    per_layer = {}   # layer -> list of (behavior, dp, best_score, best_factor, f1_score)
 
     for behavior in args.behaviors:
         sweep_path = results_dir / f"{behavior}-sweep" / "sweep_summary.json"
@@ -146,37 +147,79 @@ def main():
             dp = entry.get("dprime")
             if dp is None:
                 continue
-            all_dp.append(dp)
+            layer = entry["layer"]
             bs = entry.get("behavior_max_avg")
             bf = entry.get("behavior_max_factor")
             f1 = entry.get("behavior_f1_avg")
-            if bs is not None:
-                all_bs.append((dp, bs))
-            if bf is not None:
-                all_bf.append((dp, bf))
-                all_abf.append((dp, abs(bf)))
-            if f1 is not None:
-                all_f1.append((dp, f1))
+            row = (behavior, layer, dp, bs, bf, f1)
+            all_pooled.append(row)
+            per_layer.setdefault(layer, []).append((behavior, dp, bs, bf, f1))
 
-    if len(all_bs) >= 3:
+    # ── Per-layer cross-behavior analysis ──
+    if per_layer:
         print(f"\n{'=' * 80}")
-        print(f"CROSS-BEHAVIOR SUMMARY (all layers, all behaviors pooled)")
+        print(f"PER-LAYER CROSS-BEHAVIOR (for each layer, correlate d' with steering across behaviors)")
         print(f"{'=' * 80}")
-        print(f"  Total datapoints: {len(all_dp)}")
 
-        dp_arr, bs_arr = zip(*all_bs)
+        for layer in sorted(per_layer.keys()):
+            entries = per_layer[layer]
+            if len(entries) < 3:
+                print(f"\n  Layer {layer}: only {len(entries)} behaviors, need ≥3 for correlation")
+                continue
+
+            print(f"\n  Layer {layer} ({len(entries)} behaviors):")
+            dp_label = "d'"
+            print(f"    {'Behavior':>28}  {dp_label:>7}  {'Best':>7}  {'f_best':>7}  {'f=1':>7}")
+            print(f"    {'─'*28}  {'─'*7}  {'─'*7}  {'─'*7}  {'─'*7}")
+            for beh, dp, bs, bf, f1 in entries:
+                bs_s = f"{bs:.3f}" if bs is not None else "—"
+                bf_s = f"{bf:g}" if bf is not None else "—"
+                f1_s = f"{f1:.3f}" if f1 is not None else "—"
+                print(f"    {beh:>28}  {dp:>7.3f}  {bs_s:>7}  {bf_s:>7}  {f1_s:>7}")
+
+            valid_bs = [(dp, bs) for _, dp, bs, _, _ in entries if bs is not None]
+            valid_f1 = [(dp, f1) for _, dp, _, _, f1 in entries if f1 is not None]
+            valid_abf = [(dp, abs(bf)) for _, dp, _, bf, _ in entries if bf is not None]
+
+            if len(valid_bs) >= 3:
+                dp_arr, bs_arr = zip(*valid_bs)
+                r, p = scipy_stats.pearsonr(dp_arr, bs_arr)
+                rho, sp = scipy_stats.spearmanr(dp_arr, bs_arr)
+                print(f"    d' vs Best Score:    r={r:.3f} (p={p:.3f}),  ρ={rho:.3f} (p={sp:.3f})")
+            if len(valid_f1) >= 3:
+                dp_arr, f1_arr = zip(*valid_f1)
+                r, p = scipy_stats.pearsonr(dp_arr, f1_arr)
+                rho, sp = scipy_stats.spearmanr(dp_arr, f1_arr)
+                print(f"    d' vs Factor=1:      r={r:.3f} (p={p:.3f}),  ρ={rho:.3f} (p={sp:.3f})")
+            if len(valid_abf) >= 3:
+                dp_arr, abf_arr = zip(*valid_abf)
+                r, p = scipy_stats.pearsonr(dp_arr, abf_arr)
+                rho, sp = scipy_stats.spearmanr(dp_arr, abf_arr)
+                print(f"    d' vs |Best Factor|: r={r:.3f} (p={p:.3f}),  ρ={rho:.3f} (p={sp:.3f})")
+
+    # ── Pooled cross-behavior summary ──
+    valid_all = [(dp, bs) for _, _, dp, bs, _, _ in all_pooled if bs is not None]
+    if len(valid_all) >= 3:
+        print(f"\n{'=' * 80}")
+        print(f"POOLED SUMMARY (all layers × all behaviors)")
+        print(f"{'=' * 80}")
+        print(f"  Total datapoints: {len(all_pooled)}")
+
+        dp_arr, bs_arr = zip(*valid_all)
         r, p = scipy_stats.pearsonr(dp_arr, bs_arr)
         rho, sp = scipy_stats.spearmanr(dp_arr, bs_arr)
         print(f"\n  d' vs Best Score:     r={r:.3f} (p={p:.4f}),  ρ={rho:.3f} (p={sp:.4f})")
 
-        if len(all_f1) >= 3:
-            dp_arr, f1_arr = zip(*all_f1)
+        valid_f1 = [(dp, f1) for _, _, dp, _, _, f1 in all_pooled if f1 is not None]
+        if len(valid_f1) >= 3:
+            dp_arr, f1_arr = zip(*valid_f1)
             r, p = scipy_stats.pearsonr(dp_arr, f1_arr)
             rho, sp = scipy_stats.spearmanr(dp_arr, f1_arr)
             print(f"  d' vs Factor=1:       r={r:.3f} (p={p:.4f}),  ρ={rho:.3f} (p={sp:.4f})")
 
-        if len(all_abf) >= 3:
-            dp_arr, abf_arr = zip(*all_abf)
+        valid_abf = [(dp, abs(bf)) for _, _, dp, _, bf, _ in all_pooled if bf is not None]
+        if len(valid_abf) >= 3:
+            dp_arr, abf_arr = zip(*valid_abf)
             r, p = scipy_stats.pearsonr(dp_arr, abf_arr)
             rho, sp = scipy_stats.spearmanr(dp_arr, abf_arr)
             print(f"  d' vs |Best Factor|:  r={r:.3f} (p={p:.4f}),  ρ={rho:.3f} (p={sp:.4f})")
