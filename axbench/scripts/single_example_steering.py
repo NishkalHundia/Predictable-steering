@@ -663,38 +663,58 @@ def compute_vector_and_separability(per_example_means, labels, pair_indices,
 
 
 # ============================================================================
-# Steered generation via forward hook
+# Steered generation via forward hook (batched across factors)
 # ============================================================================
 @torch.no_grad()
-def generate_with_steering(model, tokenizer, prompt, steering_vector, layer, factor, device, max_new_tokens=150):
-    """Generate text while adding factor*steering_vector to hidden states at the given layer."""
-    sv = (factor * steering_vector).to(device)
-    if sv.dim() == 1:
-        sv = sv.unsqueeze(0).unsqueeze(0)
-    elif sv.dim() == 2:
-        sv = sv.unsqueeze(0)
+def generate_batched_factors(model, tokenizer, prompt, steering_vector, layer,
+                             factors, device, max_new_tokens=150, max_batch=16):
+    """
+    Generate steered text for multiple factors in a single batched call.
+    Duplicates the prompt N times and applies a different factor*vector to each
+    batch element via a hook, so all factors are generated in one model.generate().
+    """
+    all_texts = []
 
-    def hook_fn(module, input, output):
-        if isinstance(output, tuple):
-            hs = output[0] + sv.to(output[0].dtype)
-            return (hs,) + output[1:]
-        return output + sv.to(output.dtype)
+    for batch_start in range(0, len(factors), max_batch):
+        batch_factors = factors[batch_start:batch_start + max_batch]
+        bs = len(batch_factors)
 
-    handle = model.model.layers[layer].register_forward_hook(hook_fn)
-    try:
-        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512).to(device)
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
-        )
-        gen_ids = outputs[0, inputs.input_ids.shape[1]:]
-        text = tokenizer.decode(gen_ids, skip_special_tokens=True)
-    finally:
-        handle.remove()
+        svs = torch.stack([
+            (f * steering_vector).to(device) for f in batch_factors
+        ]).unsqueeze(1)  # [bs, 1, hidden_size]
 
-    return text
+        def hook_fn(module, input, output):
+            if isinstance(output, tuple):
+                hs = output[0]
+                hs = hs + svs[:hs.shape[0]].to(hs.dtype)
+                return (hs,) + output[1:]
+            return output + svs[:output.shape[0]].to(output.dtype)
+
+        handle = model.model.layers[layer].register_forward_hook(hook_fn)
+        try:
+            tokenizer.padding_side = "left"
+            inputs = tokenizer(
+                [prompt] * bs, return_tensors="pt", padding=True,
+                truncation=True, max_length=512,
+            ).to(device)
+
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+            )
+
+            input_len = inputs.input_ids.shape[1]
+            texts = [
+                tokenizer.decode(outputs[i, input_len:], skip_special_tokens=True)
+                for i in range(bs)
+            ]
+            all_texts.extend(texts)
+        finally:
+            handle.remove()
+
+    return all_texts
 
 
 # ============================================================================
@@ -1184,10 +1204,11 @@ async def main_async(args):
                         "method": "single_pair_diffmean",
                     }, f, indent=2)
 
-                for factor in tqdm(steering_factors, desc=f"  S{i} L{layer}", leave=False):
-                    gen = generate_with_steering(
-                        model, tokenizer, prompt, vec, layer, factor, device, args.max_new_tokens,
-                    )
+                gens = generate_batched_factors(
+                    model, tokenizer, prompt, vec, layer,
+                    steering_factors, device, args.max_new_tokens,
+                )
+                for factor, gen in zip(steering_factors, gens):
                     all_rows.append({
                         "sample_idx": i,
                         "question_idx": 0,
