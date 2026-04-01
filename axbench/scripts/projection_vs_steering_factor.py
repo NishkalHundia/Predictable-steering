@@ -5,13 +5,19 @@ For each test prompt at each layer:
   1. Retrieve unsteered (factor=0) generation from existing sweep eval results
   2. Forward pass through model to extract mean response-token activations
   3. Project onto the steering direction (DiffMean vector)
-  4. Compute per-prompt steerability metrics from existing behavior scores
-  5. Correlate projection with steerability metrics
-  6. Generate diagnostic plots
+  4. Compute distance metrics: residual_norm (off-axis distance), cosine_with_sv
+  5. Compute per-prompt steerability metrics from existing behavior scores
+  6. Correlate projection, residual_norm, cosine_with_sv against steerability
+  7. Generate diagnostic plots
 
-Hypothesis: prompts whose unsteered activations project more strongly toward the
-positive (behavior-matching) centroid need smaller steering factors for effective
-steering, while prompts projecting toward the negative centroid need larger factors.
+Hypotheses:
+  - Prompts whose unsteered activations project more strongly toward the positive
+    centroid need smaller steering factors for effective steering.
+  - Prompts closer to the DiffMeans line (small residual_norm) are more
+    predictably steered, since the SV captures more of their activation.
+
+Optionally extracts the same metrics for training examples (--train_dataset_path)
+so train vs test distributions can be compared.
 
 Requires:
   - Completed sweep (sweep_layers_open_ended.py) with eval results
@@ -26,13 +32,19 @@ Directory structure (reads from):
 Outputs:
   {sweep_dir}/projection_analysis/
     projections.csv
+    train_projections.csv  (if --train_dataset_path)
     steerability_metrics.csv
     merged_data.csv
     correlations.csv
     plots/
-      scatter_panel_layer_{N}.png
+      scatter_panel_layer_{N}.png           (projection x steerability)
+      scatter_residual_layer_{N}.png        (residual_norm x steerability)
+      scatter_cosine_layer_{N}.png          (cosine x steerability)
+      proj_vs_residual_2d_layer_{N}.png     (2D: proj x residual, color=score)
       curves_by_projection_layer_{N}.png
-      correlation_summary.png
+      curves_quantile_layer_{N}.png
+      train_vs_test_layer_{N}.png           (if --train_dataset_path)
+      correlation_summary_{predictor}.png
 
 Usage:
     uv run python axbench/scripts/projection_vs_steering_factor.py \\
@@ -40,10 +52,13 @@ Usage:
         --model_name google/gemma-2-9b-it \\
         --sweep_dir results/gemma-2-9b-it/sycophancy-sweep
 
-    # Specific layers:
-    ... --layers 15,20,25
+    # With train comparison:
+    ... --train_dataset_path datasets/generated/sycophancy/train_contrastive.json
 
-    # Replot only (skip model inference, reuse saved projections.csv):
+    # With fluency filtering:
+    ... --fluency_filter 1.0 --min_valid 25
+
+    # Replot only (skip model inference, reuse saved CSVs):
     ... --replot_only
 """
 import os
@@ -217,12 +232,27 @@ def extract_projections(model, tokenizer, sweep_dir, target_layers, device):
 
             sv = steering_vectors[layer].to(mean_act.device)
             sv_norm = sv.norm().item()
-            proj = mean_act.dot(sv).item() / sv_norm if sv_norm > 1e-12 else 0.0
+            activation_norm = mean_act.norm().item()
+
+            if sv_norm > 1e-12:
+                sv_hat = sv / sv_norm
+                proj = mean_act.dot(sv_hat).item()
+                proj_vec = proj * sv_hat
+                residual = mean_act - proj_vec
+                residual_norm = residual.norm().item()
+            else:
+                proj = 0.0
+                residual_norm = activation_norm
+
+            cosine_with_sv = (proj / activation_norm) if activation_norm > 1e-12 else 0.0
 
             rows.append({
                 "question_idx": int(question_idx),
                 "layer": int(layer),
                 "projection": proj,
+                "residual_norm": residual_norm,
+                "activation_norm": activation_norm,
+                "cosine_with_sv": cosine_with_sv,
                 "sv_norm": sv_norm,
                 "question": question,
                 "generation": str(generation),
@@ -233,6 +263,112 @@ def extract_projections(model, tokenizer, sweep_dir, target_layers, device):
             torch.cuda.empty_cache()
 
     logger.warning(f"Extracted {len(rows)} projection values")
+    return pd.DataFrame(rows)
+
+
+@torch.no_grad()
+def extract_train_projections(model, tokenizer, train_dataset_path, sweep_dir,
+                              target_layers, device):
+    """
+    For each training contrastive pair (pos + neg), compute the same activation
+    metrics as for test prompts so we can compare train vs test distributions.
+    """
+    use_chat = supports_chat_template(tokenizer)
+    model.eval()
+    sweep_dir = Path(sweep_dir)
+
+    with open(train_dataset_path, encoding="utf-8") as f:
+        train_data = json.load(f)
+
+    steering_vectors = {}
+    for layer in target_layers:
+        sv = torch.load(
+            sweep_dir / f"layer_{layer}" / "DiffMean_weight.pt",
+            map_location="cpu", weights_only=True,
+        )
+        if sv.dim() == 2:
+            sv = sv.squeeze(0)
+        steering_vectors[layer] = sv
+
+    logger.warning(f"Extracting train projections for {len(train_data)} pairs "
+                   f"({2 * len(train_data)} examples)")
+
+    rows = []
+    for pair_idx, item in enumerate(tqdm(train_data, desc="Train projections")):
+        for label, answer_key in [(1, "answer_matching_behavior"),
+                                  (0, "answer_not_matching_behavior")]:
+            question = item["question"]
+            answer = item[answer_key]
+
+            if use_chat:
+                q_text = tokenizer.apply_chat_template(
+                    [{"role": "user", "content": question}],
+                    tokenize=False, add_generation_prompt=True,
+                )
+                full_text = tokenizer.apply_chat_template(
+                    [{"role": "user", "content": question},
+                     {"role": "assistant", "content": str(answer)}],
+                    tokenize=False, add_generation_prompt=False,
+                )
+            else:
+                q_text = question
+                full_text = question + "\n\n" + str(answer)
+
+            full_inputs = tokenizer(
+                full_text, return_tensors="pt", truncation=True, max_length=1024,
+            ).to(device)
+            q_inputs = tokenizer(
+                q_text, return_tensors="pt", truncation=True, max_length=1024,
+            ).to(device)
+
+            q_len = q_inputs["input_ids"].shape[1]
+            f_len = full_inputs["input_ids"].shape[1]
+            if f_len <= q_len:
+                continue
+
+            layer_acts = gather_multi_layer_activations(
+                model, target_layers,
+                {"input_ids": full_inputs["input_ids"],
+                 "attention_mask": full_inputs["attention_mask"]},
+            )
+
+            for layer in target_layers:
+                resp_acts = layer_acts[layer].float()[0, q_len:f_len]
+                mean_act = resp_acts.mean(dim=0)
+
+                sv = steering_vectors[layer].to(mean_act.device)
+                sv_norm = sv.norm().item()
+                activation_norm = mean_act.norm().item()
+
+                if sv_norm > 1e-12:
+                    sv_hat = sv / sv_norm
+                    proj = mean_act.dot(sv_hat).item()
+                    proj_vec = proj * sv_hat
+                    residual = mean_act - proj_vec
+                    residual_norm = residual.norm().item()
+                else:
+                    proj = 0.0
+                    residual_norm = activation_norm
+
+                cosine_with_sv = (proj / activation_norm) if activation_norm > 1e-12 else 0.0
+
+                rows.append({
+                    "pair_idx": pair_idx,
+                    "label": label,
+                    "label_name": "pos" if label == 1 else "neg",
+                    "layer": int(layer),
+                    "projection": proj,
+                    "residual_norm": residual_norm,
+                    "activation_norm": activation_norm,
+                    "cosine_with_sv": cosine_with_sv,
+                    "question": question,
+                    "answer": str(answer),
+                })
+
+        if pair_idx % 5 == 0:
+            torch.cuda.empty_cache()
+
+    logger.warning(f"Extracted {len(rows)} train projection values")
     return pd.DataFrame(rows)
 
 
@@ -373,6 +509,8 @@ def compute_steerability_metrics(sweep_dir, target_layers, behavior,
 # ============================================================================
 # Phase 3: Correlation analysis
 # ============================================================================
+PREDICTOR_COLS = ["projection", "residual_norm", "cosine_with_sv"]
+
 SCATTER_METRICS = [
     ("baseline_score", "Baseline Score (f=0)", "+"),
     ("factor_for_max_pos", "Factor for Max Score (pos)", "-"),
@@ -390,25 +528,34 @@ ALL_METRIC_COLS = [
     "score_at_f1", "score_at_f2", "score_at_f5", "score_at_f10",
 ]
 
+PREDICTOR_LABELS = {
+    "projection": "Projection onto steering dir.",
+    "residual_norm": "Residual norm (dist. from SV line)",
+    "cosine_with_sv": "Cosine similarity with SV",
+}
+
 
 def compute_correlations(merged_df, target_layers):
     rows = []
     for layer in target_layers:
         ldf = merged_df[merged_df["layer"] == layer]
-        for col in ALL_METRIC_COLS:
-            if col not in ldf.columns:
+        for pred_col in PREDICTOR_COLS:
+            if pred_col not in ldf.columns:
                 continue
-            valid = ldf[["projection", col]].dropna()
-            if len(valid) < 4:
-                continue
-            r, p_r = scipy_stats.pearsonr(valid["projection"], valid[col])
-            rho, p_rho = scipy_stats.spearmanr(valid["projection"], valid[col])
-            rows.append({
-                "layer": layer, "metric": col,
-                "pearson_r": r, "pearson_p": p_r,
-                "spearman_rho": rho, "spearman_p": p_rho,
-                "n": len(valid),
-            })
+            for met_col in ALL_METRIC_COLS:
+                if met_col not in ldf.columns:
+                    continue
+                valid = ldf[[pred_col, met_col]].dropna()
+                if len(valid) < 4:
+                    continue
+                r, p_r = scipy_stats.pearsonr(valid[pred_col], valid[met_col])
+                rho, p_rho = scipy_stats.spearmanr(valid[pred_col], valid[met_col])
+                rows.append({
+                    "layer": layer, "predictor": pred_col, "metric": met_col,
+                    "pearson_r": r, "pearson_p": p_r,
+                    "spearman_rho": rho, "spearman_p": p_rho,
+                    "n": len(valid),
+                })
     return pd.DataFrame(rows)
 
 
@@ -431,8 +578,11 @@ def _annotate_corr(ax, x, y, label=""):
     ax.plot(xr, np.polyval(z, xr), "--", color="red", alpha=0.6, linewidth=1.2)
 
 
-def plot_scatter_panel(merged_df, layer, behavior, output_path):
-    """6-panel scatter: projection vs each key metric."""
+def plot_scatter_panel(merged_df, layer, behavior, output_path,
+                       x_col="projection", x_label=None):
+    """6-panel scatter: predictor variable vs each key steerability metric."""
+    if x_label is None:
+        x_label = PREDICTOR_LABELS.get(x_col, x_col)
     ldf = merged_df[merged_df["layer"] == layer]
     if ldf.empty:
         return
@@ -442,22 +592,22 @@ def plot_scatter_panel(merged_df, layer, behavior, output_path):
 
     for i, (col, label, expected) in enumerate(SCATTER_METRICS):
         ax = axes[i]
-        if col not in ldf.columns:
+        if col not in ldf.columns or x_col not in ldf.columns:
             ax.set_visible(False)
             continue
-        valid = ldf[["projection", col]].dropna()
+        valid = ldf[[x_col, col]].dropna()
         if valid.empty:
             ax.text(0.5, 0.5, "No data", ha="center", va="center", transform=ax.transAxes)
             ax.set_title(label, fontsize=9)
             continue
-        ax.scatter(valid["projection"], valid[col], alpha=0.7, s=40, edgecolors="k",
+        ax.scatter(valid[x_col], valid[col], alpha=0.7, s=40, edgecolors="k",
                    linewidths=0.3, color="#2E86AB")
-        _annotate_corr(ax, valid["projection"], valid[col])
-        ax.set_xlabel("Projection onto steering dir.", fontsize=8)
+        _annotate_corr(ax, valid[x_col], valid[col])
+        ax.set_xlabel(x_label, fontsize=8)
         ax.set_ylabel(label, fontsize=8)
         ax.set_title(f"{label}  (expect {expected})", fontsize=9)
 
-    fig.suptitle(f"{behavior} - Layer {layer}: Projection vs Steerability",
+    fig.suptitle(f"{behavior} - Layer {layer}: {x_label} vs Steerability",
                  fontsize=13, fontweight="bold")
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches="tight")
@@ -558,10 +708,17 @@ def plot_curves_by_projection_quantile(merged_df, eval_dfs, layer, behavior, out
     plt.close()
 
 
-def plot_correlation_summary(corr_df, behavior, target_layers, output_path):
-    """Pearson r and Spearman rho across layers for each key metric."""
+def plot_correlation_summary(corr_df, behavior, target_layers, output_path,
+                             predictor="projection"):
+    """Pearson r and Spearman rho across layers for each key metric, for one predictor."""
     key_metrics = [col for col, _, _ in SCATTER_METRICS]
-    avail = corr_df[corr_df["metric"].isin(key_metrics)]
+    pred_label = PREDICTOR_LABELS.get(predictor, predictor)
+
+    if "predictor" in corr_df.columns:
+        avail = corr_df[(corr_df["metric"].isin(key_metrics)) &
+                        (corr_df["predictor"] == predictor)]
+    else:
+        avail = corr_df[corr_df["metric"].isin(key_metrics)]
     if avail.empty:
         return
 
@@ -591,7 +748,7 @@ def plot_correlation_summary(corr_df, behavior, target_layers, output_path):
             ax.set_xticks(target_layers)
         ax.legend(fontsize=7, loc="best")
 
-    fig.suptitle(f"{behavior}: Projection-Steerability Correlation by Layer",
+    fig.suptitle(f"{behavior}: {pred_label} - Correlation by Layer",
                  fontsize=13, fontweight="bold")
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches="tight")
@@ -599,7 +756,7 @@ def plot_correlation_summary(corr_df, behavior, target_layers, output_path):
 
 
 def plot_projection_histogram(merged_df, layer, behavior, output_path):
-    """Histogram of projection values with baseline_score color."""
+    """Histogram of projection values."""
     ldf = merged_df[merged_df["layer"] == layer]
     if ldf.empty:
         return
@@ -610,6 +767,112 @@ def plot_projection_histogram(merged_df, layer, behavior, output_path):
     ax.set_ylabel("Count", fontsize=10)
     ax.set_title(f"{behavior} - Layer {layer}: Test-Prompt Projection Distribution",
                  fontsize=11, fontweight="bold")
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close()
+
+
+def plot_2d_projection_residual(merged_df, layer, behavior, output_path,
+                                color_col="baseline_score"):
+    """
+    2D scatter: projection (x) vs residual_norm (y), colored by a steerability
+    metric.  Reveals whether the 'sweet spot' for steering is high-projection
+    + low-residual.
+    """
+    ldf = merged_df[merged_df["layer"] == layer]
+    cols = ["projection", "residual_norm", color_col]
+    if not all(c in ldf.columns for c in cols):
+        return
+    valid = ldf[cols].dropna()
+    if valid.empty:
+        return
+
+    fig, ax = plt.subplots(figsize=(9, 7))
+    sc = ax.scatter(valid["projection"], valid["residual_norm"],
+                    c=valid[color_col], cmap="viridis", alpha=0.8, s=50,
+                    edgecolors="k", linewidths=0.3)
+    cbar = fig.colorbar(sc, ax=ax, pad=0.02)
+    cbar.set_label(color_col.replace("_", " ").title(), fontsize=10)
+    ax.set_xlabel("Projection onto steering dir.", fontsize=11)
+    ax.set_ylabel("Residual norm (dist. from SV line)", fontsize=11)
+    ax.set_title(f"{behavior} - Layer {layer}: Projection vs Residual "
+                 f"(color = {color_col})", fontsize=12, fontweight="bold")
+
+    _annotate_corr(ax, valid["projection"], valid["residual_norm"])
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close()
+
+
+def plot_train_vs_test(train_df, test_proj_df, layer, behavior, output_path):
+    """
+    Overlay histograms comparing train (pos/neg) vs test distributions for
+    projection and residual_norm.  Shows whether test examples are 'in distribution'
+    relative to training data.
+    """
+    train_l = train_df[train_df["layer"] == layer] if train_df is not None else pd.DataFrame()
+    test_l = test_proj_df[test_proj_df["layer"] == layer]
+
+    if train_l.empty and test_l.empty:
+        return
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 9))
+
+    for col_idx, metric in enumerate(["projection", "residual_norm"]):
+        metric_label = PREDICTOR_LABELS.get(metric, metric)
+
+        ax_hist = axes[0, col_idx]
+        ax_box = axes[1, col_idx]
+
+        groups = []
+        labels = []
+        colors = []
+
+        if not train_l.empty:
+            pos = train_l[train_l["label"] == 1][metric].dropna()
+            neg = train_l[train_l["label"] == 0][metric].dropna()
+            if len(pos):
+                groups.append(pos)
+                labels.append(f"Train pos (n={len(pos)})")
+                colors.append("#2ca02c")
+            if len(neg):
+                groups.append(neg)
+                labels.append(f"Train neg (n={len(neg)})")
+                colors.append("#d62728")
+        if not test_l.empty:
+            test_vals = test_l[metric].dropna()
+            if len(test_vals):
+                groups.append(test_vals)
+                labels.append(f"Test (n={len(test_vals)})")
+                colors.append("#1f77b4")
+
+        if not groups:
+            ax_hist.set_visible(False)
+            ax_box.set_visible(False)
+            continue
+
+        all_vals = pd.concat(groups)
+        bins = np.linspace(all_vals.min(), all_vals.max(), 30)
+        for vals, lbl, clr in zip(groups, labels, colors):
+            ax_hist.hist(vals, bins=bins, alpha=0.45, label=lbl, color=clr,
+                         edgecolor="white", linewidth=0.5)
+        ax_hist.set_xlabel(metric_label, fontsize=9)
+        ax_hist.set_ylabel("Count", fontsize=9)
+        ax_hist.set_title(f"{metric_label} - Histogram", fontsize=10)
+        ax_hist.legend(fontsize=7)
+
+        ax_box.boxplot([g.values for g in groups], labels=labels, vert=True,
+                       patch_artist=True,
+                       boxprops=dict(alpha=0.6))
+        for patch, clr in zip(ax_box.patches, colors):
+            patch.set_facecolor(clr)
+        ax_box.set_ylabel(metric_label, fontsize=9)
+        ax_box.set_title(f"{metric_label} - Box Plot", fontsize=10)
+        ax_box.tick_params(axis="x", labelsize=7)
+
+    fig.suptitle(f"{behavior} - Layer {layer}: Train vs Test Distributions",
+                 fontsize=13, fontweight="bold")
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close()
@@ -636,6 +899,8 @@ def main():
     parser.add_argument("--min_valid", type=int, default=None,
                         help="Only consider a factor 'valid' for best/worst metrics if "
                              ">= this many examples survive fluency filtering")
+    parser.add_argument("--train_dataset_path", type=str, default=None,
+                        help="Path to train_contrastive.json for train vs test comparison")
     parser.add_argument("--replot_only", action="store_true",
                         help="Skip model inference; reuse saved projections.csv")
     args = parser.parse_args()
@@ -657,12 +922,18 @@ def main():
 
     # -- Extract or load projections ------------------------------------
     proj_path = out_dir / "projections.csv"
+    train_proj_path = out_dir / "train_projections.csv"
+    train_df = None
+
     if args.replot_only:
         if not proj_path.exists():
             logger.error(f"No projections.csv at {proj_path}; run without --replot_only first")
             sys.exit(1)
         proj_df = pd.read_csv(proj_path)
         logger.warning(f"Loaded {len(proj_df)} saved projections")
+        if train_proj_path.exists():
+            train_df = pd.read_csv(train_proj_path)
+            logger.warning(f"Loaded {len(train_df)} saved train projections")
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         logger.warning(f"Using device: {device}")
@@ -682,6 +953,14 @@ def main():
         proj_df = extract_projections(model, tokenizer, sweep_dir, target_layers, device)
         proj_df.to_csv(proj_path, index=False)
         logger.warning(f"Saved projections to {proj_path}")
+
+        if args.train_dataset_path:
+            train_df = extract_train_projections(
+                model, tokenizer, args.train_dataset_path,
+                sweep_dir, target_layers, device,
+            )
+            train_df.to_csv(train_proj_path, index=False)
+            logger.warning(f"Saved train projections to {train_proj_path}")
 
         del model
         torch.cuda.empty_cache()
@@ -711,7 +990,8 @@ def main():
     for _, row in corr_df.iterrows():
         sig = "*" if row["spearman_p"] < 0.05 else ""
         logger.warning(
-            f"  L{int(row['layer']):2d} {row['metric']:>25s}: "
+            f"  L{int(row['layer']):2d} [{row['predictor']:>15s}] "
+            f"{row['metric']:>25s}: "
             f"r={row['pearson_r']:+.3f} (p={row['pearson_p']:.3f})  "
             f"rho={row['spearman_rho']:+.3f} (p={row['spearman_p']:.3f}) {sig}"
         )
@@ -727,7 +1007,15 @@ def main():
     logger.warning("Generating plots ...")
     for layer in target_layers:
         plot_scatter_panel(merged, layer, args.behavior,
-                           plot_dir / f"scatter_panel_layer_{layer}.png")
+                           plot_dir / f"scatter_panel_layer_{layer}.png",
+                           x_col="projection")
+        plot_scatter_panel(merged, layer, args.behavior,
+                           plot_dir / f"scatter_residual_layer_{layer}.png",
+                           x_col="residual_norm")
+        plot_scatter_panel(merged, layer, args.behavior,
+                           plot_dir / f"scatter_cosine_layer_{layer}.png",
+                           x_col="cosine_with_sv")
+
         plot_curves_by_projection(merged, eval_dfs, layer, args.behavior,
                                   plot_dir / f"curves_by_projection_layer_{layer}.png")
         plot_curves_by_projection_quantile(merged, eval_dfs, layer, args.behavior,
@@ -735,8 +1023,21 @@ def main():
         plot_projection_histogram(merged, layer, args.behavior,
                                   plot_dir / f"projection_hist_layer_{layer}.png")
 
-    plot_correlation_summary(corr_df, args.behavior, target_layers,
-                             plot_dir / "correlation_summary.png")
+        plot_2d_projection_residual(merged, layer, args.behavior,
+                                    plot_dir / f"proj_vs_residual_2d_layer_{layer}.png",
+                                    color_col="baseline_score")
+        plot_2d_projection_residual(merged, layer, args.behavior,
+                                    plot_dir / f"proj_vs_residual_2d_score_f1_layer_{layer}.png",
+                                    color_col="score_at_f1")
+
+        if train_df is not None:
+            plot_train_vs_test(train_df, proj_df, layer, args.behavior,
+                               plot_dir / f"train_vs_test_layer_{layer}.png")
+
+    for pred in PREDICTOR_COLS:
+        plot_correlation_summary(corr_df, args.behavior, target_layers,
+                                 plot_dir / f"correlation_summary_{pred}.png",
+                                 predictor=pred)
 
     # -- Summary ----------------------------------------------------------
     summary = {
@@ -746,7 +1047,10 @@ def main():
         "layers": target_layers,
         "fluency_filter": args.fluency_filter,
         "min_valid": args.min_valid,
+        "train_dataset_path": args.train_dataset_path,
         "n_prompts_per_layer": int(merged.groupby("layer")["question_idx"].nunique().median()),
+        "n_train_examples": len(train_df) if train_df is not None else 0,
+        "predictors": PREDICTOR_COLS,
         "correlations": corr_df.to_dict(orient="records"),
     }
     with open(out_dir / "analysis_summary.json", "w") as f:
