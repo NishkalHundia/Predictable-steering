@@ -239,9 +239,59 @@ def extract_projections(model, tokenizer, sweep_dir, target_layers, device):
 # ============================================================================
 # Phase 2: Per-prompt steerability metrics
 # ============================================================================
-def compute_steerability_metrics(sweep_dir, target_layers, behavior):
+def _load_layer_eval(sweep_dir, layer, fluency_filter=None):
+    """
+    Load behavior eval data for a layer, optionally joined with axbench fluency
+    data and filtered to fluency_score >= fluency_filter.
+
+    Returns (filtered_df, n_per_factor) where n_per_factor is a dict mapping
+    steering_factor -> count of surviving examples (for min_valid checks).
+    """
+    eval_path = sweep_dir / f"layer_{layer}" / "eval" / "eval_results.parquet"
+    if not eval_path.exists():
+        return pd.DataFrame(), {}
+
+    eval_df = pd.read_parquet(eval_path)
+
+    if fluency_filter is not None:
+        ax_path = sweep_dir / f"layer_{layer}" / "eval_axbench" / "eval_results.parquet"
+        if ax_path.exists():
+            ax_df = pd.read_parquet(ax_path)
+            if "fluency_score" in ax_df.columns:
+                ax_cols = ["question_idx", "steering_factor", "fluency_score"]
+                merged = eval_df.merge(ax_df[ax_cols],
+                                       on=["question_idx", "steering_factor"],
+                                       how="inner")
+                mask = merged["fluency_score"] >= fluency_filter
+                n_before, n_after = len(mask), int(mask.sum())
+                logger.warning(
+                    f"  Layer {layer}: fluency >= {fluency_filter}: "
+                    f"{n_after}/{n_before} rows survive"
+                )
+                eval_df = merged[mask].reset_index(drop=True)
+            else:
+                logger.warning(f"  Layer {layer}: axbench data has no fluency_score column")
+        else:
+            logger.warning(f"  Layer {layer}: no axbench data at {ax_path}, skipping fluency filter")
+
+    n_per_factor = (
+        eval_df.dropna(subset=["behavior_score"])
+        .groupby("steering_factor")["behavior_score"]
+        .count()
+        .to_dict()
+    )
+    return eval_df, n_per_factor
+
+
+def compute_steerability_metrics(sweep_dir, target_layers, behavior,
+                                 fluency_filter=None, min_valid=None):
     """
     From existing eval data, compute per-prompt steerability metrics at each layer.
+
+    If fluency_filter is set, only (prompt, factor) rows where the axbench
+    fluency_score >= fluency_filter are used.  If min_valid is set, aggregate
+    "best factor" metrics only consider factors with >= min_valid surviving
+    examples (matching rejudge_sweep.py logic).
     """
     min_val, max_val, _ = get_behavior_scale(behavior)
     scale_range = max_val - min_val
@@ -249,10 +299,13 @@ def compute_steerability_metrics(sweep_dir, target_layers, behavior):
     all_rows = []
 
     for layer in target_layers:
-        eval_path = sweep_dir / f"layer_{layer}" / "eval" / "eval_results.parquet"
-        if not eval_path.exists():
+        eval_df, n_per_factor = _load_layer_eval(sweep_dir, layer, fluency_filter)
+        if eval_df.empty:
             continue
-        eval_df = pd.read_parquet(eval_path)
+
+        valid_factors = set(n_per_factor.keys())
+        if min_valid:
+            valid_factors = {f for f, n in n_per_factor.items() if n >= min_valid}
 
         for qidx in sorted(eval_df["question_idx"].unique()):
             pdf = eval_df[eval_df["question_idx"] == qidx].dropna(subset=["behavior_score"])
@@ -262,15 +315,18 @@ def compute_steerability_metrics(sweep_dir, target_layers, behavior):
             scores = dict(zip(pdf["steering_factor"].values, pdf["behavior_score"].values))
             baseline = scores.get(0.0, scores.get(0, np.nan))
 
+            scores_valid = {f: s for f, s in scores.items() if f in valid_factors}
+
             pos = sorted([(f, s) for f, s in scores.items() if f > 0], key=lambda x: x[0])
-            neg = sorted([(f, s) for f, s in scores.items() if f < 0], key=lambda x: x[0])
+            pos_valid = sorted([(f, s) for f, s in scores_valid.items() if f > 0],
+                               key=lambda x: x[0])
             all_sorted = sorted(scores.items(), key=lambda x: x[0])
 
             m = {"question_idx": int(qidx), "layer": int(layer), "baseline_score": baseline}
 
-            # --- max positive score & its factor ---
-            if pos:
-                best_f, best_s = max(pos, key=lambda x: x[1])
+            # --- max positive score & its factor (respects min_valid) ---
+            if pos_valid:
+                best_f, best_s = max(pos_valid, key=lambda x: x[1])
                 m["max_pos_score"] = best_s
                 m["factor_for_max_pos"] = best_f
                 m["delta_from_baseline"] = (best_s - baseline) if not np.isnan(baseline) else np.nan
@@ -278,6 +334,8 @@ def compute_steerability_metrics(sweep_dir, target_layers, behavior):
                 m["max_pos_score"] = m["factor_for_max_pos"] = m["delta_from_baseline"] = np.nan
 
             # --- min factor to exceed baseline + delta (10/20/30 % of scale) ---
+            # uses all positive-factor scores (not min_valid gated) since this
+            # is a per-prompt metric, not an aggregate
             for pct_label, pct in [("10", 0.10), ("20", 0.20), ("30", 0.30)]:
                 key = f"min_factor_delta_{pct_label}"
                 if np.isnan(baseline) or not pos:
@@ -572,6 +630,12 @@ def main():
     parser.add_argument("--layers", type=str, default=None,
                         help="Comma-separated layers (default: discover from sweep_dir)")
     parser.add_argument("--use_bf16", action="store_true", default=True)
+    parser.add_argument("--fluency_filter", type=float, default=None,
+                        help="Only use (prompt, factor) rows with fluency_score >= this "
+                             "(requires eval_axbench/ data from rejudge_sweep.py)")
+    parser.add_argument("--min_valid", type=int, default=None,
+                        help="Only consider a factor 'valid' for best/worst metrics if "
+                             ">= this many examples survive fluency filtering")
     parser.add_argument("--replot_only", action="store_true",
                         help="Skip model inference; reuse saved projections.csv")
     args = parser.parse_args()
@@ -623,8 +687,15 @@ def main():
         torch.cuda.empty_cache()
 
     # -- Compute steerability metrics ------------------------------------
+    if args.fluency_filter is not None:
+        logger.warning(f"Fluency filter: >= {args.fluency_filter}")
+    if args.min_valid is not None:
+        logger.warning(f"Min valid: >= {args.min_valid} examples per factor")
     logger.warning("Computing per-prompt steerability metrics ...")
-    metrics_df = compute_steerability_metrics(sweep_dir, target_layers, args.behavior)
+    metrics_df = compute_steerability_metrics(
+        sweep_dir, target_layers, args.behavior,
+        fluency_filter=args.fluency_filter, min_valid=args.min_valid,
+    )
     metrics_df.to_csv(out_dir / "steerability_metrics.csv", index=False)
 
     # -- Merge projections + metrics -------------------------------------
@@ -645,12 +716,12 @@ def main():
             f"rho={row['spearman_rho']:+.3f} (p={row['spearman_p']:.3f}) {sig}"
         )
 
-    # -- Load eval data for curve plots -----------------------------------
+    # -- Load eval data for curve plots (with same fluency filter) --------
     eval_dfs = {}
     for layer in target_layers:
-        ep = sweep_dir / f"layer_{layer}" / "eval" / "eval_results.parquet"
-        if ep.exists():
-            eval_dfs[layer] = pd.read_parquet(ep)
+        filtered_df, _ = _load_layer_eval(sweep_dir, layer, args.fluency_filter)
+        if not filtered_df.empty:
+            eval_dfs[layer] = filtered_df
 
     # -- Generate plots ---------------------------------------------------
     logger.warning("Generating plots ...")
@@ -673,6 +744,8 @@ def main():
         "model_name": args.model_name,
         "sweep_dir": str(sweep_dir),
         "layers": target_layers,
+        "fluency_filter": args.fluency_filter,
+        "min_valid": args.min_valid,
         "n_prompts_per_layer": int(merged.groupby("layer")["question_idx"].nunique().median()),
         "correlations": corr_df.to_dict(orient="records"),
     }
