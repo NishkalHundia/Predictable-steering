@@ -1,69 +1,47 @@
 """
-Projection vs Steering Factor Analysis.
+Test-Time Projection Analysis.
 
-For each test prompt at each layer:
-  1. Retrieve unsteered (factor=0) generation from existing sweep eval results
-  2. Forward pass through model to extract mean response-token activations
-  3. Project onto the steering direction (DiffMean vector)
-  4. Compute distance metrics: residual_norm (off-axis distance), cosine_with_sv
-  5. Compute per-prompt steerability metrics from existing behavior scores
-  6. Correlate projection, residual_norm, cosine_with_sv against steerability
-  7. Generate diagnostic plots
+Tests whether a test prompt's unsteered activation, projected onto the DiffMean
+steering direction and normalized relative to the training centroids, correlates
+with the judge-assigned behavior score of its unsteered generation.
 
-Hypotheses:
-  - Prompts whose unsteered activations project more strongly toward the positive
-    centroid need smaller steering factors for effective steering.
-  - Prompts closer to the DiffMeans line (small residual_norm) are more
-    predictably steered, since the SV captures more of their activation.
-
-Optionally extracts the same metrics for training examples (--train_dataset_path)
-so train vs test distributions can be compared.
+Formalization:
+  - Training produces centroids mu_pos, mu_neg and steering vector v = mu_pos - mu_neg
+  - Centroid projections: c+ = mu_pos . v_hat,  c- = mu_neg . v_hat
+  - Normalization: p_tilde = (p - m) / h  where m = (c+ + c-)/2, h = (c+ - c-)/2
+  - Under this transform: c+ -> +1, c- -> -1
+  - For test prompt x_j with unsteered generation y_j^(0):
+      p_j = mean_response_act(x_j, y_j^(0)) . v_hat
+      p_tilde_j = (p_j - m) / h
+  - Hypothesis: rho(p_tilde, baseline_score) >> 0
 
 Requires:
-  - Completed sweep (sweep_layers_open_ended.py) with eval results
-  - Optionally rejudged (rejudge_sweep.py)
-
-Directory structure (reads from):
-  {sweep_dir}/
-    layer_{N}/
-      DiffMean_weight.pt
-      eval/eval_results.parquet
+  - Completed sweep (sweep_layers_open_ended.py) with DiffMean_weight.pt and eval results
+  - Training contrastive dataset (for centroid computation)
 
 Outputs:
   {sweep_dir}/projection_analysis/
-    projections.csv
-    train_projections.csv  (if --train_dataset_path)
-    steerability_metrics.csv
-    merged_data.csv
+    test_projections.csv
+    train_projections.csv
+    centroids.csv
     correlations.csv
+    analysis_summary.json
     plots/
-      scatter_panel_layer_{N}.png           (projection x steerability)
-      scatter_residual_layer_{N}.png        (residual_norm x steerability)
-      scatter_cosine_layer_{N}.png          (cosine x steerability)
-      proj_vs_residual_2d_layer_{N}.png     (2D: proj x residual, color=score)
-      curves_by_projection_layer_{N}.png
-      curves_quantile_layer_{N}.png
-      train_vs_test_layer_{N}.png           (if --train_dataset_path)
-      correlation_summary_{predictor}.png
+      scatter_layer_{N}.png
+      distribution_layer_{N}.png
+      correlation_across_layers.png
 
 Usage:
     uv run python axbench/scripts/projection_vs_steering_factor.py \\
-        --behavior sycophancy \\
+        --behavior corrigible-neutral-HHH \\
         --model_name google/gemma-2-9b-it \\
-        --sweep_dir results/gemma-2-9b-it/sycophancy-sweep
-
-    # With train comparison:
-    ... --train_dataset_path datasets/generated/sycophancy/train_contrastive.json
-
-    # With fluency filtering:
-    ... --fluency_filter 1.0 --min_valid 25
-
-    # Replot only (skip model inference, reuse saved CSVs):
-    ... --replot_only
+        --sweep_dir results/gemma-2-9b-it/corrigible-neutral-HHH-sweep \\
+        --train_dataset_path datasets/generated/gemma-2-9b-it/corrigible-neutral-HHH/train_contrastive.json
 """
 import os
 import sys
 import json
+import shutil
 import torch
 import numpy as np
 import pandas as pd
@@ -74,8 +52,6 @@ from scipy import stats as scipy_stats
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.colors import Normalize
-from matplotlib.cm import ScalarMappable
 
 import logging
 logging.basicConfig(
@@ -87,9 +63,6 @@ logger = logging.getLogger(__name__)
 
 plt.style.use("seaborn-v0_8-whitegrid")
 
-# ============================================================================
-# Behavior scales
-# ============================================================================
 BEHAVIOR_SCALES = {
     "survival-instinct": (-5, 5, 0),
     "myopic-reward": (-5, 5, 0),
@@ -101,10 +74,6 @@ BEHAVIOR_SCALES = {
 }
 
 BEHAVIORS = list(BEHAVIOR_SCALES.keys())
-
-
-def get_behavior_scale(behavior: str):
-    return BEHAVIOR_SCALES.get(behavior, (0, 10, 5))
 
 
 # ============================================================================
@@ -143,24 +112,8 @@ def gather_multi_layer_activations(model, target_layers: list[int], inputs: dict
     return layer_acts
 
 
-# ============================================================================
-# Phase 1: Extract projections
-# ============================================================================
-@torch.no_grad()
-def extract_projections(model, tokenizer, sweep_dir, target_layers, device):
-    """
-    For each test prompt, get the unsteered generation (factor=0), run a forward
-    pass to collect mean response-token activations at each target layer, and
-    project onto the steering direction.
-
-    Uses the same activation-extraction logic as sweep_layers_open_ended.py:
-    mean of response-token hidden states, projected as a.dot(sv) / ||sv||.
-    """
-    use_chat = supports_chat_template(tokenizer)
-    model.eval()
-    sweep_dir = Path(sweep_dir)
-
-    steering_vectors = {}
+def _load_steering_vectors(sweep_dir: Path, target_layers: list[int]):
+    svs = {}
     for layer in target_layers:
         sv = torch.load(
             sweep_dir / f"layer_{layer}" / "DiffMean_weight.pt",
@@ -168,101 +121,129 @@ def extract_projections(model, tokenizer, sweep_dir, target_layers, device):
         )
         if sv.dim() == 2:
             sv = sv.squeeze(0)
-        steering_vectors[layer] = sv
+        svs[layer] = sv
+    return svs
+
+
+def _format_texts(tokenizer, use_chat, question, answer):
+    if use_chat:
+        q_text = tokenizer.apply_chat_template(
+            [{"role": "user", "content": question}],
+            tokenize=False, add_generation_prompt=True,
+        )
+        full_text = tokenizer.apply_chat_template(
+            [{"role": "user", "content": question},
+             {"role": "assistant", "content": str(answer)}],
+            tokenize=False, add_generation_prompt=False,
+        )
+    else:
+        q_text = question
+        full_text = question + "\n\n" + str(answer)
+    return q_text, full_text
+
+
+def _get_mean_response_act(model, tokenizer, target_layers, question, answer,
+                           use_chat, device):
+    """Forward pass -> mean response-token activation at each target layer."""
+    q_text, full_text = _format_texts(tokenizer, use_chat, question, answer)
+
+    full_inputs = tokenizer(
+        full_text, return_tensors="pt", truncation=True, max_length=1024,
+    ).to(device)
+    q_inputs = tokenizer(
+        q_text, return_tensors="pt", truncation=True, max_length=1024,
+    ).to(device)
+
+    q_len = q_inputs["input_ids"].shape[1]
+    f_len = full_inputs["input_ids"].shape[1]
+    if f_len <= q_len:
+        return None
+
+    layer_acts = gather_multi_layer_activations(
+        model, target_layers,
+        {"input_ids": full_inputs["input_ids"],
+         "attention_mask": full_inputs["attention_mask"]},
+    )
+
+    result = {}
+    for layer in target_layers:
+        resp_acts = layer_acts[layer].float()[0, q_len:f_len]
+        result[layer] = resp_acts.mean(dim=0)
+    return result
+
+
+# ============================================================================
+# Extraction
+# ============================================================================
+@torch.no_grad()
+def extract_test_projections(model, tokenizer, sweep_dir, target_layers, device):
+    """
+    For each test prompt, get the unsteered generation (factor=0), forward pass,
+    mean response-token activation, project onto v_hat.
+    """
+    use_chat = supports_chat_template(tokenizer)
+    model.eval()
+    sweep_dir = Path(sweep_dir)
+    svs = _load_steering_vectors(sweep_dir, target_layers)
 
     first_layer = target_layers[0]
     eval_df = pd.read_parquet(
         sweep_dir / f"layer_{first_layer}" / "eval" / "eval_results.parquet"
     )
-
     baseline_df = eval_df[eval_df["steering_factor"] == 0].copy().reset_index(drop=True)
     if baseline_df.empty:
         closest = eval_df.loc[eval_df["steering_factor"].abs().idxmin(), "steering_factor"]
         baseline_df = eval_df[eval_df["steering_factor"] == closest].copy().reset_index(drop=True)
-        logger.warning(f"No factor=0 found; using factor={closest} as baseline")
+        logger.warning(f"No factor=0 found; using factor={closest}")
+
+    baseline_scores = {}
+    for layer in target_layers:
+        layer_eval = pd.read_parquet(
+            sweep_dir / f"layer_{layer}" / "eval" / "eval_results.parquet"
+        )
+        f0 = layer_eval[layer_eval["steering_factor"] == 0]
+        baseline_scores[layer] = dict(zip(f0["question_idx"], f0["behavior_score"]))
+
     logger.warning(f"Extracting projections for {len(baseline_df)} test prompts")
 
     rows = []
-    for idx in tqdm(range(len(baseline_df)), desc="Extracting projections"):
+    for idx in tqdm(range(len(baseline_df)), desc="Test projections"):
         row = baseline_df.iloc[idx]
         question = row["question"]
         generation = row["generation"]
         question_idx = row.get("question_idx", idx)
 
         if pd.isna(generation) or str(generation).strip() == "":
-            logger.warning(f"  Prompt {question_idx}: empty baseline generation, skipping")
             continue
 
-        if use_chat:
-            q_text = tokenizer.apply_chat_template(
-                [{"role": "user", "content": question}],
-                tokenize=False, add_generation_prompt=True,
-            )
-            full_text = tokenizer.apply_chat_template(
-                [{"role": "user", "content": question},
-                 {"role": "assistant", "content": str(generation)}],
-                tokenize=False, add_generation_prompt=False,
-            )
-        else:
-            q_text = question
-            full_text = question + "\n\n" + str(generation)
-
-        full_inputs = tokenizer(
-            full_text, return_tensors="pt", truncation=True, max_length=1024,
-        ).to(device)
-        q_inputs = tokenizer(
-            q_text, return_tensors="pt", truncation=True, max_length=1024,
-        ).to(device)
-
-        q_len = q_inputs["input_ids"].shape[1]
-        f_len = full_inputs["input_ids"].shape[1]
-        if f_len <= q_len:
-            logger.warning(f"  Prompt {question_idx}: no response tokens, skipping")
-            continue
-
-        layer_acts = gather_multi_layer_activations(
-            model, target_layers,
-            {"input_ids": full_inputs["input_ids"],
-             "attention_mask": full_inputs["attention_mask"]},
+        mean_acts = _get_mean_response_act(
+            model, tokenizer, target_layers, question, str(generation),
+            use_chat, device,
         )
+        if mean_acts is None:
+            continue
 
         for layer in target_layers:
-            resp_acts = layer_acts[layer].float()[0, q_len:f_len]
-            mean_act = resp_acts.mean(dim=0)
-
-            sv = steering_vectors[layer].to(mean_act.device)
+            sv = svs[layer].to(mean_acts[layer].device)
             sv_norm = sv.norm().item()
-            activation_norm = mean_act.norm().item()
-
             if sv_norm > 1e-12:
-                sv_hat = sv / sv_norm
-                proj = mean_act.dot(sv_hat).item()
-                proj_vec = proj * sv_hat
-                residual = mean_act - proj_vec
-                residual_norm = residual.norm().item()
+                proj = mean_acts[layer].dot(sv / sv_norm).item()
             else:
                 proj = 0.0
-                residual_norm = activation_norm
-
-            cosine_with_sv = (proj / activation_norm) if activation_norm > 1e-12 else 0.0
 
             rows.append({
                 "question_idx": int(question_idx),
                 "layer": int(layer),
                 "projection": proj,
-                "residual_norm": residual_norm,
-                "activation_norm": activation_norm,
-                "cosine_with_sv": cosine_with_sv,
-                "sv_norm": sv_norm,
+                "baseline_score": baseline_scores.get(layer, {}).get(question_idx, np.nan),
                 "question": question,
                 "generation": str(generation),
-                "n_response_tokens": int(f_len - q_len),
             })
 
         if idx % 5 == 0:
             torch.cuda.empty_cache()
 
-    logger.warning(f"Extracted {len(rows)} projection values")
+    logger.warning(f"Extracted {len(rows)} test projection values")
     return pd.DataFrame(rows)
 
 
@@ -270,28 +251,18 @@ def extract_projections(model, tokenizer, sweep_dir, target_layers, device):
 def extract_train_projections(model, tokenizer, train_dataset_path, sweep_dir,
                               target_layers, device):
     """
-    For each training contrastive pair (pos + neg), compute the same activation
-    metrics as for test prompts so we can compare train vs test distributions.
+    For each training contrastive pair (pos + neg), compute the raw projection
+    onto v_hat. Used to establish centroids c+ and c-.
     """
     use_chat = supports_chat_template(tokenizer)
     model.eval()
     sweep_dir = Path(sweep_dir)
+    svs = _load_steering_vectors(sweep_dir, target_layers)
 
     with open(train_dataset_path, encoding="utf-8") as f:
         train_data = json.load(f)
 
-    steering_vectors = {}
-    for layer in target_layers:
-        sv = torch.load(
-            sweep_dir / f"layer_{layer}" / "DiffMean_weight.pt",
-            map_location="cpu", weights_only=True,
-        )
-        if sv.dim() == 2:
-            sv = sv.squeeze(0)
-        steering_vectors[layer] = sv
-
-    logger.warning(f"Extracting train projections for {len(train_data)} pairs "
-                   f"({2 * len(train_data)} examples)")
+    logger.warning(f"Extracting train projections for {len(train_data)} pairs")
 
     rows = []
     for pair_idx, item in enumerate(tqdm(train_data, desc="Train projections")):
@@ -300,57 +271,20 @@ def extract_train_projections(model, tokenizer, train_dataset_path, sweep_dir,
             question = item["question"]
             answer = item[answer_key]
 
-            if use_chat:
-                q_text = tokenizer.apply_chat_template(
-                    [{"role": "user", "content": question}],
-                    tokenize=False, add_generation_prompt=True,
-                )
-                full_text = tokenizer.apply_chat_template(
-                    [{"role": "user", "content": question},
-                     {"role": "assistant", "content": str(answer)}],
-                    tokenize=False, add_generation_prompt=False,
-                )
-            else:
-                q_text = question
-                full_text = question + "\n\n" + str(answer)
-
-            full_inputs = tokenizer(
-                full_text, return_tensors="pt", truncation=True, max_length=1024,
-            ).to(device)
-            q_inputs = tokenizer(
-                q_text, return_tensors="pt", truncation=True, max_length=1024,
-            ).to(device)
-
-            q_len = q_inputs["input_ids"].shape[1]
-            f_len = full_inputs["input_ids"].shape[1]
-            if f_len <= q_len:
+            mean_acts = _get_mean_response_act(
+                model, tokenizer, target_layers, question, str(answer),
+                use_chat, device,
+            )
+            if mean_acts is None:
                 continue
 
-            layer_acts = gather_multi_layer_activations(
-                model, target_layers,
-                {"input_ids": full_inputs["input_ids"],
-                 "attention_mask": full_inputs["attention_mask"]},
-            )
-
             for layer in target_layers:
-                resp_acts = layer_acts[layer].float()[0, q_len:f_len]
-                mean_act = resp_acts.mean(dim=0)
-
-                sv = steering_vectors[layer].to(mean_act.device)
+                sv = svs[layer].to(mean_acts[layer].device)
                 sv_norm = sv.norm().item()
-                activation_norm = mean_act.norm().item()
-
                 if sv_norm > 1e-12:
-                    sv_hat = sv / sv_norm
-                    proj = mean_act.dot(sv_hat).item()
-                    proj_vec = proj * sv_hat
-                    residual = mean_act - proj_vec
-                    residual_norm = residual.norm().item()
+                    proj = mean_acts[layer].dot(sv / sv_norm).item()
                 else:
                     proj = 0.0
-                    residual_norm = activation_norm
-
-                cosine_with_sv = (proj / activation_norm) if activation_norm > 1e-12 else 0.0
 
                 rows.append({
                     "pair_idx": pair_idx,
@@ -358,11 +292,6 @@ def extract_train_projections(model, tokenizer, train_dataset_path, sweep_dir,
                     "label_name": "pos" if label == 1 else "neg",
                     "layer": int(layer),
                     "projection": proj,
-                    "residual_norm": residual_norm,
-                    "activation_norm": activation_norm,
-                    "cosine_with_sv": cosine_with_sv,
-                    "question": question,
-                    "answer": str(answer),
                 })
 
         if pair_idx % 5 == 0:
@@ -373,334 +302,161 @@ def extract_train_projections(model, tokenizer, train_dataset_path, sweep_dir,
 
 
 # ============================================================================
-# Phase 2: Per-prompt steerability metrics
+# Centroid normalization
 # ============================================================================
-def _load_layer_eval(sweep_dir, layer, fluency_filter=None):
+def compute_centroids(train_df, target_layers):
     """
-    Load behavior eval data for a layer, optionally joined with axbench fluency
-    data and filtered to fluency_score >= fluency_filter.
+    From training projections, compute per-layer:
+      c+ = mean projection of positive examples
+      c- = mean projection of negative examples
+      m  = (c+ + c-) / 2        (midpoint)
+      h  = (c+ - c-) / 2        (half-range)
 
-    Returns (filtered_df, n_per_factor) where n_per_factor is a dict mapping
-    steering_factor -> count of surviving examples (for min_valid checks).
+    Returns a DataFrame and a dict for quick lookup.
     """
-    eval_path = sweep_dir / f"layer_{layer}" / "eval" / "eval_results.parquet"
-    if not eval_path.exists():
-        return pd.DataFrame(), {}
-
-    eval_df = pd.read_parquet(eval_path)
-
-    if fluency_filter is not None:
-        ax_path = sweep_dir / f"layer_{layer}" / "eval_axbench" / "eval_results.parquet"
-        if ax_path.exists():
-            ax_df = pd.read_parquet(ax_path)
-            if "fluency_score" in ax_df.columns:
-                ax_cols = ["question_idx", "steering_factor", "fluency_score"]
-                merged = eval_df.merge(ax_df[ax_cols],
-                                       on=["question_idx", "steering_factor"],
-                                       how="inner")
-                mask = merged["fluency_score"] >= fluency_filter
-                n_before, n_after = len(mask), int(mask.sum())
-                logger.warning(
-                    f"  Layer {layer}: fluency >= {fluency_filter}: "
-                    f"{n_after}/{n_before} rows survive"
-                )
-                eval_df = merged[mask].reset_index(drop=True)
-            else:
-                logger.warning(f"  Layer {layer}: axbench data has no fluency_score column")
-        else:
-            logger.warning(f"  Layer {layer}: no axbench data at {ax_path}, skipping fluency filter")
-
-    n_per_factor = (
-        eval_df.dropna(subset=["behavior_score"])
-        .groupby("steering_factor")["behavior_score"]
-        .count()
-        .to_dict()
-    )
-    return eval_df, n_per_factor
-
-
-def compute_steerability_metrics(sweep_dir, target_layers, behavior,
-                                 fluency_filter=None, min_valid=None):
-    """
-    From existing eval data, compute per-prompt steerability metrics at each layer.
-
-    If fluency_filter is set, only (prompt, factor) rows where the axbench
-    fluency_score >= fluency_filter are used.  If min_valid is set, aggregate
-    "best factor" metrics only consider factors with >= min_valid surviving
-    examples (matching rejudge_sweep.py logic).
-    """
-    min_val, max_val, _ = get_behavior_scale(behavior)
-    scale_range = max_val - min_val
-    sweep_dir = Path(sweep_dir)
-    all_rows = []
-
-    for layer in target_layers:
-        eval_df, n_per_factor = _load_layer_eval(sweep_dir, layer, fluency_filter)
-        if eval_df.empty:
-            continue
-
-        valid_factors = set(n_per_factor.keys())
-        if min_valid:
-            valid_factors = {f for f, n in n_per_factor.items() if n >= min_valid}
-
-        for qidx in sorted(eval_df["question_idx"].unique()):
-            pdf = eval_df[eval_df["question_idx"] == qidx].dropna(subset=["behavior_score"])
-            if pdf.empty:
-                continue
-
-            scores = dict(zip(pdf["steering_factor"].values, pdf["behavior_score"].values))
-            baseline = scores.get(0.0, scores.get(0, np.nan))
-
-            scores_valid = {f: s for f, s in scores.items() if f in valid_factors}
-
-            pos = sorted([(f, s) for f, s in scores.items() if f > 0], key=lambda x: x[0])
-            pos_valid = sorted([(f, s) for f, s in scores_valid.items() if f > 0],
-                               key=lambda x: x[0])
-            all_sorted = sorted(scores.items(), key=lambda x: x[0])
-
-            m = {"question_idx": int(qidx), "layer": int(layer), "baseline_score": baseline}
-
-            # --- max positive score & its factor (respects min_valid) ---
-            if pos_valid:
-                best_f, best_s = max(pos_valid, key=lambda x: x[1])
-                m["max_pos_score"] = best_s
-                m["factor_for_max_pos"] = best_f
-                m["delta_from_baseline"] = (best_s - baseline) if not np.isnan(baseline) else np.nan
-            else:
-                m["max_pos_score"] = m["factor_for_max_pos"] = m["delta_from_baseline"] = np.nan
-
-            # --- min factor to exceed baseline + delta (10/20/30 % of scale) ---
-            # uses all positive-factor scores (not min_valid gated) since this
-            # is a per-prompt metric, not an aggregate
-            for pct_label, pct in [("10", 0.10), ("20", 0.20), ("30", 0.30)]:
-                key = f"min_factor_delta_{pct_label}"
-                if np.isnan(baseline) or not pos:
-                    m[key] = np.nan
-                else:
-                    thresh = baseline + pct * scale_range
-                    m[key] = next((f for f, s in pos if s >= thresh), np.nan)
-
-            # --- sensitivity slope (all factors) ---
-            if len(all_sorted) >= 3:
-                fa = np.array([x[0] for x in all_sorted])
-                sa = np.array([x[1] for x in all_sorted])
-                m["sensitivity_slope"] = scipy_stats.linregress(fa, sa).slope
-            else:
-                m["sensitivity_slope"] = np.nan
-
-            # --- positive-factors-only sensitivity slope ---
-            if len(pos) >= 3:
-                fa = np.array([x[0] for x in pos])
-                sa = np.array([x[1] for x in pos])
-                m["pos_sensitivity_slope"] = scipy_stats.linregress(fa, sa).slope
-            else:
-                m["pos_sensitivity_slope"] = np.nan
-
-            # --- scores at specific factors ---
-            for f_val in [1.0, 2.0, 5.0, 10.0]:
-                col = f"score_at_f{int(f_val)}"
-                m[col] = scores.get(f_val, scores.get(int(f_val), np.nan))
-
-            all_rows.append(m)
-
-    return pd.DataFrame(all_rows)
-
-
-# ============================================================================
-# Phase 3: Correlation analysis
-# ============================================================================
-PREDICTOR_COLS = ["projection", "residual_norm", "cosine_with_sv"]
-
-SCATTER_METRICS = [
-    ("baseline_score", "Baseline Score (f=0)", "+"),
-    ("factor_for_max_pos", "Factor for Max Score (pos)", "-"),
-    ("min_factor_delta_20", "Min Factor for Delta 20%", "-"),
-    ("sensitivity_slope", "Sensitivity (slope, all factors)", "+"),
-    ("score_at_f1", "Score at f=1", "+"),
-    ("delta_from_baseline", "Delta from Baseline (max-base)", "-"),
-]
-
-ALL_METRIC_COLS = [
-    "baseline_score", "max_pos_score", "factor_for_max_pos",
-    "delta_from_baseline",
-    "min_factor_delta_10", "min_factor_delta_20", "min_factor_delta_30",
-    "sensitivity_slope", "pos_sensitivity_slope",
-    "score_at_f1", "score_at_f2", "score_at_f5", "score_at_f10",
-]
-
-PREDICTOR_LABELS = {
-    "projection": "Projection onto steering dir.",
-    "residual_norm": "Residual norm (dist. from SV line)",
-    "cosine_with_sv": "Cosine similarity with SV",
-}
-
-
-def compute_correlations(merged_df, target_layers):
     rows = []
     for layer in target_layers:
-        ldf = merged_df[merged_df["layer"] == layer]
-        for pred_col in PREDICTOR_COLS:
-            if pred_col not in ldf.columns:
-                continue
-            for met_col in ALL_METRIC_COLS:
-                if met_col not in ldf.columns:
-                    continue
-                valid = ldf[[pred_col, met_col]].dropna()
-                if len(valid) < 4:
-                    continue
-                r, p_r = scipy_stats.pearsonr(valid[pred_col], valid[met_col])
-                rho, p_rho = scipy_stats.spearmanr(valid[pred_col], valid[met_col])
-                rows.append({
-                    "layer": layer, "predictor": pred_col, "metric": met_col,
-                    "pearson_r": r, "pearson_p": p_r,
-                    "spearman_rho": rho, "spearman_p": p_rho,
-                    "n": len(valid),
-                })
+        ldf = train_df[train_df["layer"] == layer]
+        c_pos = ldf[ldf["label"] == 1]["projection"].mean()
+        c_neg = ldf[ldf["label"] == 0]["projection"].mean()
+        midpoint = (c_pos + c_neg) / 2.0
+        half_range = (c_pos - c_neg) / 2.0
+        rows.append({
+            "layer": layer,
+            "c_pos": c_pos,
+            "c_neg": c_neg,
+            "midpoint": midpoint,
+            "half_range": half_range,
+        })
+    return pd.DataFrame(rows)
+
+
+def normalize_projections(df, centroids_df, proj_col="projection"):
+    """Add a 'normalized_projection' column: (p - m) / h, so c+ -> +1, c- -> -1."""
+    centroid_map = {
+        row["layer"]: (row["midpoint"], row["half_range"])
+        for _, row in centroids_df.iterrows()
+    }
+    norms = []
+    for _, row in df.iterrows():
+        m, h = centroid_map.get(row["layer"], (0, 1))
+        norms.append((row[proj_col] - m) / h if abs(h) > 1e-12 else 0.0)
+    df = df.copy()
+    df["normalized_projection"] = norms
+    return df
+
+
+# ============================================================================
+# Correlation
+# ============================================================================
+def compute_correlations(test_df, target_layers):
+    """Spearman and Pearson: normalized_projection vs baseline_score, per layer."""
+    rows = []
+    for layer in target_layers:
+        ldf = test_df[test_df["layer"] == layer]
+        valid = ldf[["normalized_projection", "baseline_score"]].dropna()
+        if len(valid) < 4:
+            continue
+        r, p_r = scipy_stats.pearsonr(valid["normalized_projection"], valid["baseline_score"])
+        rho, p_rho = scipy_stats.spearmanr(valid["normalized_projection"], valid["baseline_score"])
+        rows.append({
+            "layer": layer,
+            "pearson_r": r, "pearson_p": p_r,
+            "spearman_rho": rho, "spearman_p": p_rho,
+            "n": len(valid),
+        })
     return pd.DataFrame(rows)
 
 
 # ============================================================================
-# Phase 4: Plots
+# Plots
 # ============================================================================
-def _annotate_corr(ax, x, y, label=""):
-    valid = pd.DataFrame({"x": x, "y": y}).dropna()
-    if len(valid) < 4:
-        return
-    r, p_r = scipy_stats.pearsonr(valid["x"], valid["y"])
-    rho, p_rho = scipy_stats.spearmanr(valid["x"], valid["y"])
-    txt = f"r={r:.3f} (p={p_r:.3f})\nrho={rho:.3f} (p={p_rho:.3f})\nn={len(valid)}"
-    ax.text(0.03, 0.97, txt, transform=ax.transAxes, fontsize=7,
-            verticalalignment="top", fontfamily="monospace",
-            bbox=dict(boxstyle="round,pad=0.3", facecolor="wheat", alpha=0.7))
-    # regression line
-    z = np.polyfit(valid["x"], valid["y"], 1)
-    xr = np.linspace(valid["x"].min(), valid["x"].max(), 50)
-    ax.plot(xr, np.polyval(z, xr), "--", color="red", alpha=0.6, linewidth=1.2)
-
-
-def plot_scatter_panel(merged_df, layer, behavior, output_path,
-                       x_col="projection", x_label=None):
-    """6-panel scatter: predictor variable vs each key steerability metric."""
-    if x_label is None:
-        x_label = PREDICTOR_LABELS.get(x_col, x_col)
-    ldf = merged_df[merged_df["layer"] == layer]
-    if ldf.empty:
+def plot_scatter(test_df, layer, behavior, output_path):
+    """Scatter: normalized projection (x) vs baseline behavior score (y)."""
+    ldf = test_df[test_df["layer"] == layer]
+    valid = ldf[["normalized_projection", "baseline_score"]].dropna()
+    if valid.empty:
         return
 
-    fig, axes = plt.subplots(2, 3, figsize=(16, 9))
-    axes = axes.flatten()
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.scatter(valid["normalized_projection"], valid["baseline_score"],
+               alpha=0.8, s=60, edgecolors="k", linewidths=0.4, color="#2E86AB",
+               zorder=3)
 
-    for i, (col, label, expected) in enumerate(SCATTER_METRICS):
-        ax = axes[i]
-        if col not in ldf.columns or x_col not in ldf.columns:
-            ax.set_visible(False)
-            continue
-        valid = ldf[[x_col, col]].dropna()
-        if valid.empty:
-            ax.text(0.5, 0.5, "No data", ha="center", va="center", transform=ax.transAxes)
-            ax.set_title(label, fontsize=9)
-            continue
-        ax.scatter(valid[x_col], valid[col], alpha=0.7, s=40, edgecolors="k",
-                   linewidths=0.3, color="#2E86AB")
-        _annotate_corr(ax, valid[x_col], valid[col])
-        ax.set_xlabel(x_label, fontsize=8)
-        ax.set_ylabel(label, fontsize=8)
-        ax.set_title(f"{label}  (expect {expected})", fontsize=9)
+    ax.axvline(x=-1, color="#d62728", linestyle="--", alpha=0.6, label="Neg centroid (-1)")
+    ax.axvline(x=+1, color="#2ca02c", linestyle="--", alpha=0.6, label="Pos centroid (+1)")
+    ax.axvline(x=0, color="gray", linestyle=":", alpha=0.4, label="Midpoint (0)")
 
-    fig.suptitle(f"{behavior} - Layer {layer}: {x_label} vs Steerability",
-                 fontsize=13, fontweight="bold")
+    if len(valid) >= 4:
+        r, p_r = scipy_stats.pearsonr(valid["normalized_projection"], valid["baseline_score"])
+        rho, p_rho = scipy_stats.spearmanr(valid["normalized_projection"], valid["baseline_score"])
+        z = np.polyfit(valid["normalized_projection"], valid["baseline_score"], 1)
+        xr = np.linspace(valid["normalized_projection"].min(),
+                         valid["normalized_projection"].max(), 50)
+        ax.plot(xr, np.polyval(z, xr), "--", color="red", alpha=0.7, linewidth=1.5,
+                zorder=2)
+        txt = f"r = {r:.3f} (p = {p_r:.1e})\nrho = {rho:.3f} (p = {p_rho:.1e})\nn = {len(valid)}"
+        ax.text(0.03, 0.97, txt, transform=ax.transAxes, fontsize=9,
+                verticalalignment="top", fontfamily="monospace",
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="wheat", alpha=0.8))
+
+    ax.set_xlabel("Normalized projection  (neg centroid = -1, pos centroid = +1)",
+                  fontsize=10)
+    ax.set_ylabel("Baseline behavior score (unsteered)", fontsize=10)
+    ax.set_title(f"{behavior} - Layer {layer}", fontsize=12, fontweight="bold")
+    ax.legend(fontsize=8, loc="lower right")
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close()
 
 
-def plot_curves_by_projection(merged_df, eval_dfs, layer, behavior, output_path):
+def plot_distribution(train_df, test_df, layer, behavior, output_path):
     """
-    Behavior-score vs steering-factor curves for every prompt, colored by
-    projection value. If the hypothesis holds, high-projection prompts (blue)
-    should show behaviour rising at lower factors than low-projection prompts (red).
+    Overlaid histograms: train positive (green), train negative (red),
+    test (blue), all in normalized projection space with centroids marked.
     """
-    ldf = merged_df[merged_df["layer"] == layer]
-    if ldf.empty or layer not in eval_dfs:
-        return
-    edf = eval_dfs[layer]
-    min_val, max_val, ref_line = get_behavior_scale(behavior)
+    train_l = train_df[train_df["layer"] == layer]
+    test_l = test_df[test_df["layer"] == layer]
 
-    proj_map = dict(zip(ldf["question_idx"], ldf["projection"]))
-    qidxs = sorted(proj_map.keys())
-    projs = np.array([proj_map[q] for q in qidxs])
-    norm = Normalize(vmin=projs.min(), vmax=projs.max())
-    cmap = plt.cm.coolwarm
+    fig, ax = plt.subplots(figsize=(10, 5))
 
-    fig, ax = plt.subplots(figsize=(10, 6))
-    for qidx in qidxs:
-        pdf = edf[edf["question_idx"] == qidx].sort_values("steering_factor")
-        if pdf.empty:
-            continue
-        color = cmap(norm(proj_map[qidx]))
-        ax.plot(pdf["steering_factor"], pdf["behavior_score"],
-                "-o", color=color, alpha=0.55, linewidth=1.2, markersize=3)
+    groups, labels, colors = [], [], []
+    if not train_l.empty:
+        pos = train_l[train_l["label"] == 1]["normalized_projection"].dropna()
+        neg = train_l[train_l["label"] == 0]["normalized_projection"].dropna()
+        if len(pos):
+            groups.append(pos); labels.append(f"Train pos (n={len(pos)})"); colors.append("#2ca02c")
+        if len(neg):
+            groups.append(neg); labels.append(f"Train neg (n={len(neg)})"); colors.append("#d62728")
+    if not test_l.empty:
+        test_vals = test_l["normalized_projection"].dropna()
+        if len(test_vals):
+            groups.append(test_vals); labels.append(f"Test (n={len(test_vals)})"); colors.append("#1f77b4")
 
-    sm = ScalarMappable(cmap=cmap, norm=norm)
-    sm.set_array([])
-    cbar = fig.colorbar(sm, ax=ax, pad=0.02)
-    cbar.set_label("Projection (low -> high)", fontsize=9)
-
-    if ref_line is not None:
-        ax.axhline(y=ref_line, color="gray", linestyle="--", alpha=0.4)
-    ax.axvline(x=0, color="gray", linestyle=":", alpha=0.4)
-    ax.set_xlabel("Steering Factor", fontsize=11)
-    ax.set_ylabel(f"Behavior Score ({min_val:.0f}-{max_val:.0f})", fontsize=11)
-    ax.set_ylim(min_val - 0.3, max_val + 0.3)
-    ax.set_title(f"{behavior} - Layer {layer}: Per-Prompt Curves Colored by Projection",
-                 fontsize=12, fontweight="bold")
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches="tight")
-    plt.close()
-
-
-def plot_curves_by_projection_quantile(merged_df, eval_dfs, layer, behavior, output_path,
-                                       n_quantiles=3):
-    """
-    Mean behavior-score curve per projection quantile (tercile by default).
-    Cleaner aggregated view than the per-prompt version.
-    """
-    ldf = merged_df[merged_df["layer"] == layer]
-    if ldf.empty or layer not in eval_dfs:
-        return
-    edf = eval_dfs[layer]
-    min_val, max_val, ref_line = get_behavior_scale(behavior)
-
-    proj_map = dict(zip(ldf["question_idx"], ldf["projection"]))
-
-    enriched = edf.copy()
-    enriched["projection"] = enriched["question_idx"].map(proj_map)
-    enriched = enriched.dropna(subset=["projection", "behavior_score"])
-    if enriched.empty:
+    if not groups:
+        plt.close()
         return
 
-    enriched["proj_quantile"] = pd.qcut(enriched["projection"], n_quantiles,
-                                         labels=False, duplicates="drop")
+    all_vals = pd.concat(groups)
+    bins = np.linspace(all_vals.min() - 0.5, all_vals.max() + 0.5, 35)
+    for vals, lbl, clr in zip(groups, labels, colors):
+        ax.hist(vals, bins=bins, alpha=0.45, label=lbl, color=clr,
+                edgecolor="white", linewidth=0.5)
 
-    colors = plt.cm.coolwarm(np.linspace(0.15, 0.85, enriched["proj_quantile"].nunique()))
-    quantile_bounds = enriched.groupby("proj_quantile")["projection"].agg(["min", "max"])
+    ax.axvline(x=-1, color="#d62728", linestyle="--", linewidth=2, alpha=0.8)
+    ax.axvline(x=+1, color="#2ca02c", linestyle="--", linewidth=2, alpha=0.8)
+    ax.axvline(x=0, color="gray", linestyle=":", alpha=0.5)
 
-    fig, ax = plt.subplots(figsize=(10, 6))
-    for q_idx, color in zip(sorted(enriched["proj_quantile"].unique()), colors):
-        qdf = enriched[enriched["proj_quantile"] == q_idx]
-        agg = qdf.groupby("steering_factor")["behavior_score"].agg(["mean", "std"]).reset_index()
-        lo, hi = quantile_bounds.loc[q_idx, "min"], quantile_bounds.loc[q_idx, "max"]
-        label = f"Q{int(q_idx)}: proj [{lo:.1f}, {hi:.1f}]"
-        ax.errorbar(agg["steering_factor"], agg["mean"], yerr=agg["std"],
-                    marker="o", linewidth=2, capsize=3, color=color, label=label, markersize=4)
+    ylim = ax.get_ylim()
+    ax.text(-1, ylim[1] * 0.95, " c- = -1", color="#d62728", fontsize=9,
+            fontweight="bold", va="top")
+    ax.text(+1, ylim[1] * 0.95, " c+ = +1", color="#2ca02c", fontsize=9,
+            fontweight="bold", va="top")
 
-    if ref_line is not None:
-        ax.axhline(y=ref_line, color="gray", linestyle="--", alpha=0.4)
-    ax.axvline(x=0, color="gray", linestyle=":", alpha=0.4)
-    ax.set_xlabel("Steering Factor", fontsize=11)
-    ax.set_ylabel(f"Mean Behavior Score ({min_val:.0f}-{max_val:.0f})", fontsize=11)
-    ax.set_ylim(min_val - 0.3, max_val + 0.3)
-    ax.set_title(f"{behavior} - Layer {layer}: Mean Curves by Projection Quantile",
+    ax.set_xlabel("Normalized projection  (neg centroid = -1, pos centroid = +1)",
+                  fontsize=10)
+    ax.set_ylabel("Count", fontsize=10)
+    ax.set_title(f"{behavior} - Layer {layer}: Train vs Test Projection Distribution",
                  fontsize=12, fontweight="bold")
     ax.legend(fontsize=8)
     plt.tight_layout()
@@ -708,171 +464,29 @@ def plot_curves_by_projection_quantile(merged_df, eval_dfs, layer, behavior, out
     plt.close()
 
 
-def plot_correlation_summary(corr_df, behavior, target_layers, output_path,
-                             predictor="projection"):
-    """Pearson r and Spearman rho across layers for each key metric, for one predictor."""
-    key_metrics = [col for col, _, _ in SCATTER_METRICS]
-    pred_label = PREDICTOR_LABELS.get(predictor, predictor)
-
-    if "predictor" in corr_df.columns:
-        avail = corr_df[(corr_df["metric"].isin(key_metrics)) &
-                        (corr_df["predictor"] == predictor)]
-    else:
-        avail = corr_df[corr_df["metric"].isin(key_metrics)]
-    if avail.empty:
+def plot_correlation_across_layers(corr_df, behavior, output_path):
+    """Spearman rho (with significance markers) across layers."""
+    if corr_df.empty:
         return
 
-    metrics_present = [m for m in key_metrics if m in avail["metric"].values]
-    n = len(metrics_present)
-    if n == 0:
-        return
+    fig, ax = plt.subplots(figsize=(10, 5))
+    layers = corr_df["layer"].values
+    rhos = corr_df["spearman_rho"].values
+    pvals = corr_df["spearman_p"].values
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    sig_mask = pvals < 0.05
+    ax.plot(layers, rhos, "o-", color="#2E86AB", linewidth=2, markersize=7,
+            zorder=2, label="Spearman rho")
+    ax.scatter(layers[sig_mask], rhos[sig_mask], s=120, facecolors="none",
+               edgecolors="red", linewidths=2, zorder=3, label="p < 0.05")
 
-    for ax, stat_col, stat_name in [
-        (axes[0], "pearson_r", "Pearson r"),
-        (axes[1], "spearman_rho", "Spearman rho"),
-    ]:
-        cmap = plt.cm.tab10(np.linspace(0, 1, n))
-        for i, metric in enumerate(metrics_present):
-            mdf = avail[avail["metric"] == metric].sort_values("layer")
-            if mdf.empty:
-                continue
-            ax.plot(mdf["layer"], mdf[stat_col], "o-", label=metric.replace("_", " "),
-                    color=cmap[i], linewidth=1.8, markersize=5)
-        ax.axhline(y=0, color="gray", linestyle="--", alpha=0.5)
-        ax.set_xlabel("Layer")
-        ax.set_ylabel(stat_name)
-        ax.set_title(f"{stat_name} across Layers")
-        if target_layers:
-            ax.set_xticks(target_layers)
-        ax.legend(fontsize=7, loc="best")
-
-    fig.suptitle(f"{behavior}: {pred_label} - Correlation by Layer",
-                 fontsize=13, fontweight="bold")
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches="tight")
-    plt.close()
-
-
-def plot_projection_histogram(merged_df, layer, behavior, output_path):
-    """Histogram of projection values."""
-    ldf = merged_df[merged_df["layer"] == layer]
-    if ldf.empty:
-        return
-    fig, ax = plt.subplots(figsize=(8, 4))
-    ax.hist(ldf["projection"].dropna(), bins=20, color="#2E86AB", edgecolor="white",
-            alpha=0.8)
-    ax.set_xlabel("Projection onto steering direction", fontsize=10)
-    ax.set_ylabel("Count", fontsize=10)
-    ax.set_title(f"{behavior} - Layer {layer}: Test-Prompt Projection Distribution",
-                 fontsize=11, fontweight="bold")
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches="tight")
-    plt.close()
-
-
-def plot_2d_projection_residual(merged_df, layer, behavior, output_path,
-                                color_col="baseline_score"):
-    """
-    2D scatter: projection (x) vs residual_norm (y), colored by a steerability
-    metric.  Reveals whether the 'sweet spot' for steering is high-projection
-    + low-residual.
-    """
-    ldf = merged_df[merged_df["layer"] == layer]
-    cols = ["projection", "residual_norm", color_col]
-    if not all(c in ldf.columns for c in cols):
-        return
-    valid = ldf[cols].dropna()
-    if valid.empty:
-        return
-
-    fig, ax = plt.subplots(figsize=(9, 7))
-    sc = ax.scatter(valid["projection"], valid["residual_norm"],
-                    c=valid[color_col], cmap="viridis", alpha=0.8, s=50,
-                    edgecolors="k", linewidths=0.3)
-    cbar = fig.colorbar(sc, ax=ax, pad=0.02)
-    cbar.set_label(color_col.replace("_", " ").title(), fontsize=10)
-    ax.set_xlabel("Projection onto steering dir.", fontsize=11)
-    ax.set_ylabel("Residual norm (dist. from SV line)", fontsize=11)
-    ax.set_title(f"{behavior} - Layer {layer}: Projection vs Residual "
-                 f"(color = {color_col})", fontsize=12, fontweight="bold")
-
-    _annotate_corr(ax, valid["projection"], valid["residual_norm"])
-
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches="tight")
-    plt.close()
-
-
-def plot_train_vs_test(train_df, test_proj_df, layer, behavior, output_path):
-    """
-    Overlay histograms comparing train (pos/neg) vs test distributions for
-    projection and residual_norm.  Shows whether test examples are 'in distribution'
-    relative to training data.
-    """
-    train_l = train_df[train_df["layer"] == layer] if train_df is not None else pd.DataFrame()
-    test_l = test_proj_df[test_proj_df["layer"] == layer]
-
-    if train_l.empty and test_l.empty:
-        return
-
-    fig, axes = plt.subplots(2, 2, figsize=(14, 9))
-
-    for col_idx, metric in enumerate(["projection", "residual_norm"]):
-        metric_label = PREDICTOR_LABELS.get(metric, metric)
-
-        ax_hist = axes[0, col_idx]
-        ax_box = axes[1, col_idx]
-
-        groups = []
-        labels = []
-        colors = []
-
-        if not train_l.empty:
-            pos = train_l[train_l["label"] == 1][metric].dropna()
-            neg = train_l[train_l["label"] == 0][metric].dropna()
-            if len(pos):
-                groups.append(pos)
-                labels.append(f"Train pos (n={len(pos)})")
-                colors.append("#2ca02c")
-            if len(neg):
-                groups.append(neg)
-                labels.append(f"Train neg (n={len(neg)})")
-                colors.append("#d62728")
-        if not test_l.empty:
-            test_vals = test_l[metric].dropna()
-            if len(test_vals):
-                groups.append(test_vals)
-                labels.append(f"Test (n={len(test_vals)})")
-                colors.append("#1f77b4")
-
-        if not groups:
-            ax_hist.set_visible(False)
-            ax_box.set_visible(False)
-            continue
-
-        all_vals = pd.concat(groups)
-        bins = np.linspace(all_vals.min(), all_vals.max(), 30)
-        for vals, lbl, clr in zip(groups, labels, colors):
-            ax_hist.hist(vals, bins=bins, alpha=0.45, label=lbl, color=clr,
-                         edgecolor="white", linewidth=0.5)
-        ax_hist.set_xlabel(metric_label, fontsize=9)
-        ax_hist.set_ylabel("Count", fontsize=9)
-        ax_hist.set_title(f"{metric_label} - Histogram", fontsize=10)
-        ax_hist.legend(fontsize=7)
-
-        ax_box.boxplot([g.values for g in groups], labels=labels, vert=True,
-                       patch_artist=True,
-                       boxprops=dict(alpha=0.6))
-        for patch, clr in zip(ax_box.patches, colors):
-            patch.set_facecolor(clr)
-        ax_box.set_ylabel(metric_label, fontsize=9)
-        ax_box.set_title(f"{metric_label} - Box Plot", fontsize=10)
-        ax_box.tick_params(axis="x", labelsize=7)
-
-    fig.suptitle(f"{behavior} - Layer {layer}: Train vs Test Distributions",
-                 fontsize=13, fontweight="bold")
+    ax.axhline(y=0, color="gray", linestyle="--", alpha=0.5)
+    ax.set_xlabel("Layer", fontsize=11)
+    ax.set_ylabel("Spearman rho (normalized proj. vs baseline score)", fontsize=10)
+    ax.set_title(f"{behavior}: Projection-Score Correlation Across Layers",
+                 fontsize=12, fontweight="bold")
+    ax.set_xticks(layers)
+    ax.legend(fontsize=9)
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close()
@@ -884,29 +498,28 @@ def plot_train_vs_test(train_df, test_proj_df, layer, behavior, output_path):
 def main():
     import argparse
     parser = argparse.ArgumentParser(
-        description="Analyze projection of unsteered activations vs required steering factor"
+        description="Test-time projection analysis: normalized projection vs baseline behavior score"
     )
     parser.add_argument("--behavior", type=str, required=True, choices=BEHAVIORS)
     parser.add_argument("--model_name", type=str, default="google/gemma-2-9b-it")
     parser.add_argument("--sweep_dir", type=str, required=True,
                         help="Path to sweep output dir (contains layer_N/ subdirs)")
+    parser.add_argument("--train_dataset_path", type=str, required=True,
+                        help="Path to train_contrastive.json (needed for centroid normalization)")
     parser.add_argument("--layers", type=str, default=None,
                         help="Comma-separated layers (default: discover from sweep_dir)")
     parser.add_argument("--use_bf16", action="store_true", default=True)
-    parser.add_argument("--fluency_filter", type=float, default=None,
-                        help="Only use (prompt, factor) rows with fluency_score >= this "
-                             "(requires eval_axbench/ data from rejudge_sweep.py)")
-    parser.add_argument("--min_valid", type=int, default=None,
-                        help="Only consider a factor 'valid' for best/worst metrics if "
-                             ">= this many examples survive fluency filtering")
-    parser.add_argument("--train_dataset_path", type=str, default=None,
-                        help="Path to train_contrastive.json for train vs test comparison")
     parser.add_argument("--replot_only", action="store_true",
-                        help="Skip model inference; reuse saved projections.csv")
+                        help="Skip model inference; reuse saved CSVs")
     args = parser.parse_args()
 
     sweep_dir = Path(args.sweep_dir)
+
+    # Always start fresh
     out_dir = sweep_dir / "projection_analysis"
+    if out_dir.exists():
+        logger.warning(f"Removing existing {out_dir}")
+        shutil.rmtree(out_dir)
     plot_dir = out_dir / "plots"
     out_dir.mkdir(parents=True, exist_ok=True)
     plot_dir.mkdir(parents=True, exist_ok=True)
@@ -921,22 +534,20 @@ def main():
     logger.warning(f"Target layers: {target_layers}")
 
     # -- Extract or load projections ------------------------------------
-    proj_path = out_dir / "projections.csv"
+    test_proj_path = out_dir / "test_projections.csv"
     train_proj_path = out_dir / "train_projections.csv"
-    train_df = None
 
     if args.replot_only:
-        if not proj_path.exists():
-            logger.error(f"No projections.csv at {proj_path}; run without --replot_only first")
-            sys.exit(1)
-        proj_df = pd.read_csv(proj_path)
-        logger.warning(f"Loaded {len(proj_df)} saved projections")
-        if train_proj_path.exists():
-            train_df = pd.read_csv(train_proj_path)
-            logger.warning(f"Loaded {len(train_df)} saved train projections")
+        for p in [test_proj_path, train_proj_path]:
+            if not p.exists():
+                logger.error(f"Missing {p}; run without --replot_only first")
+                sys.exit(1)
+        test_df = pd.read_csv(test_proj_path)
+        train_df = pd.read_csv(train_proj_path)
+        logger.warning(f"Loaded {len(test_df)} test, {len(train_df)} train projections")
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        logger.warning(f"Using device: {device}")
+        logger.warning(f"Device: {device}")
         logger.warning(f"Loading model {args.model_name} ...")
         tokenizer = AutoTokenizer.from_pretrained(
             args.model_name, model_max_length=1024, padding_side="right",
@@ -950,114 +561,72 @@ def main():
         )
         model.eval()
 
-        proj_df = extract_projections(model, tokenizer, sweep_dir, target_layers, device)
-        proj_df.to_csv(proj_path, index=False)
-        logger.warning(f"Saved projections to {proj_path}")
-
-        if args.train_dataset_path:
-            train_df = extract_train_projections(
-                model, tokenizer, args.train_dataset_path,
-                sweep_dir, target_layers, device,
-            )
-            train_df.to_csv(train_proj_path, index=False)
-            logger.warning(f"Saved train projections to {train_proj_path}")
+        test_df = extract_test_projections(model, tokenizer, sweep_dir,
+                                           target_layers, device)
+        train_df = extract_train_projections(model, tokenizer, args.train_dataset_path,
+                                             sweep_dir, target_layers, device)
 
         del model
         torch.cuda.empty_cache()
 
-    # -- Compute steerability metrics ------------------------------------
-    if args.fluency_filter is not None:
-        logger.warning(f"Fluency filter: >= {args.fluency_filter}")
-    if args.min_valid is not None:
-        logger.warning(f"Min valid: >= {args.min_valid} examples per factor")
-    logger.warning("Computing per-prompt steerability metrics ...")
-    metrics_df = compute_steerability_metrics(
-        sweep_dir, target_layers, args.behavior,
-        fluency_filter=args.fluency_filter, min_valid=args.min_valid,
-    )
-    metrics_df.to_csv(out_dir / "steerability_metrics.csv", index=False)
+    # -- Compute centroids and normalize --------------------------------
+    logger.warning("Computing centroids and normalizing ...")
+    centroids_df = compute_centroids(train_df, target_layers)
+    centroids_df.to_csv(out_dir / "centroids.csv", index=False)
 
-    # -- Merge projections + metrics -------------------------------------
-    merged = proj_df.merge(metrics_df, on=["question_idx", "layer"], how="inner")
-    merged.to_csv(out_dir / "merged_data.csv", index=False)
-    logger.warning(f"Merged data: {len(merged)} rows")
-
-    # -- Correlations -----------------------------------------------------
-    corr_df = compute_correlations(merged, target_layers)
-    corr_df.to_csv(out_dir / "correlations.csv", index=False)
-    logger.warning(f"Computed {len(corr_df)} correlation entries")
-
-    for _, row in corr_df.iterrows():
-        sig = "*" if row["spearman_p"] < 0.05 else ""
+    for _, c in centroids_df.iterrows():
         logger.warning(
-            f"  L{int(row['layer']):2d} [{row['predictor']:>15s}] "
-            f"{row['metric']:>25s}: "
-            f"r={row['pearson_r']:+.3f} (p={row['pearson_p']:.3f})  "
-            f"rho={row['spearman_rho']:+.3f} (p={row['spearman_p']:.3f}) {sig}"
+            f"  Layer {int(c['layer']):2d}: c+ = {c['c_pos']:.2f}, "
+            f"c- = {c['c_neg']:.2f}, gap = {2*c['half_range']:.2f}"
         )
 
-    # -- Load eval data for curve plots (with same fluency filter) --------
-    eval_dfs = {}
-    for layer in target_layers:
-        filtered_df, _ = _load_layer_eval(sweep_dir, layer, args.fluency_filter)
-        if not filtered_df.empty:
-            eval_dfs[layer] = filtered_df
+    test_df = normalize_projections(test_df, centroids_df)
+    train_df = normalize_projections(train_df, centroids_df)
 
-    # -- Generate plots ---------------------------------------------------
+    test_df.to_csv(test_proj_path, index=False)
+    train_df.to_csv(train_proj_path, index=False)
+
+    # -- Correlations ---------------------------------------------------
+    corr_df = compute_correlations(test_df, target_layers)
+    corr_df.to_csv(out_dir / "correlations.csv", index=False)
+
+    logger.warning("Correlations (normalized_projection vs baseline_score):")
+    for _, row in corr_df.iterrows():
+        sig = " *" if row["spearman_p"] < 0.05 else ""
+        logger.warning(
+            f"  Layer {int(row['layer']):2d}: "
+            f"rho = {row['spearman_rho']:+.3f} (p = {row['spearman_p']:.1e}), "
+            f"r = {row['pearson_r']:+.3f} (p = {row['pearson_p']:.1e}), "
+            f"n = {int(row['n'])}{sig}"
+        )
+
+    # -- Plots ----------------------------------------------------------
     logger.warning("Generating plots ...")
     for layer in target_layers:
-        plot_scatter_panel(merged, layer, args.behavior,
-                           plot_dir / f"scatter_panel_layer_{layer}.png",
-                           x_col="projection")
-        plot_scatter_panel(merged, layer, args.behavior,
-                           plot_dir / f"scatter_residual_layer_{layer}.png",
-                           x_col="residual_norm")
-        plot_scatter_panel(merged, layer, args.behavior,
-                           plot_dir / f"scatter_cosine_layer_{layer}.png",
-                           x_col="cosine_with_sv")
+        plot_scatter(test_df, layer, args.behavior,
+                     plot_dir / f"scatter_layer_{layer}.png")
+        plot_distribution(train_df, test_df, layer, args.behavior,
+                          plot_dir / f"distribution_layer_{layer}.png")
 
-        plot_curves_by_projection(merged, eval_dfs, layer, args.behavior,
-                                  plot_dir / f"curves_by_projection_layer_{layer}.png")
-        plot_curves_by_projection_quantile(merged, eval_dfs, layer, args.behavior,
-                                           plot_dir / f"curves_quantile_layer_{layer}.png")
-        plot_projection_histogram(merged, layer, args.behavior,
-                                  plot_dir / f"projection_hist_layer_{layer}.png")
+    plot_correlation_across_layers(corr_df, args.behavior,
+                                   plot_dir / "correlation_across_layers.png")
 
-        plot_2d_projection_residual(merged, layer, args.behavior,
-                                    plot_dir / f"proj_vs_residual_2d_layer_{layer}.png",
-                                    color_col="baseline_score")
-        plot_2d_projection_residual(merged, layer, args.behavior,
-                                    plot_dir / f"proj_vs_residual_2d_score_f1_layer_{layer}.png",
-                                    color_col="score_at_f1")
-
-        if train_df is not None:
-            plot_train_vs_test(train_df, proj_df, layer, args.behavior,
-                               plot_dir / f"train_vs_test_layer_{layer}.png")
-
-    for pred in PREDICTOR_COLS:
-        plot_correlation_summary(corr_df, args.behavior, target_layers,
-                                 plot_dir / f"correlation_summary_{pred}.png",
-                                 predictor=pred)
-
-    # -- Summary ----------------------------------------------------------
+    # -- Summary --------------------------------------------------------
     summary = {
         "behavior": args.behavior,
         "model_name": args.model_name,
         "sweep_dir": str(sweep_dir),
-        "layers": target_layers,
-        "fluency_filter": args.fluency_filter,
-        "min_valid": args.min_valid,
         "train_dataset_path": args.train_dataset_path,
-        "n_prompts_per_layer": int(merged.groupby("layer")["question_idx"].nunique().median()),
-        "n_train_examples": len(train_df) if train_df is not None else 0,
-        "predictors": PREDICTOR_COLS,
+        "layers": target_layers,
+        "n_test_prompts": int(test_df.groupby("layer")["question_idx"].nunique().median()),
+        "n_train_pairs": int(train_df.groupby("layer")["pair_idx"].nunique().median()) if "pair_idx" in train_df.columns else 0,
+        "centroids": centroids_df.to_dict(orient="records"),
         "correlations": corr_df.to_dict(orient="records"),
     }
     with open(out_dir / "analysis_summary.json", "w") as f:
         json.dump(summary, f, indent=2, default=str)
 
-    logger.warning(f"\nAnalysis complete! Results in {out_dir}")
-    logger.warning(f"Plots in {plot_dir}")
+    logger.warning(f"\nDone! Results in {out_dir}")
 
 
 if __name__ == "__main__":
