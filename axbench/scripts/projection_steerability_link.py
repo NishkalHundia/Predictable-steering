@@ -63,6 +63,16 @@ logger = logging.getLogger(__name__)
 
 plt.style.use("seaborn-v0_8-whitegrid")
 
+BEHAVIOR_SCALES = {
+    "survival-instinct": (-5, 5),
+    "myopic-reward": (-5, 5),
+    "corrigible-neutral-HHH": (-5, 5),
+    "hallucination": (0, 5),
+    "sycophancy": (0, 10),
+    "refusal": (0, 10),
+    "coordinate-other-ais": (0, 10),
+}
+
 STEER_METRIC_COLS = ["best_steered_score", "delta", "score_f1", "score_f2", "score_f5"]
 
 
@@ -281,7 +291,10 @@ def within_layer_analysis(per_prompt_df: pd.DataFrame, layers: list[int]) -> pd.
 def compute_aggregate_steerability(
     sweep_dir: Path, layers: list[int],
     fluency_threshold: float, min_valid: int,
+    behavior: str,
 ) -> pd.DataFrame:
+    scale_min, scale_max = BEHAVIOR_SCALES.get(behavior, (-5, 5))
+
     rows = []
     for layer in layers:
         layer_dir = sweep_dir / f"layer_{layer}"
@@ -319,15 +332,36 @@ def compute_aggregate_steerability(
         baseline_mean = float(f0["mean_score"].values[0]) if not f0.empty else np.nan
 
         pos_valid = valid_factors[valid_factors["steering_factor"] > 0]
+
+        def _score_at(f):
+            r = valid_factors[valid_factors["steering_factor"] == f]
+            return float(r["mean_score"].values[0]) if not r.empty else np.nan
+
         if pos_valid.empty:
             best_agg_score = np.nan
             best_agg_factor = np.nan
             agg_delta = np.nan
+            normalized_delta = np.nan
+            efficiency = np.nan
+            auc_positive = np.nan
         else:
             best_row = pos_valid.loc[pos_valid["mean_score"].idxmax()]
             best_agg_score = float(best_row["mean_score"])
             best_agg_factor = float(best_row["steering_factor"])
             agg_delta = best_agg_score - baseline_mean if not np.isnan(baseline_mean) else np.nan
+
+            headroom = scale_max - baseline_mean
+            if not np.isnan(agg_delta) and abs(headroom) > 1e-6:
+                normalized_delta = agg_delta / headroom
+            else:
+                normalized_delta = np.nan
+
+            if not np.isnan(agg_delta) and best_agg_factor > 0:
+                efficiency = agg_delta / best_agg_factor
+            else:
+                efficiency = np.nan
+
+            auc_positive = float(pos_valid["mean_score"].mean())
 
         rows.append({
             "layer": layer,
@@ -335,6 +369,12 @@ def compute_aggregate_steerability(
             "agg_best_score": best_agg_score,
             "agg_best_factor": best_agg_factor,
             "agg_delta": agg_delta,
+            "normalized_delta": normalized_delta,
+            "score_f1": _score_at(1),
+            "score_f2": _score_at(2),
+            "score_f5": _score_at(5),
+            "efficiency": efficiency,
+            "auc_positive": auc_positive,
         })
     return pd.DataFrame(rows)
 
@@ -344,9 +384,11 @@ def compute_aggregate_steerability(
 # ============================================================================
 def cross_layer_correlations(merged: pd.DataFrame) -> pd.DataFrame:
     predictors = [c for c in ["proj_baseline_rho", "dprime"] if c in merged.columns]
-    targets = [c for c in ["agg_delta", "agg_best_score",
-                           "mean_rho_vs_best_steered", "mean_rho_vs_delta"]
-               if c in merged.columns]
+    targets = [c for c in [
+        "agg_delta", "normalized_delta", "agg_best_score",
+        "score_f1", "score_f2", "score_f5",
+        "efficiency", "auc_positive",
+    ] if c in merged.columns]
     rows = []
     for pred in predictors:
         for tgt in targets:
@@ -634,7 +676,7 @@ def main():
     logger.warning("\n=== SUPPLEMENTARY: Aggregate Layer Metrics ===")
     sep_df = load_separability(sweep_dir, layers)
     agg_df = compute_aggregate_steerability(
-        sweep_dir, layers, args.fluency_threshold, args.min_valid,
+        sweep_dir, layers, args.fluency_threshold, args.min_valid, args.behavior,
     )
     rho_df = load_projection_correlations(sweep_dir)
 
@@ -657,8 +699,10 @@ def main():
     logger.warning("\nPer-layer summary:")
     for _, row in layer_df.iterrows():
         dp = f"d'={row.get('dprime', np.nan):.2f}" if pd.notna(row.get("dprime")) else "d'=N/A"
-        delta = f"agg_delta={row.get('agg_delta', np.nan):+.2f}" if pd.notna(row.get("agg_delta")) else "agg_delta=N/A"
-        logger.warning(f"  Layer {int(row['layer']):2d}: {dp}  {delta}")
+        delta = f"delta={row.get('agg_delta', np.nan):+.2f}" if pd.notna(row.get("agg_delta")) else "delta=N/A"
+        nd = f"norm_d={row.get('normalized_delta', np.nan):+.1%}" if pd.notna(row.get("normalized_delta")) else "norm_d=N/A"
+        rho = f"rho={row.get('proj_baseline_rho', np.nan):+.3f}" if pd.notna(row.get("proj_baseline_rho")) else "rho=N/A"
+        logger.warning(f"  Layer {int(row['layer']):2d}: {rho}  {dp}  {delta}  {nd}")
 
     # --- Cross-layer correlations (supplementary) ---
     xl_df = cross_layer_correlations(layer_df)
