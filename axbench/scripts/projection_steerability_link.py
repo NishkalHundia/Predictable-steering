@@ -350,9 +350,29 @@ def compute_aggregate_steerability(
             best_agg_factor = float(best_row["steering_factor"])
             agg_delta = best_agg_score - baseline_mean if not np.isnan(baseline_mean) else np.nan
 
-            headroom = scale_max - baseline_mean
-            if not np.isnan(agg_delta) and abs(headroom) > 1e-6:
-                normalized_delta = agg_delta / headroom
+            # Per-prompt normalized delta: normalize each prompt by its own headroom,
+            # then average. This avoids the bias from using the aggregate baseline as
+            # the headroom denominator (prompts with high baselines have less room to
+            # improve, so aggregate headroom misrepresents the distribution).
+            pos_working = working[working["steering_factor"] > 0]
+            f0_working = working[working["steering_factor"] == 0]
+            per_prompt_best = (
+                pos_working.groupby("question_idx")["behavior_score"]
+                .max()
+                .reset_index()
+                .rename(columns={"behavior_score": "best_steered"})
+            )
+            per_prompt_base = f0_working[["question_idx", "behavior_score"]].rename(
+                columns={"behavior_score": "baseline"}
+            )
+            per_prompt = per_prompt_best.merge(per_prompt_base, on="question_idx", how="inner")
+            per_prompt["headroom"] = scale_max - per_prompt["baseline"]
+            valid_pp = per_prompt[per_prompt["headroom"].abs() > 1e-6].copy()
+            if not valid_pp.empty:
+                valid_pp["norm_delta"] = (
+                    (valid_pp["best_steered"] - valid_pp["baseline"]) / valid_pp["headroom"]
+                )
+                normalized_delta = float(valid_pp["norm_delta"].mean())
             else:
                 normalized_delta = np.nan
 
@@ -756,3 +776,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+updage
