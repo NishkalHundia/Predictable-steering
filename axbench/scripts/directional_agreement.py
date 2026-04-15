@@ -189,7 +189,7 @@ def compute_directional_agreement(model, tokenizer, train_dataset_path,
         if pair_idx % 5 == 0:
             torch.cuda.empty_cache()
 
-    # Compute steering vector and cosine similarities per layer
+    # Compute cosine similarities per layer
     results = {}
     for layer in target_layers:
         delta_stack = torch.stack(deltas[layer])  # [n_prompts, hidden]
@@ -208,6 +208,7 @@ def compute_directional_agreement(model, tokenizer, train_dataset_path,
             "mean_cos_sim": mean_cos,
             "std_cos_sim": std_cos,
             "steering_norm": steering_vec.norm().item(),
+            "deltas": delta_stack,
         }
 
         logger.warning(
@@ -216,6 +217,47 @@ def compute_directional_agreement(model, tokenizer, train_dataset_path,
         )
 
     return results, prompts
+
+
+def compute_pairwise_similarities(results, target_layers):
+    """
+    Compute cos_sim(Delta_i, Delta_j) for all pairs i != j.
+
+    Returns:
+      pairwise_results: {layer: {"cos_sims": [float, ...], "mean_cos_sim": float, ...}}
+    """
+    pairwise_results = {}
+    for layer in target_layers:
+        delta_stack = results[layer]["deltas"]  # [n, hidden]
+        n = delta_stack.shape[0]
+
+        # Normalize all deltas
+        norms = delta_stack.norm(dim=1, keepdim=True).clamp(min=1e-12)
+        normalized = delta_stack / norms
+
+        # Full cosine similarity matrix: [n, n]
+        sim_matrix = normalized @ normalized.T
+
+        # Extract upper triangle (i < j), excludes diagonal
+        indices = torch.triu_indices(n, n, offset=1)
+        pairwise_sims = sim_matrix[indices[0], indices[1]].tolist()
+
+        mean_cos = np.mean(pairwise_sims)
+        std_cos = np.std(pairwise_sims)
+
+        pairwise_results[layer] = {
+            "cos_sims": pairwise_sims,
+            "mean_cos_sim": mean_cos,
+            "std_cos_sim": std_cos,
+            "n_pairs": len(pairwise_sims),
+        }
+
+        logger.warning(
+            f"  Layer {layer:2d}: pairwise mean cos_sim = {mean_cos:.4f} +/- {std_cos:.4f}, "
+            f"n_pairs = {len(pairwise_sims)}"
+        )
+
+    return pairwise_results
 
 
 # ============================================================================
@@ -248,7 +290,7 @@ def plot_bar(cos_sims, mean_cos, layer, behavior, output_path):
     plt.close()
 
 
-def plot_histogram(cos_sims, mean_cos, layer, behavior, output_path):
+def plot_histogram(cos_sims, mean_cos, layer, behavior, output_path, pairwise=False):
     """Histogram of cos_sim values with mean line."""
     fig, ax = plt.subplots(figsize=(8, 5))
 
@@ -257,9 +299,14 @@ def plot_histogram(cos_sims, mean_cos, layer, behavior, output_path):
     ax.axvline(x=mean_cos, color="red", linestyle="--", linewidth=2,
                label=f"Mean = {mean_cos:.4f}")
 
-    ax.set_xlabel("cos_sim(Delta_i, s)", fontsize=10)
+    if pairwise:
+        ax.set_xlabel("cos_sim(Delta_i, Delta_j)", fontsize=10)
+        title_suffix = "Pairwise"
+    else:
+        ax.set_xlabel("cos_sim(Delta_i, s)", fontsize=10)
+        title_suffix = "Steering Vector"
     ax.set_ylabel("Count", fontsize=10)
-    ax.set_title(f"{behavior} - Layer {layer}: Directional Agreement Distribution",
+    ax.set_title(f"{behavior} - Layer {layer}: Directional Agreement ({title_suffix})",
                  fontsize=12, fontweight="bold")
     ax.set_xlim(-1.05, 1.05)
     ax.legend(fontsize=10)
@@ -307,13 +354,18 @@ def main():
     parser.add_argument("--layers", type=str, default=None,
                         help="Comma-separated layers (default: discover from sweep_dir)")
     parser.add_argument("--use_bf16", action="store_true", default=True)
+    parser.add_argument("--pairwise", action="store_true",
+                        help="Compute pairwise cos_sim(Delta_i, Delta_j) instead of steering vector similarity")
     parser.add_argument("--replot_only", action="store_true",
                         help="Skip model inference; reuse saved CSVs")
     args = parser.parse_args()
 
     sweep_dir = Path(args.sweep_dir)
 
-    out_dir = sweep_dir / "cosine_similarity"
+    if args.pairwise:
+        out_dir = sweep_dir / "cosine_similarity_pairwise"
+    else:
+        out_dir = sweep_dir / "cosine_similarity"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if args.layers:
@@ -368,31 +420,54 @@ def main():
         del model
         torch.cuda.empty_cache()
 
+    # -- Pairwise mode: compute pairwise similarities from deltas -----------
+    if args.pairwise and not args.replot_only:
+        plot_results = compute_pairwise_similarities(results, target_layers)
+    elif args.pairwise and args.replot_only:
+        plot_results = results  # already loaded from CSVs
+    else:
+        plot_results = results
+
     # -- Save CSVs and generate plots per layer ----------------------------
     layer_means = {}
     for layer in target_layers:
         layer_dir = out_dir / f"layer_{layer}"
         layer_dir.mkdir(parents=True, exist_ok=True)
 
-        cos_sims = results[layer]["cos_sims"]
-        mean_cos = results[layer]["mean_cos_sim"]
-        std_cos = results[layer]["std_cos_sim"]
+        if args.pairwise and not args.replot_only:
+            cos_sims = plot_results[layer]["cos_sims"]
+            mean_cos = plot_results[layer]["mean_cos_sim"]
+            std_cos = plot_results[layer]["std_cos_sim"]
+        else:
+            cos_sims = plot_results[layer]["cos_sims"]
+            mean_cos = plot_results[layer]["mean_cos_sim"]
+            std_cos = plot_results[layer]["std_cos_sim"]
 
         layer_means[layer] = {"mean": mean_cos, "std": std_cos}
 
         # Save CSV
-        df = pd.DataFrame({
-            "prompt_idx": list(range(len(cos_sims))),
-            "cos_sim": cos_sims,
-            "question": prompts[:len(cos_sims)] if prompts else [""] * len(cos_sims),
-        })
+        if args.pairwise:
+            df = pd.DataFrame({
+                "pair_idx": list(range(len(cos_sims))),
+                "cos_sim": cos_sims,
+            })
+        else:
+            df = pd.DataFrame({
+                "prompt_idx": list(range(len(cos_sims))),
+                "cos_sim": cos_sims,
+                "question": prompts[:len(cos_sims)] if prompts else [""] * len(cos_sims),
+            })
         df.to_csv(layer_dir / "cosine_similarities.csv", index=False)
 
-        # Plots
-        plot_bar(cos_sims, mean_cos, layer, args.behavior,
-                 layer_dir / "bar_plot.png")
-        plot_histogram(cos_sims, mean_cos, layer, args.behavior,
-                       layer_dir / "histogram.png")
+        # Plots — pairwise only gets histogram (too many pairs for bar plot)
+        if args.pairwise:
+            plot_histogram(cos_sims, mean_cos, layer, args.behavior,
+                           layer_dir / "histogram.png", pairwise=True)
+        else:
+            plot_bar(cos_sims, mean_cos, layer, args.behavior,
+                     layer_dir / "bar_plot.png")
+            plot_histogram(cos_sims, mean_cos, layer, args.behavior,
+                           layer_dir / "histogram.png")
 
         logger.warning(
             f"  Layer {layer:2d}: mean = {mean_cos:.4f}, std = {std_cos:.4f}, "
@@ -404,20 +479,24 @@ def main():
                             out_dir / "mean_across_layers.png")
 
     # -- Summary JSON ------------------------------------------------------
+    mode = "pairwise" if args.pairwise else "steering"
     summary = {
         "behavior": args.behavior,
         "model_name": args.model_name,
+        "mode": mode,
         "sweep_dir": str(sweep_dir),
         "train_dataset_path": args.train_dataset_path,
         "n_prompts": len(results[target_layers[0]]["cos_sims"]),
         "layers": {
             int(l): {
-                "mean_cos_sim": results[l]["mean_cos_sim"],
-                "std_cos_sim": results[l]["std_cos_sim"],
+                "mean_cos_sim": layer_means[l]["mean"],
+                "std_cos_sim": layer_means[l]["std"],
             }
             for l in target_layers
         },
     }
+    if args.pairwise:
+        summary["n_pairs_per_layer"] = plot_results[target_layers[0]].get("n_pairs", 0)
     with open(out_dir / "summary.json", "w") as f:
         json.dump(summary, f, indent=2, default=str)
 
