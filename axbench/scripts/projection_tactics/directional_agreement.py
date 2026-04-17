@@ -20,7 +20,7 @@ Outputs:
     summary.json
 
 Usage:
-    uv run python axbench/scripts/directional_agreement.py \\
+    uv run python axbench/scripts/projection_tactics/directional_agreement.py \\
         --behavior corrigible-neutral-HHH \\
         --model_name google/gemma-2-9b-it \\
         --sweep_dir results/gemma-2-9b-it/corrigible-neutral-HHH-sweep \\

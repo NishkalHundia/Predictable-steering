@@ -32,7 +32,7 @@ Outputs:
       correlation_across_layers.png
 
 Usage:
-    uv run python axbench/scripts/projection_lda.py \\
+    uv run python axbench/scripts/projection_tactics/projection_lda.py \\
         --behavior corrigible-neutral-HHH \\
         --model_name google/gemma-2-9b-it \\
         --sweep_dir results/gemma-2-9b-it/corrigible-neutral-HHH-sweep \\
