@@ -162,9 +162,11 @@ def compute_token_position_agreement(model, tokenizer, train_dataset_path,
 
     logger.warning(f"Computing token-position agreement for {len(train_data)} pairs")
 
-    # Phase 1: collect per-token deltas for each prompt at each layer
-    # per_prompt_deltas[layer] = list of tensors, each [n_tokens_i, hidden]
+    # Phase 1: collect per-token deltas AND per-prompt mean deltas (for steering vector)
+    # per_prompt_deltas[layer] = list of tensors, each [min_len_i, hidden] (truncated)
+    # per_prompt_mean_deltas[layer] = list of tensors, each [hidden] (from ALL tokens)
     per_prompt_deltas = {l: [] for l in target_layers}
+    per_prompt_mean_deltas = {l: [] for l in target_layers}
     prompts = []
 
     for pair_idx, item in enumerate(tqdm(train_data, desc="Collecting activations")):
@@ -188,6 +190,12 @@ def compute_token_position_agreement(model, tokenizer, train_dataset_path,
         for layer in target_layers:
             p = pos_acts[layer]  # [len_pos, hidden]
             n = neg_acts[layer]  # [len_neg, hidden]
+
+            # Steering vector uses ALL tokens: mean(pos) - mean(neg)
+            mean_delta = p.mean(dim=0) - n.mean(dim=0)
+            per_prompt_mean_deltas[layer].append(mean_delta)
+
+            # Per-token deltas truncated to min length
             min_len = min(p.shape[0], n.shape[0])
             delta = p[:min_len] - n[:min_len]  # [min_len, hidden]
             per_prompt_deltas[layer].append(delta)
@@ -195,12 +203,12 @@ def compute_token_position_agreement(model, tokenizer, train_dataset_path,
         if pair_idx % 5 == 0:
             torch.cuda.empty_cache()
 
-    # Phase 2: compute steering vector per layer (mean of per-prompt mean deltas)
+    # Phase 2: steering vector = mean over prompts of [mean(all_pos) - mean(all_neg)]
     steering_vectors = {}
     for layer in target_layers:
-        # Mean delta per prompt, then mean across prompts
-        mean_deltas = torch.stack([d.mean(dim=0) for d in per_prompt_deltas[layer]])
-        steering_vectors[layer] = mean_deltas.mean(dim=0)  # [hidden]
+        steering_vectors[layer] = torch.stack(
+            per_prompt_mean_deltas[layer]
+        ).mean(dim=0)  # [hidden]
 
     # Phase 3: for each prompt, compute avg cosine sim across token positions
     results = {}
