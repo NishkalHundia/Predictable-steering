@@ -539,10 +539,15 @@ def main():
 
         baseline_records.append({
             "prompt_idx": j,
+            "question": question,
+            "answer_matching_behavior": item["answer_matching_behavior"],
+            "answer_not_matching_behavior": item.get("answer_not_matching_behavior", ""),
             "matching_letter": matching_letter,
             "greedy_letter": greedy_letter,
             "baseline_p_match": p_match,
             "greedy_match_baseline": greedy_match,
+            "baseline_logp_A": float(cand_logps["A"]),
+            "baseline_logp_B": float(cand_logps["B"]),
             "activations": cand_letter_acts[greedy_letter],  # per-layer hidden @ greedy letter pos
         })
 
@@ -564,7 +569,7 @@ def main():
         pre_tok.append(row)
 
     logger.warning(f"\n=== Phase B: steered scoring per layer (α={args.steering_factor}) ===")
-    steered_map = {}  # (layer, prompt_idx) -> (p_match_steered, greedy_match_steered)
+    steered_map = {}  # (layer, prompt_idx) -> dict(p_match_steered, greedy_match_steered, greedy_letter_steered, logp_A, logp_B)
     for l in tqdm(layers, desc="Layers"):
         sv = steering_vecs[l]
         for j, item in enumerate(test_data):
@@ -581,8 +586,15 @@ def main():
             logp_m = logps[matching_letter]
             logp_n = logps["B" if matching_letter == "A" else "A"]
             p_match_s = float(np.exp(logp_m) / (np.exp(logp_m) + np.exp(logp_n)))
-            greedy_s = int(logp_m > logp_n)
-            steered_map[(l, j)] = (p_match_s, greedy_s)
+            greedy_letter_s = "A" if logps["A"] > logps["B"] else "B"
+            greedy_match_s = int(greedy_letter_s == matching_letter)
+            steered_map[(l, j)] = {
+                "p_match_steered": p_match_s,
+                "greedy_match_steered": greedy_match_s,
+                "greedy_letter_steered": greedy_letter_s,
+                "steered_logp_A": float(logps["A"]),
+                "steered_logp_B": float(logps["B"]),
+            }
 
     # ----------------------------------------------------------------------
     # Assemble per-prompt x per-layer rows + compute kappa_a.
@@ -600,22 +612,75 @@ def main():
             else:
                 kappa_a = float(2.0 * (act - mu).dot(v).item() / v_norm_sq)
 
-            p_steered, greedy_steered = steered_map[(l, j)]
+            st = steered_map[(l, j)]
             per_prompt_rows.append({
                 "layer": l,
                 "prompt_idx": j,
+                "question": rec["question"],
+                "answer_matching_behavior": rec["answer_matching_behavior"],
+                "answer_not_matching_behavior": rec["answer_not_matching_behavior"],
                 "matching_letter": rec["matching_letter"],
+                # Baseline (unsteered) "generation" = greedy letter via log-prob
                 "greedy_letter_baseline": rec["greedy_letter"],
+                "baseline_logp_A": rec["baseline_logp_A"],
+                "baseline_logp_B": rec["baseline_logp_B"],
                 "baseline_p_match": rec["baseline_p_match"],
                 "greedy_match_baseline": rec["greedy_match_baseline"],
-                "steered_p_match": p_steered,
-                "greedy_match_steered": greedy_steered,
+                # Steered "generation" at this layer
+                "greedy_letter_steered": st["greedy_letter_steered"],
+                "steered_logp_A": st["steered_logp_A"],
+                "steered_logp_B": st["steered_logp_B"],
+                "steered_p_match": st["p_match_steered"],
+                "greedy_match_steered": st["greedy_match_steered"],
+                # Projection
                 "kappa_a": kappa_a,
             })
 
     per_prompt_df = pd.DataFrame(per_prompt_rows)
     per_prompt_df.to_csv(out_dir / "per_prompt_results.csv", index=False)
     logger.warning(f"Wrote {len(per_prompt_df)} per-prompt rows to {out_dir/'per_prompt_results.csv'}")
+
+    # Human-readable generations dump (one JSONL per run: baseline + per-layer steered).
+    gens_dir = out_dir / "generations"
+    gens_dir.mkdir(exist_ok=True)
+    # Baseline (layer-agnostic)
+    with open(gens_dir / "baseline.jsonl", "w", encoding="utf-8") as f:
+        for rec in baseline_records:
+            f.write(json.dumps({
+                "prompt_idx": rec["prompt_idx"],
+                "question": rec["question"],
+                "answer_matching_behavior": rec["answer_matching_behavior"],
+                "answer_not_matching_behavior": rec["answer_not_matching_behavior"],
+                "matching_letter": rec["matching_letter"],
+                "baseline_greedy_letter": rec["greedy_letter"],
+                "baseline_logp_A": rec["baseline_logp_A"],
+                "baseline_logp_B": rec["baseline_logp_B"],
+                "baseline_p_match": rec["baseline_p_match"],
+                "greedy_match_baseline": rec["greedy_match_baseline"],
+            }, ensure_ascii=False) + "\n")
+    # Per-layer steered generations
+    for l in layers:
+        with open(gens_dir / f"steered_layer_{l}.jsonl", "w", encoding="utf-8") as f:
+            for rec in baseline_records:
+                j = rec["prompt_idx"]
+                st = steered_map[(l, j)]
+                f.write(json.dumps({
+                    "prompt_idx": j,
+                    "layer": l,
+                    "question": rec["question"],
+                    "matching_letter": rec["matching_letter"],
+                    "baseline_greedy_letter": rec["greedy_letter"],
+                    "steered_greedy_letter": st["greedy_letter_steered"],
+                    "flipped": bool(rec["greedy_letter"] != st["greedy_letter_steered"]),
+                    "baseline_p_match": rec["baseline_p_match"],
+                    "steered_p_match": st["p_match_steered"],
+                    "steered_logp_A": st["steered_logp_A"],
+                    "steered_logp_B": st["steered_logp_B"],
+                    "greedy_match_baseline": rec["greedy_match_baseline"],
+                    "greedy_match_steered": st["greedy_match_steered"],
+                }, ensure_ascii=False) + "\n")
+    logger.warning(f"Wrote generations dumps to {gens_dir}/ "
+                   f"(baseline.jsonl + {len(layers)} steered_layer_*.jsonl)")
 
     # ----------------------------------------------------------------------
     # Per-layer summary.

@@ -146,11 +146,20 @@ Per-layer aggregates over the 50 prompts:
 
 ```
 <sweep_dir>/mcqa_analysis/
-  per_prompt_results.csv       # one row per (layer, prompt_idx): baseline_p_match, steered_p_match,
-                               #                                  kappa_a, greedy_match_baseline, greedy_match_steered
+  per_prompt_results.csv       # one row per (layer, prompt_idx), with:
+                               #   question, answer_matching_behavior, answer_not_matching_behavior,
+                               #   matching_letter,
+                               #   greedy_letter_baseline, baseline_logp_A, baseline_logp_B,
+                               #     baseline_p_match, greedy_match_baseline,
+                               #   greedy_letter_steered, steered_logp_A, steered_logp_B,
+                               #     steered_p_match, greedy_match_steered,
+                               #   kappa_a
   per_layer_summary.csv        # one row per layer with all aggregate metrics
   cross_layer_correlation.csv  # Pearson/Spearman between each predictor (d', κ_a→P_base ρ,
                                # κ_a→P_base r) and each test-side metric, across layers
+  generations/
+    baseline.jsonl             # 50 rows: question + both-candidate log-probs + greedy letter (unsteered)
+    steered_layer_{N}.jsonl    # 50 rows per layer: question + steered log-probs + greedy letter + flip flag
   summary.json
   plots/
     dprime_vs_steering_by_layer.png         # Exp 1: two lines (d', steered_acc) vs layer + correlation annotation
