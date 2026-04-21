@@ -217,51 +217,126 @@ def forward_with_steering(model, input_ids, steering_layer: int,
 # ============================================================================
 # Plots
 # ============================================================================
-def plot_dprime_vs_steering(layer_df: pd.DataFrame, behavior: str, output_path: Path):
-    if layer_df.empty:
+def _plot_predictor_vs_steering(
+    layer_df: pd.DataFrame, pred_col: str, pred_label: str, pred_color: str,
+    behavior: str, output_path: Path, title_suffix: str,
+):
+    """Dual-y-axis line plot: a per-layer predictor + steered/baseline acc by layer."""
+    if layer_df.empty or pred_col not in layer_df.columns:
         return
-    layers = layer_df["layer"].values
+    sub = layer_df.dropna(subset=[pred_col, "steered_acc_mean"])
+    if len(sub) < 3:
+        return
+    layers = sub["layer"].values
     fig, ax1 = plt.subplots(figsize=(10, 5))
-    color_dp, color_st = "#E94F37", "#2E86AB"
 
-    ax1.plot(layers, layer_df["dprime"].values, "o-", color=color_dp,
-             linewidth=2.5, markersize=7, label="d' (train)")
+    ax1.plot(layers, sub[pred_col].values, "o-", color=pred_color,
+             linewidth=2.5, markersize=7, label=pred_label)
     ax1.set_xlabel("Layer", fontsize=11)
-    ax1.set_ylabel("d' (train)", color=color_dp, fontsize=11)
-    ax1.tick_params(axis="y", labelcolor=color_dp)
+    ax1.set_ylabel(pred_label, color=pred_color, fontsize=11)
+    ax1.tick_params(axis="y", labelcolor=pred_color)
     ax1.set_xticks(layers)
 
+    color_st = "#2E86AB"
     ax2 = ax1.twinx()
-    ax2.plot(layers, layer_df["steered_acc_mean"].values, "s-", color=color_st,
+    ax2.plot(layers, sub["steered_acc_mean"].values, "s-", color=color_st,
              linewidth=2, markersize=6, label="Steered acc (test, α=1)")
-    ax2.plot(layers, layer_df["baseline_acc_mean"].values, "D--", color="gray",
+    ax2.plot(layers, sub["baseline_acc_mean"].values, "D--", color="gray",
              linewidth=1.5, markersize=5, alpha=0.7, label="Baseline acc (test, α=0)")
     ax2.set_ylabel("Test P(matching)", color=color_st, fontsize=11)
     ax2.tick_params(axis="y", labelcolor=color_st)
     ax2.set_ylim(0, 1.05)
 
-    dp = layer_df["dprime"].values
-    st = layer_df["steered_acc_mean"].values
-    delta = st - layer_df["baseline_acc_mean"].values
-    mask = ~(np.isnan(dp) | np.isnan(st))
-    corr_text = []
-    if mask.sum() >= 3:
-        r, p = scipy_stats.pearsonr(dp[mask], st[mask])
-        rho, sp = scipy_stats.spearmanr(dp[mask], st[mask])
-        corr_text.append(f"d' vs steered_acc:  r={r:+.3f} (p={p:.3f}), ρ={rho:+.3f} (p={sp:.3f})")
-        rd, pd_ = scipy_stats.pearsonr(dp[mask], delta[mask])
-        rhod, spd = scipy_stats.spearmanr(dp[mask], delta[mask])
-        corr_text.append(f"d' vs Δacc (steered-base):  r={rd:+.3f} (p={pd_:.3f}), ρ={rhod:+.3f} (p={spd:.3f})")
-    if corr_text:
-        ax1.text(0.02, 0.98, "\n".join(corr_text), transform=ax1.transAxes,
+    pred = sub[pred_col].values
+    st = sub["steered_acc_mean"].values
+    delta = st - sub["baseline_acc_mean"].values
+    corr_lines = []
+    if len(sub) >= 3:
+        r, p = scipy_stats.pearsonr(pred, st)
+        rho, sp = scipy_stats.spearmanr(pred, st)
+        corr_lines.append(
+            f"{pred_label} vs steered_acc:  r={r:+.3f} (p={p:.3f}), ρ={rho:+.3f} (p={sp:.3f})"
+        )
+        rd, pd_ = scipy_stats.pearsonr(pred, delta)
+        rhod, spd = scipy_stats.spearmanr(pred, delta)
+        corr_lines.append(
+            f"{pred_label} vs Δacc:         r={rd:+.3f} (p={pd_:.3f}), ρ={rhod:+.3f} (p={spd:.3f})"
+        )
+    if corr_lines:
+        ax1.text(0.02, 0.98, "\n".join(corr_lines), transform=ax1.transAxes,
                  fontsize=8, verticalalignment="top", fontfamily="monospace",
                  bbox=dict(boxstyle="round,pad=0.3", facecolor="wheat", alpha=0.8))
 
     lines1, labels1 = ax1.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
     ax1.legend(lines1 + lines2, labels1 + labels2, loc="lower right", fontsize=8)
-    ax1.set_title(f"{behavior}: d' (train) vs Steered Accuracy (test, α=1) by Layer",
-                  fontsize=12, fontweight="bold")
+    ax1.set_title(f"{behavior}: {title_suffix}", fontsize=12, fontweight="bold")
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close()
+
+
+def plot_dprime_vs_steering(layer_df: pd.DataFrame, behavior: str, output_path: Path):
+    _plot_predictor_vs_steering(
+        layer_df, "dprime", "d' (train)", "#E94F37",
+        behavior, output_path,
+        title_suffix="d' (train) vs Steered Accuracy (test, α=1) by Layer",
+    )
+
+
+def plot_kappa_rho_vs_steering(layer_df: pd.DataFrame, behavior: str, output_path: Path):
+    _plot_predictor_vs_steering(
+        layer_df, "proj_spearman_rho", "ρ(κ_a, P_base) (test, N=50)", "#6B2D5C",
+        behavior, output_path,
+        title_suffix="Projection quality (κ_a → baseline) vs Steered Accuracy by Layer",
+    )
+
+
+def plot_combined_predictors(layer_df: pd.DataFrame, behavior: str, output_path: Path):
+    """Overlay both predictors (d' and κ_a ρ) alongside steered accuracy for comparison."""
+    if layer_df.empty:
+        return
+    sub = layer_df.dropna(subset=["steered_acc_mean"])
+    if len(sub) < 3:
+        return
+    layers = sub["layer"].values
+
+    fig, ax1 = plt.subplots(figsize=(11, 5))
+    color_dp, color_kappa, color_st = "#E94F37", "#6B2D5C", "#2E86AB"
+
+    # Left axis: z-scored predictors so they share a scale
+    def _z(x):
+        x = np.asarray(x, dtype=float)
+        mask = ~np.isnan(x)
+        if mask.sum() < 2 or np.nanstd(x) < 1e-12:
+            return np.zeros_like(x)
+        return (x - np.nanmean(x)) / np.nanstd(x)
+
+    if "dprime" in sub.columns and sub["dprime"].notna().any():
+        ax1.plot(layers, _z(sub["dprime"].values), "o-", color=color_dp,
+                 linewidth=2, markersize=6, label="d' (train, z-scored)")
+    if "proj_spearman_rho" in sub.columns and sub["proj_spearman_rho"].notna().any():
+        ax1.plot(layers, _z(sub["proj_spearman_rho"].values), "^-", color=color_kappa,
+                 linewidth=2, markersize=6, label="ρ(κ_a, P_base) (test, z-scored)")
+    ax1.axhline(0, color="gray", linestyle="--", alpha=0.4)
+    ax1.set_xlabel("Layer", fontsize=11)
+    ax1.set_ylabel("Predictor (z-scored)", fontsize=11)
+    ax1.set_xticks(layers)
+
+    ax2 = ax1.twinx()
+    ax2.plot(layers, sub["steered_acc_mean"].values, "s-", color=color_st,
+             linewidth=2.5, markersize=6, label="Steered acc (test, α=1)")
+    ax2.set_ylabel("Steered P(matching)", color=color_st, fontsize=11)
+    ax2.tick_params(axis="y", labelcolor=color_st)
+    ax2.set_ylim(0, 1.05)
+
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc="lower right", fontsize=8)
+    ax1.set_title(
+        f"{behavior}: Train-side (d') vs Test-side (κ_a ρ) predictors of Steering",
+        fontsize=12, fontweight="bold",
+    )
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close()
@@ -591,7 +666,8 @@ def main():
         )
 
     # ----------------------------------------------------------------------
-    # Cross-layer (d' vs test metrics) correlations.
+    # Cross-layer correlations: for each predictor in {d', κ_a-based ρ, κ_a-based r}
+    # correlate per-layer values with test-side targets across layers.
     # ----------------------------------------------------------------------
     cross_rows = []
     targets = [
@@ -599,29 +675,37 @@ def main():
         "baseline_greedy_acc", "steered_greedy_acc", "delta_greedy_acc",
         "proj_spearman_rho", "proj_pearson_r",
     ]
-    dp = layer_df["dprime"].values
-    for tgt in targets:
-        if tgt not in layer_df.columns:
+    predictors = [
+        ("dprime", "d'"),
+        ("proj_spearman_rho", "κ_a→P_base ρ"),
+        ("proj_pearson_r", "κ_a→P_base r"),
+    ]
+    for pred_col, pred_label in predictors:
+        if pred_col not in layer_df.columns:
             continue
-        tv = layer_df[tgt].values
-        mask = ~(pd.isna(dp) | pd.isna(tv))
-        if mask.sum() < 3:
-            continue
-        r, pr = scipy_stats.pearsonr(dp[mask], tv[mask])
-        rho, sp = scipy_stats.spearmanr(dp[mask], tv[mask])
-        cross_rows.append({
-            "predictor": "dprime", "target": tgt,
-            "n": int(mask.sum()),
-            "pearson_r": float(r), "pearson_p": float(pr),
-            "spearman_rho": float(rho), "spearman_p": float(sp),
-        })
+        pv = layer_df[pred_col].values
+        for tgt in targets:
+            if tgt not in layer_df.columns or tgt == pred_col:
+                continue
+            tv = layer_df[tgt].values
+            mask = ~(pd.isna(pv) | pd.isna(tv))
+            if mask.sum() < 3:
+                continue
+            r, pr = scipy_stats.pearsonr(pv[mask], tv[mask])
+            rho, sp = scipy_stats.spearmanr(pv[mask], tv[mask])
+            cross_rows.append({
+                "predictor": pred_col, "predictor_label": pred_label, "target": tgt,
+                "n": int(mask.sum()),
+                "pearson_r": float(r), "pearson_p": float(pr),
+                "spearman_rho": float(rho), "spearman_p": float(sp),
+            })
     cross_df = pd.DataFrame(cross_rows)
     cross_df.to_csv(out_dir / "cross_layer_correlation.csv", index=False)
     logger.warning("\nCross-layer correlations (N = #layers):")
     for _, r in cross_df.iterrows():
         sig = "*" if r["pearson_p"] < 0.05 else " "
         logger.warning(
-            f"  d' vs {r['target']:25s} (n={int(r['n'])}): "
+            f"  {r['predictor_label']:14s} vs {r['target']:25s} (n={int(r['n'])}): "
             f"r={r['pearson_r']:+.3f} (p={r['pearson_p']:.3g}){sig}  "
             f"ρ={r['spearman_rho']:+.3f} (p={r['spearman_p']:.3g})"
         )
@@ -631,6 +715,8 @@ def main():
     # ----------------------------------------------------------------------
     plots_dir = out_dir / "plots"
     plot_dprime_vs_steering(layer_df, args.behavior, plots_dir / "dprime_vs_steering_by_layer.png")
+    plot_kappa_rho_vs_steering(layer_df, args.behavior, plots_dir / "kappa_rho_vs_steering_by_layer.png")
+    plot_combined_predictors(layer_df, args.behavior, plots_dir / "combined_predictors_vs_steering.png")
     plot_projection_rho_by_layer(layer_df, args.behavior, plots_dir / "projection_rho_by_layer.png")
     for l in layers:
         plot_scatter_for_layer(per_prompt_df, l, args.behavior,

@@ -111,11 +111,17 @@ Per-layer aggregates over the 50 prompts:
 
 ### 3.5 Hypotheses
 
-- **Exp 1.** Across layers, `Pearson(d', steered_acc_mean) > 0` and significant, i.e.
-  layers with cleaner training separation steer better at α = 1.
-- **Exp 2a.** Within each layer, `Pearson(κ_a, baseline_score) > 0` and significant for at
-  least the layers where `d'` is high, confirming that (1) the direction generalizes
-  train → test and (2) the diff-in-means line is actually behavior-aligned.
+- **Exp 1 (train-side predictor).** Across layers,
+  `Pearson(d', steered_acc_mean) > 0` and significant — layers with cleaner training
+  separation steer better at α = 1.
+- **Exp 1' (test-side predictor, κ_a analogue).** Across layers, the per-layer projection
+  quality `ρ_l = Spearman(κ_a, baseline_score)_l` also tracks steering success:
+  `Pearson(ρ_l, steered_acc_mean) > 0` and significant. This is the MCQA analogue of the
+  `ρ_l` predictor from `projection_steerability_experiment.md`.
+- **Exp 2a (within-layer sanity check).** For each layer, `Pearson(κ_a, baseline_score) > 0`
+  and significant for at least the layers where `d'` is high, confirming that (1) the
+  direction generalizes train → test and (2) the diff-in-means line is actually
+  behavior-aligned.
 
 ---
 
@@ -143,12 +149,15 @@ Per-layer aggregates over the 50 prompts:
   per_prompt_results.csv       # one row per (layer, prompt_idx): baseline_p_match, steered_p_match,
                                #                                  kappa_a, greedy_match_baseline, greedy_match_steered
   per_layer_summary.csv        # one row per layer with all aggregate metrics
-  cross_layer_correlation.csv  # Pearson/Spearman between d' and each test-side metric, across layers
+  cross_layer_correlation.csv  # Pearson/Spearman between each predictor (d', κ_a→P_base ρ,
+                               # κ_a→P_base r) and each test-side metric, across layers
   summary.json
   plots/
-    dprime_vs_steering_by_layer.png        # Exp 1: two lines (d', steered_acc) vs layer + correlation annotation
-    projection_rho_by_layer.png            # Per-layer Spearman/Pearson(κ_a, baseline_score) across layers
-    projection_scatter_layer_{N}.png       # Exp 2a scatter plot, one per layer
+    dprime_vs_steering_by_layer.png         # Exp 1: two lines (d', steered_acc) vs layer + correlation annotation
+    kappa_rho_vs_steering_by_layer.png      # Exp 1': two lines (ρ(κ_a, P_base), steered_acc) vs layer + corr
+    combined_predictors_vs_steering.png     # z-scored d' and κ_a ρ overlaid with steered acc
+    projection_rho_by_layer.png             # Per-layer Spearman/Pearson(κ_a, baseline_score) across layers
+    projection_scatter_layer_{N}.png        # Exp 2a scatter plot, one per layer
 ```
 
 ---
