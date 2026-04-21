@@ -32,13 +32,19 @@ Given a set of contrastive training pairs {(x_i, y_i^+, y_i^-)}:
 - **Steering vector:** v = mu_pos - mu_neg
 - **Unit steering vector:** v_hat = v / ||v||
 
-The d' (discriminability index) measures training separability along v_hat:
+### 3.2 Training Separability: d'
+
+The **d' (discriminability index)** measures how well-separated the positive and negative training distributions are when projected onto v_hat. It is the signal-to-noise ratio of the centroid gap:
 
 ```
 d' = (mu_pos . v_hat - mu_neg . v_hat) / sqrt( (sigma_pos^2 + sigma_neg^2) / 2 )
 ```
 
-### 3.2 Centroid Normalization
+where sigma_pos and sigma_neg are the standard deviations of the positive and negative training projections onto v_hat. The numerator is the gap between centroids in the steering direction; the denominator is the pooled within-class spread. A high d' means the training examples are cleanly linearly separable along v_hat; a low d' means the two distributions heavily overlap even in the direction the vector points.
+
+Crucially, d' is computed entirely from **training data** — it says nothing directly about test prompts or whether the direction is behaviorally meaningful in deployment. It is a per-layer quantity, so we can ask whether layers with higher d' also tend to steer better.
+
+### 3.3 Centroid Normalization (per layer)
 
 Project training centroids onto the steering direction:
 
@@ -115,45 +121,65 @@ Spearman( rho_l, normalized_delta_l )  >>  0    over l = 1..23 layers
 
 ## 5. Results
 
-### corrigible-neutral-HHH
+### 5.1 Does rho_l predict normalized_delta_l?
 
-**Strong positive relationship.** rho_l ranges from +0.455 to +0.789 across layers, all significant. Layers with the highest projection-baseline alignment (layers 21-27) also tend to produce the best steering outcomes.
+**No — for none of the four behaviors does the cross-layer correlation reach significance.**
 
-### hallucination
+| Behavior | rho(proj_baseline_rho, normalized_delta) | p-value |
+|----------|------------------------------------------|---------|
+| corrigible-neutral-HHH | -0.235 | 0.280 |
+| hallucination | +0.363 | 0.089 |
+| myopic-reward | -0.161 | 0.463 |
+| survival-instinct | +0.239 | 0.272 |
 
-**Weak projection-baseline correlation overall** (near zero rho_l at most layers), but a notable exception at layers 24-25 where rho spikes and steering effectiveness also peaks. The relationship holds locally where it exists.
+For corrigible-neutral-HHH the correlation is even slightly negative, despite rho_l being strong and consistent across all layers (0.455 to 0.789). The likely reason: both proj_baseline_rho and normalized_delta have little variance across layers for this behavior — steerability is uniformly high (65–97%) regardless of layer, so there's nothing to predict.
 
-### myopic-reward
+### 5.2 Does d' predict normalized_delta_l?
 
-**No projection-baseline correlation at any layer.** Correspondingly, d' (training separability) anti-correlates with steerability (rho ~ -0.70): the layers where training examples are most linearly separable actually steer *worse*. The DiffMean direction appears to capture a training-specific confound that doesn't generalize.
+**Yes — and the results are striking and behavior-dependent.**
 
-### survival-instinct
+| Behavior | rho(d', normalized_delta) | p-value | Direction |
+|----------|--------------------------|---------|-----------|
+| corrigible-neutral-HHH | +0.373 | 0.080 | Positive (borderline) |
+| hallucination | +0.476 | 0.022* | Positive |
+| myopic-reward | **-0.748** | <0.001* | **Strongly negative** |
+| survival-instinct | +0.626 | 0.001* | Positive |
 
-**No projection-baseline correlation.** But d' does positively predict aggregate steerability (rho ~ +0.65), meaning training separability is informative even when projection-to-behavior alignment is not.
+For hallucination and survival-instinct, d' is a strong positive predictor of steerability — layers where training examples are more separable also produce better steering. For myopic-reward, the relationship inverts completely: the more separable the training distributions at a layer, the *worse* that layer steers (rho = -0.748, p < 0.001). d' also correlates strongly with other steerability metrics beyond normalized_delta:
 
-### Summary
+**hallucination:** d' → auc_positive rho = +0.680 (p < 0.001), d' → efficiency rho = +0.631 (p = 0.001)
 
-| Behavior | rho_l -> baseline (H1) | rho_l -> normalized_delta |
-|----------|------------------------|--------------------------|
-| **corrigible-neutral-HHH** | Strong (up to +0.79, 23/23 layers sig) | Positive |
-| **hallucination** | Weak overall, spike at layers 24-25 | Locally positive |
-| **myopic-reward** | None | None (d' negative) |
-| **survival-instinct** | None | None (but d' positive) |
+**survival-instinct:** d' → auc_positive rho = +0.722 (p < 0.001), d' → score_f5 rho = +0.686 (p < 0.001)
+
+**myopic-reward:** d' → agg_best_score rho = -0.718 (p < 0.001), d' → auc_positive rho = -0.622 (p = 0.002)
+
+### 5.3 Summary
+
+| Behavior | rho_l (proj → baseline) | rho_l → steerability | d' → steerability |
+|----------|-------------------------|----------------------|-------------------|
+| **corrigible-neutral-HHH** | Strong, 0.45–0.79 across all 23 layers | Not significant (−0.24) | Borderline positive (+0.37) |
+| **hallucination** | Near zero most layers; spike at layers 24–25 | Not significant (+0.36) | Positive (+0.48)* |
+| **myopic-reward** | Near zero | Not significant (−0.16) | **Strongly negative (−0.75)*** |
+| **survival-instinct** | Near zero | Not significant (+0.24) | Strongly positive (+0.63)* |
 
 ---
 
 ## 6. Interpretation
 
-### Why Does Alignment Predict Steerability?
+### rho_l Does Not Predict Steerability Across Layers
 
-When rho_l is high, the DiffMean vector at layer l has successfully isolated a direction in activation space that encodes genuine behavioral variance across prompts — not just a direction that separates training examples. Applying that same vector as a steering intervention then moves activations along an axis the model "uses" for that behavior, producing reliable behavioral change.
+The main hypothesis is not supported. Even for corrigible-neutral-HHH — where rho_l is strong (0.45–0.79) and significant at every layer — it does not predict which layers steer well. The reason appears to be a floor/ceiling effect: for corrigible-neutral-HHH, every layer steers well (normalized_delta 65–97%), leaving no variance for rho_l to predict. When both variables are uniformly high, cross-layer correlation becomes uninformative.
 
-When rho_l is near zero, the DiffMean direction may be picking up training confounds (topic, formatting, length differences between positive and negative examples). Steering along a confounded direction doesn't reliably produce the target behavior.
+For the other three behaviors, rho_l is near zero everywhere, so again there's no signal to correlate.
 
-### d' Is Not Enough
+### d' Is the Better Layer-Level Predictor — When It Works
 
-d' measures how separable the training examples are along v_hat, but this separation can be driven by confounds rather than the target behavior. A high d' with low rho_l is the tell: the model has found a linear separator for the training data, but it's not the behavioral axis. **rho_l is the better diagnostic** because it validates the direction on held-out test prompts against an independent behavioral signal.
+d' (training separability) predicts steerability significantly for hallucination and survival-instinct, and borderline for corrigible-neutral-HHH. This suggests that for most behaviors, how cleanly the training examples separate along the steering direction at a given layer is a useful proxy for how well that layer will steer.
 
-### myopic-reward Is the Clearest Failure Case
+### myopic-reward: A Confounded Direction
 
-The negative d'-steerability correlation is strong evidence that the DiffMean vector for myopic-reward is capturing something other than the target concept. The more separable the training examples are at a layer, the worse steering works — consistent with overfitting to a spurious training-set feature.
+The strongly negative d'-steerability correlation for myopic-reward (rho = -0.748) is the most informative result. The layers where training examples are most linearly separable are the layers where steering works *worst*. This is consistent with the DiffMean vector overfitting to a spurious feature in the training contrastive pairs — some superficial difference between positive and negative examples that gets more pronounced at certain layers but has nothing to do with myopic reward behavior. The more "confident" the separator, the more off-target the steering direction.
+
+### The Role of rho_l Revisited
+
+rho_l remains useful as a test-time diagnostic: for corrigible-neutral-HHH, the fact that it is high and significant at every layer confirms the steering vector genuinely encodes the behavioral axis. But high rho_l at the layer level does not, by itself, mean that layer steers better than other layers — it just means the direction is meaningful. Whether that translates into steerability depends on other factors (model depth, representation geometry) that d' partially captures.
