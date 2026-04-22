@@ -144,9 +144,13 @@ Per-layer aggregates over the 50 prompts:
 
 ### Test script (`mcqa_test_steer_and_project.py`)
 
+The test script supports a **list of steering factors** (`--steering_factors "1,2,3,5,10"`)
+and runs batched forward passes. Baseline activations + `κ_a` are factor-independent, so
+phase A is only run once; phase B loops `factors × layers`.
+
 ```
 <sweep_dir>/mcqa_analysis/
-  per_prompt_results.csv       # one row per (layer, prompt_idx), with:
+  per_prompt_results.csv       # one row per (steering_factor, layer, prompt_idx), with:
                                #   question, answer_matching_behavior, answer_not_matching_behavior,
                                #   matching_letter,
                                #   greedy_letter_baseline, baseline_logp_A, baseline_logp_B,
@@ -154,19 +158,23 @@ Per-layer aggregates over the 50 prompts:
                                #   greedy_letter_steered, steered_logp_A, steered_logp_B,
                                #     steered_p_match, greedy_match_steered,
                                #   kappa_a
-  per_layer_summary.csv        # one row per layer with all aggregate metrics
-  cross_layer_correlation.csv  # Pearson/Spearman between each predictor (d', κ_a→P_base ρ,
-                               # κ_a→P_base r) and each test-side metric, across layers
+  per_layer_summary.csv        # one row per (steering_factor, layer)
+  cross_layer_correlation.csv  # per (steering_factor, predictor, target); predictor ∈
+                               # {d', κ_a→P_base ρ, κ_a→P_base r}
   generations/
-    baseline.jsonl             # 50 rows: question + both-candidate log-probs + greedy letter (unsteered)
-    steered_layer_{N}.jsonl    # 50 rows per layer: question + steered log-probs + greedy letter + flip flag
+    baseline.jsonl                                 # 50 rows: question + baseline log-probs
+    steered_layer_{N}_factor_{α}.jsonl             # per (layer, factor): 50 rows with steered log-probs + flip flag
   summary.json
   plots/
-    dprime_vs_steering_by_layer.png         # Exp 1: two lines (d', steered_acc) vs layer + correlation annotation
-    kappa_rho_vs_steering_by_layer.png      # Exp 1': two lines (ρ(κ_a, P_base), steered_acc) vs layer + corr
-    combined_predictors_vs_steering.png     # z-scored d' and κ_a ρ overlaid with steered acc
-    projection_rho_by_layer.png             # Per-layer Spearman/Pearson(κ_a, baseline_score) across layers
-    projection_scatter_layer_{N}.png        # Exp 2a scatter plot, one per layer
+    factor_{α}/
+      dprime_vs_steering_by_layer.png         # Exp 1: two lines (d', steered_acc) vs layer + correlation
+      kappa_rho_vs_steering_by_layer.png      # Exp 1': (ρ(κ_a, P_base), steered_acc) vs layer
+      combined_predictors_vs_steering.png     # z-scored d' and κ_a ρ overlaid with steered acc
+      projection_rho_by_layer.png             # Per-layer Spearman/Pearson(κ_a, baseline_score)
+      projection_scatter_layer_{N}.png        # Exp 2a scatter plot, one per layer
+    factor_sweep_steered_acc.png               # one line per α, y = steered_acc_mean, x = layer
+    factor_sweep_delta_acc.png                 # one line per α, y = Δacc
+    factor_sweep_steered_greedy_acc.png        # one line per α, y = steered greedy accuracy
 ```
 
 ---
@@ -183,10 +191,42 @@ uv run python axbench/scripts/mcqa_train_diffmean_sweep.py \
     --seed 42 \
     --output_dir results/mcqa_sweep/gemma-2-9b-it/corrigible-neutral-HHH
 
-# Phase 2 — test: steered accuracy at α=1 per layer + projection scatter.
+# Phase 2 — test: steered accuracy per (factor × layer) + projection scatter.
 uv run python axbench/scripts/mcqa_test_steer_and_project.py \
     --behavior corrigible-neutral-HHH \
     --model_name google/gemma-2-9b-it \
     --sweep_dir results/mcqa_sweep/gemma-2-9b-it/corrigible-neutral-HHH \
-    --steering_factor 1.0
+    --steering_factors "1,2,3,5,10" \
+    --batch_size 16
 ```
+
+### Sweep across behaviors
+
+```bash
+for B in survival-instinct corrigible-neutral-HHH myopic-reward sycophancy hallucination; do
+  DS="datasets/raw/${B}/dataset.json"
+  if [ ! -f "$DS" ]; then
+    echo "=== SKIP $B: raw $DS not found ==="
+    continue
+  fi
+  echo "=== $B ==="
+  uv run python axbench/scripts/mcqa_train_diffmean_sweep.py \
+      --behavior "$B" \
+      --model_name google/gemma-2-9b-it \
+      --layers 10-32 \
+      --max_examples 300 \
+      --seed 42 \
+      --output_dir "results/mcqa_sweep/gemma-2-9b-it/${B}" \
+  && \
+  uv run python axbench/scripts/mcqa_test_steer_and_project.py \
+      --behavior "$B" \
+      --model_name google/gemma-2-9b-it \
+      --sweep_dir "results/mcqa_sweep/gemma-2-9b-it/${B}" \
+      --steering_factors "1,2,3,5,10" \
+      --batch_size 16
+done
+```
+
+Sycophancy and hallucination will be skipped automatically until their raw
+`dataset.json` is built (they ship `make_dataset.py` scripts that expect source
+CSVs/JSONLs not included in the repo).
