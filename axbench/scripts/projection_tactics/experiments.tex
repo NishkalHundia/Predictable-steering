@@ -1,0 +1,94 @@
+\documentclass[11pt]{article}
+\usepackage{amsmath, amssymb}
+\usepackage[margin=1in]{geometry}
+\usepackage{enumitem}
+
+\title{Projection Tactics: Experiment Descriptions}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\noindent All experiments use contrastive training pairs $(x_i, y_i^+, y_i^-)$ and extract response-token activations $a^l$ at layer $l$.
+
+% ------------------------------------------------------------------
+\section{DiffMean Projection Analysis}
+\label{sec:diffmean}
+
+Projects test-time activations onto the DiffMean steering direction and checks correlation with unsteered behavior scores.
+
+\begin{align}
+    \mathbf{v}^l &= \boldsymbol{\mu}_+ - \boldsymbol{\mu}_-, \quad \hat{\mathbf{v}} = \mathbf{v}/\|\mathbf{v}\| \\
+    c_+ &= \boldsymbol{\mu}_+ \cdot \hat{\mathbf{v}}, \quad c_- = \boldsymbol{\mu}_- \cdot \hat{\mathbf{v}} \\
+    m &= \tfrac{c_+ + c_-}{2}, \quad h = \tfrac{c_+ - c_-}{2} \\
+    \tilde{p}_j &= \frac{\bar{a}^l(x_j, y_j) \cdot \hat{\mathbf{v}} - m}{h}
+\end{align}
+
+Under this normalization $c_+ \to +1$, $c_- \to -1$. Tests whether $\rho(\tilde{p},\, \text{score}) \gg 0$.
+
+% ------------------------------------------------------------------
+\section{LDA Projection Analysis}
+\label{sec:lda}
+
+Same projection and centroid normalization as Section~\ref{sec:diffmean}, but replaces the DiffMean direction with the Fisher LDA direction:
+\begin{equation}
+    \mathbf{w}_\text{LDA} = \boldsymbol{\Sigma}_W^{-1}(\boldsymbol{\mu}_+ - \boldsymbol{\mu}_-)
+\end{equation}
+where $\boldsymbol{\Sigma}_W$ is the pooled within-class covariance. Accounts for the shape of activation clusters, not just their means.
+
+% ------------------------------------------------------------------
+\section{Logistic Probe Projection Analysis}
+\label{sec:probe}
+
+Same framework as Section~\ref{sec:diffmean}, but projects onto the weight vector of a logistic regression probe:
+\begin{equation}
+    \mathbf{w}_\text{probe} = \arg\min_{\mathbf{w}} \sum_i \mathcal{L}_\text{BCE}\!\bigl(\sigma(\mathbf{w} \cdot \bar{a}^l_i + b),\; y_i\bigr)
+\end{equation}
+where positive activations are labeled 1, negative labeled 0. Optimizes a classification objective over all training activations.
+
+% ------------------------------------------------------------------
+\section{Directional Agreement (Steering Vector)}
+\label{sec:dir-agree}
+
+Measures how well each prompt's activation difference aligns with the steering vector.
+\begin{align}
+    \boldsymbol{\Delta}_i &= \bar{a}^l(x_i, y_i^+) - \bar{a}^l(x_i, y_i^-) \\
+    \mathbf{s}^l &= \frac{1}{N}\sum_i \boldsymbol{\Delta}_i \\
+    \text{score}_i &= \cos(\boldsymbol{\Delta}_i,\; \mathbf{s}^l)
+\end{align}
+A narrow, high-mean distribution indicates the steering vector consistently captures individual examples' behavioral axes.
+
+% ------------------------------------------------------------------
+\section{Directional Agreement (Pairwise)}
+\label{sec:pairwise}
+
+Instead of comparing each $\boldsymbol{\Delta}_i$ to the steering vector, compares all pairs of per-prompt deltas:
+\begin{equation}
+    \text{score}_{ij} = \cos(\boldsymbol{\Delta}_i,\; \boldsymbol{\Delta}_j), \quad i < j
+\end{equation}
+High pairwise agreement means individual prompts shift activations in a consistent direction, independent of the steering vector definition.
+
+% ------------------------------------------------------------------
+\section{Token-Position Directional Agreement}
+\label{sec:token-pos}
+
+Per-token version of Section~\ref{sec:dir-agree}. Instead of averaging activations first, computes a difference vector at each token position and averages the cosine similarities.
+\begin{align}
+    \delta_i^t &= a^l_+(x_i, t) - a^l_-(x_i, t), \quad t = 1, \dots, \min(T_+, T_-) \\
+    \mathbf{s}^l &= \frac{1}{N}\sum_i \bigl[\bar{a}^l_+(x_i) - \bar{a}^l_-(x_i)\bigr] \\
+    \text{score}_i &= \frac{1}{T_{\min}} \sum_t \cos(\delta_i^t,\; \mathbf{s}^l)
+\end{align}
+The steering vector $\mathbf{s}^l$ uses all tokens (no truncation); the per-token cosine similarities are computed only up to $\min(T_+, T_-)$.
+
+% ------------------------------------------------------------------
+\section{Activation Spread}
+\label{sec:spread}
+
+Measures how dispersed a single prompt's response-token activations are, computed separately for positive and negative responses.
+\begin{equation}
+    \text{spread}_i = \frac{1}{\binom{T}{2}} \sum_{t < t'} \bigl[1 - \cos(a^l_t,\; a^l_{t'})\bigr]
+\end{equation}
+Higher spread means token-position activations point in more diverse directions. Reported per-prompt per-layer, and averaged across prompts.
+
+\end{document}
