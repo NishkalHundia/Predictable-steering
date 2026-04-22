@@ -30,7 +30,7 @@ Usage:
         --behavior corrigible-neutral-HHH \
         --model_name google/gemma-2-9b-it \
         --sweep_dir results/mcqa_sweep/gemma-2-9b-it/corrigible-neutral-HHH \
-        --steering_factor 1.0
+        --steering-factors=1,2,3,5,10
 """
 import json
 import re
@@ -515,9 +515,20 @@ def main():
                         help="Default: datasets/test/<behavior>/test_dataset_ab.json")
     parser.add_argument("--output_dir", type=str, default=None,
                         help="Default: <sweep_dir>/mcqa_analysis")
-    parser.add_argument("--steering_factors", type=str, default="1",
-                        help="Comma-separated list of unnormalized steering factors α "
-                             "to evaluate individually (e.g. '1,2,3,5,10'). Default '1'.")
+    parser.add_argument(
+        "--steering-factors", "--steering_factors", "--factors",
+        dest="steering_factors",
+        type=str,
+        default="1",
+        metavar="STR",
+        help="Comma-separated list of unnormalized steering factors α "
+             "(e.g. 1,2,3,5,10). Pass as one string; default 1.",
+    )
+    parser.add_argument(
+        "--steering_factor", type=float, default=None,
+        help="Single α only; equivalent to --steering-factors STR with one value. "
+             "If set, overrides --steering-factors.",
+    )
     parser.add_argument("--batch_size", type=int, default=16,
                         help="Batch size for baseline and steered forward passes.")
     parser.add_argument("--max_test", type=int, default=None,
@@ -526,9 +537,14 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
-    factors = sorted({float(x.strip()) for x in args.steering_factors.split(",") if x.strip()})
+    if args.steering_factor is not None:
+        factors = [float(args.steering_factor)]
+    else:
+        factors = sorted(
+            {float(x.strip()) for x in str(args.steering_factors).split(",") if x.strip()}
+        )
     if not factors:
-        logger.error("--steering_factors is empty")
+        logger.error("No steering factors (use --steering-factors STR or --steering_factor α)")
         sys.exit(1)
 
     torch.manual_seed(args.seed)
