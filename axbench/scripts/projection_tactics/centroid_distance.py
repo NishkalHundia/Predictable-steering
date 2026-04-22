@@ -33,9 +33,14 @@ Outputs:
     correlations.csv              (per-layer corr of both distances vs baseline score)
     analysis_summary.json
     plots/
-      scatter_neg_layer_{N}.png   (dist-to-neg centroid vs baseline)
-      scatter_pos_layer_{N}.png   (dist-to-pos centroid vs baseline)
-      distribution_layer_{N}.png  (train vs test distance distribution)
+      scatter_neg_layer_{N}.png       (dist-to-neg centroid vs baseline)
+      scatter_pos_layer_{N}.png       (dist-to-pos centroid vs baseline)
+      distribution_layer_{N}.png      (train vs test distance distribution)
+      distance_space_layer_{N}.png    (2D: dist_to_pos vs dist_to_neg,
+                                       test points colored by baseline score)
+      pca_layer_{N}.png               (2D PCA of activations, with eps-ball
+                                       shadows around each centroid; requires
+                                       cached raw activations .pt file)
       correlation_across_layers.png
 
 Usage:
@@ -55,9 +60,11 @@ from pathlib import Path
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from scipy import stats as scipy_stats
+from sklearn.decomposition import PCA
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.patches import Circle
 
 import logging
 logging.basicConfig(
@@ -74,9 +81,9 @@ BEHAVIOR_SCALES = {
     "myopic-reward": (-5, 5, 0),
     "corrigible-neutral-HHH": (-5, 5, 0),
     "hallucination": (0, 5, None),
-    "sycophancy": (0, 10, 5),
-    "refusal": (0, 10, 5),
-    "coordinate-other-ais": (0, 10, 5),
+    # "sycophancy": (0, 10, 5),
+    # "refusal": (0, 10, 5),
+    # "coordinate-other-ais": (0, 10, 5),
 }
 
 BEHAVIORS = list(BEHAVIOR_SCALES.keys())
@@ -575,6 +582,189 @@ def plot_distribution(train_df, test_df, layer, behavior, radii_df,
     plt.close()
 
 
+def plot_distance_space_layer(train_df, test_df, layer, behavior, radii_df,
+                              percentile, output_path):
+    """2D scatter in (dist_to_pos_centroid, dist_to_neg_centroid) space.
+
+    Training pos / training neg / test points live in the same 2D plane the
+    correlations operate on. Vertical/horizontal lines at eps_pos / eps_neg
+    split the plane into four quadrants (inside-both, inside-pos-only,
+    inside-neg-only, outside-both). Test points are colored by baseline score.
+    """
+    train_l = train_df[train_df["layer"] == layer]
+    test_l = test_df[test_df["layer"] == layer]
+
+    fig, ax = plt.subplots(figsize=(9, 8))
+
+    if not train_l.empty:
+        tp = train_l[train_l["label"] == 1]
+        tn = train_l[train_l["label"] == 0]
+        if len(tp):
+            ax.scatter(tp["dist_to_pos_centroid"], tp["dist_to_neg_centroid"],
+                       s=45, alpha=0.55, color="#2ca02c", edgecolors="white",
+                       linewidths=0.4, label=f"Train pos (n={len(tp)})", zorder=2)
+        if len(tn):
+            ax.scatter(tn["dist_to_pos_centroid"], tn["dist_to_neg_centroid"],
+                       s=45, alpha=0.55, color="#d62728", edgecolors="white",
+                       linewidths=0.4, label=f"Train neg (n={len(tn)})", zorder=2)
+
+    sc = None
+    if not test_l.empty:
+        valid = test_l.dropna(subset=["dist_to_pos_centroid",
+                                      "dist_to_neg_centroid", "baseline_score"])
+        if len(valid):
+            sc = ax.scatter(
+                valid["dist_to_pos_centroid"], valid["dist_to_neg_centroid"],
+                c=valid["baseline_score"], cmap="coolwarm",
+                marker="^", s=90, edgecolors="black", linewidths=0.6,
+                label=f"Test (n={len(valid)})", zorder=4,
+            )
+
+    rrow = radii_df[radii_df["layer"] == layer]
+    if not rrow.empty:
+        r = rrow.iloc[0]
+        eps_p_max = r["eps_pos_max"]
+        eps_n_max = r["eps_neg_max"]
+        eps_p_pct = r[f"eps_pos_p{int(percentile)}"]
+        eps_n_pct = r[f"eps_neg_p{int(percentile)}"]
+        ax.axvline(x=eps_p_max, color="#2ca02c", linestyle="--", alpha=0.7,
+                   label=f"eps_pos max = {eps_p_max:.2f}")
+        ax.axvline(x=eps_p_pct, color="#2ca02c", linestyle=":", alpha=0.7,
+                   label=f"eps_pos p{int(percentile)} = {eps_p_pct:.2f}")
+        ax.axhline(y=eps_n_max, color="#d62728", linestyle="--", alpha=0.7,
+                   label=f"eps_neg max = {eps_n_max:.2f}")
+        ax.axhline(y=eps_n_pct, color="#d62728", linestyle=":", alpha=0.7,
+                   label=f"eps_neg p{int(percentile)} = {eps_n_pct:.2f}")
+
+    if sc is not None:
+        cbar = fig.colorbar(sc, ax=ax, fraction=0.035, pad=0.02)
+        cbar.set_label("Baseline behavior score", fontsize=9)
+
+    ax.set_xlabel("L2 distance to pos centroid", fontsize=10)
+    ax.set_ylabel("L2 distance to neg centroid", fontsize=10)
+    ax.set_title(
+        f"{behavior} - Layer {layer}: Distance-Space View\n"
+        f"(x<eps_pos & y>eps_neg => inside pos ball only)",
+        fontsize=11, fontweight="bold",
+    )
+    ax.legend(fontsize=8, loc="best")
+    ax.set_xlim(left=0)
+    ax.set_ylim(bottom=0)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close()
+
+
+def plot_pca_layer(train_acts_layer, test_mean_acts, test_metadata,
+                   centroids_layer, layer, behavior, output_path,
+                   percentile=95.0):
+    """2D PCA scatter of raw activations around their centroids.
+
+    Fits PCA on the full set of training activations (pos + neg combined),
+    projects everything into 2D, and draws each cluster + the empirical
+    2D "shadow" of the epsilon ball (a circle at the max / p95 of 2D training
+    distances from each projected centroid).
+
+    This is a LOSSY view: the true epsilon ball lives in full activation
+    space; its 2D projection is only a shadow, so the drawn radius is the
+    2D empirical radius, not a reprojection of the full-D radius.
+    """
+    pos_list = train_acts_layer.get("pos", [])
+    neg_list = train_acts_layer.get("neg", [])
+    if not pos_list or not neg_list:
+        return
+
+    pos_mat = torch.stack(pos_list).numpy()
+    neg_mat = torch.stack(neg_list).numpy()
+    X = np.concatenate([pos_mat, neg_mat], axis=0)
+
+    pca = PCA(n_components=2)
+    pca.fit(X)
+    pos_2d = pca.transform(pos_mat)
+    neg_2d = pca.transform(neg_mat)
+
+    mu_pos_2d = pca.transform(centroids_layer["mu_pos"].numpy()[None, :])[0]
+    mu_neg_2d = pca.transform(centroids_layer["mu_neg"].numpy()[None, :])[0]
+
+    dp = np.linalg.norm(pos_2d - mu_pos_2d, axis=1)
+    dn = np.linalg.norm(neg_2d - mu_neg_2d, axis=1)
+    r_pos_max = float(dp.max()) if len(dp) else 0.0
+    r_neg_max = float(dn.max()) if len(dn) else 0.0
+    r_pos_pct = float(np.percentile(dp, percentile)) if len(dp) else 0.0
+    r_neg_pct = float(np.percentile(dn, percentile)) if len(dn) else 0.0
+
+    # Test projections (those whose layer matches)
+    test_2d, test_scores = [], []
+    for entry in test_metadata:
+        if int(entry["layer"]) != int(layer):
+            continue
+        key = (int(entry["question_idx"]), int(layer))
+        act = test_mean_acts.get(key)
+        if act is None:
+            continue
+        test_2d.append(pca.transform(act.numpy()[None, :])[0])
+        test_scores.append(entry.get("baseline_score", np.nan))
+    test_2d = np.array(test_2d) if len(test_2d) else np.empty((0, 2))
+    test_scores = np.array(test_scores, dtype=float) if len(test_scores) else np.array([])
+
+    fig, ax = plt.subplots(figsize=(9, 8))
+
+    ax.scatter(pos_2d[:, 0], pos_2d[:, 1], s=45, alpha=0.55, color="#2ca02c",
+               edgecolors="white", linewidths=0.4,
+               label=f"Train pos (n={len(pos_2d)})", zorder=2)
+    ax.scatter(neg_2d[:, 0], neg_2d[:, 1], s=45, alpha=0.55, color="#d62728",
+               edgecolors="white", linewidths=0.4,
+               label=f"Train neg (n={len(neg_2d)})", zorder=2)
+
+    for mu_2d, r_max, r_pct, color, lbl in [
+        (mu_pos_2d, r_pos_max, r_pos_pct, "#2ca02c", "pos"),
+        (mu_neg_2d, r_neg_max, r_neg_pct, "#d62728", "neg"),
+    ]:
+        ax.add_patch(Circle(tuple(mu_2d), r_max, fill=False,
+                            edgecolor=color, linestyle="--", linewidth=2,
+                            alpha=0.85, zorder=3,
+                            label=f"eps_{lbl} max (2D) = {r_max:.2f}"))
+        ax.add_patch(Circle(tuple(mu_2d), r_pct, fill=False,
+                            edgecolor=color, linestyle=":", linewidth=2,
+                            alpha=0.85, zorder=3,
+                            label=f"eps_{lbl} p{int(percentile)} (2D) = {r_pct:.2f}"))
+        ax.scatter([mu_2d[0]], [mu_2d[1]], marker="X", s=220, color=color,
+                   edgecolors="black", linewidths=1.2, zorder=5)
+
+    sc = None
+    if len(test_2d):
+        valid = ~np.isnan(test_scores)
+        if valid.any():
+            sc = ax.scatter(
+                test_2d[valid, 0], test_2d[valid, 1],
+                c=test_scores[valid], cmap="coolwarm",
+                marker="^", s=90, edgecolors="black", linewidths=0.6,
+                label=f"Test (n={int(valid.sum())})", zorder=4,
+            )
+        if (~valid).any():
+            ax.scatter(test_2d[~valid, 0], test_2d[~valid, 1], marker="^",
+                       s=80, facecolors="none", edgecolors="gray",
+                       linewidths=0.6, zorder=4)
+
+    if sc is not None:
+        cbar = fig.colorbar(sc, ax=ax, fraction=0.035, pad=0.02)
+        cbar.set_label("Baseline behavior score", fontsize=9)
+
+    ev = pca.explained_variance_ratio_
+    ax.set_xlabel(f"PC1 ({ev[0]*100:.1f}% var)", fontsize=10)
+    ax.set_ylabel(f"PC2 ({ev[1]*100:.1f}% var)", fontsize=10)
+    ax.set_title(
+        f"{behavior} - Layer {layer}: 2D PCA of Activations\n"
+        f"(circles = 2D shadow of eps ball; NOT the full-D radius)",
+        fontsize=11, fontweight="bold",
+    )
+    ax.set_aspect("equal", adjustable="datalim")
+    ax.legend(fontsize=8, loc="best")
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close()
+
+
 def plot_correlation_across_layers(corr_df, behavior, output_path):
     if corr_df.empty:
         return
@@ -597,7 +787,8 @@ def plot_correlation_across_layers(corr_df, behavior, output_path):
         ax.plot(layers, rhos, "o-", color=color, linewidth=2, markersize=7,
                 label=f"dist to {tag} centroid vs score ({expected})", zorder=2)
         ax.scatter(layers[sig_mask], rhos[sig_mask], s=140, facecolors="none",
-                   edgecolors=color, linewidths=2.2, zorder=3)
+                   edgecolors=color, linewidths=2.2, zorder=3,
+                   label=f"p < 0.05 ({tag})")
 
     ax.axhline(y=0, color="gray", linestyle="--", alpha=0.5)
     ax.set_xlabel("Layer", fontsize=11)
@@ -666,6 +857,15 @@ def main():
     train_acts_path = out_dir / "train_activations.pt"
     test_acts_path = out_dir / "test_activations.pt"
 
+    # Raw activations + centroids are needed only for PCA plots; everything
+    # else can work from CSVs alone. These start as None and are populated
+    # either by the extraction phase or (in replot mode) by loading the
+    # cached .pt files when present.
+    train_acts = None
+    centroids = None
+    test_mean_acts = None
+    test_metadata = None
+
     if args.replot_only:
         for p in [test_dist_path, train_dist_path]:
             if not p.exists():
@@ -675,6 +875,23 @@ def main():
         train_df = pd.read_csv(train_dist_path)
         centroids_df = pd.read_csv(out_dir / "centroids.csv")
         logger.warning(f"Loaded {len(test_df)} test, {len(train_df)} train rows")
+
+        if train_acts_path.exists():
+            logger.warning(f"Loading cached training activations for PCA plot")
+            cached = torch.load(train_acts_path, map_location="cpu", weights_only=False)
+            train_acts = cached["train_acts"]
+            centroids = {}
+            for layer in target_layers:
+                if layer not in train_acts:
+                    continue
+                pos = torch.stack(train_acts[layer]["pos"])
+                neg = torch.stack(train_acts[layer]["neg"])
+                centroids[layer] = {"mu_pos": pos.mean(dim=0), "mu_neg": neg.mean(dim=0)}
+        if test_acts_path.exists():
+            logger.warning(f"Loading cached test activations for PCA plot")
+            cached_test = torch.load(test_acts_path, map_location="cpu", weights_only=False)
+            test_mean_acts = cached_test["test_mean_acts"]
+            test_metadata = cached_test["test_metadata"]
     else:
         model = None
         tokenizer = None
@@ -799,6 +1016,22 @@ def main():
         plot_distribution(train_df, test_df, layer, args.behavior,
                           centroids_df, args.eps_percentile,
                           plot_dir / f"distribution_layer_{layer}.png")
+
+        plot_distance_space_layer(
+            train_df, test_df, layer, args.behavior,
+            centroids_df, args.eps_percentile,
+            plot_dir / f"distance_space_layer_{layer}.png",
+        )
+
+        if train_acts is not None and centroids is not None and layer in centroids:
+            plot_pca_layer(
+                train_acts[layer],
+                test_mean_acts if test_mean_acts is not None else {},
+                test_metadata if test_metadata is not None else [],
+                centroids[layer], layer, args.behavior,
+                plot_dir / f"pca_layer_{layer}.png",
+                percentile=args.eps_percentile,
+            )
 
     plot_correlation_across_layers(corr_df, args.behavior,
                                    plot_dir / "correlation_across_layers.png")
