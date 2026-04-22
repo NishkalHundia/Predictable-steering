@@ -564,6 +564,131 @@ def plot_scatter_for_layer(per_prompt: pd.DataFrame, layer: int, behavior: str,
 # ============================================================================
 # Cross-factor plots
 # ============================================================================
+def plot_steered_sign_mcc_by_layer(per_prompt_df: pd.DataFrame, behavior: str,
+                                    output_path: Path):
+    """
+    For each steering factor α (including α=0 = baseline), compute:
+        κ_a_steered(j, l, α) = κ_a_baseline(j, l) + 2α
+    (exact: steering adds α·v to the activation, which shifts the projection
+    along v by exactly 2α in κ_a units).
+    Then compute MCC(sign(κ_a_steered), greedy_match_steered) per (layer, factor).
+
+    This answers: "does the side of the diff-in-means line that the STEERED
+    activation lands on predict the steered model's greedy choice, and does
+    this relationship hold / improve as α increases?"
+    """
+    if per_prompt_df.empty or "kappa_a" not in per_prompt_df.columns:
+        return
+    factors = sorted(per_prompt_df["steering_factor"].unique())
+    layers = sorted(per_prompt_df["layer"].unique())
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+    cmap = plt.get_cmap("plasma")
+
+    for i, f in enumerate(factors):
+        color = cmap(i / max(1, len(factors) - 1))
+        mccs = []
+        for l in layers:
+            sub = per_prompt_df[
+                (per_prompt_df["steering_factor"] == f) &
+                (per_prompt_df["layer"] == l)
+            ][["kappa_a", "greedy_match_steered"]].dropna()
+            if len(sub) < 4:
+                mccs.append(float("nan"))
+                continue
+            kappa_steered = sub["kappa_a"].values + 2.0 * f
+            pred = (kappa_steered > 0).astype(int)
+            actual = sub["greedy_match_steered"].astype(int).values
+            tp = int(((pred == 1) & (actual == 1)).sum())
+            tn = int(((pred == 0) & (actual == 0)).sum())
+            fp = int(((pred == 1) & (actual == 0)).sum())
+            fn = int(((pred == 0) & (actual == 1)).sum())
+            denom = np.sqrt(float(tp + fp) * (tp + fn) * (tn + fp) * (tn + fn))
+            mcc = float((tp * tn - fp * fn) / denom) if denom > 0 else 0.0
+            mccs.append(mcc)
+
+        # α=0 is the baseline — draw it thicker for reference.
+        lw = 3.0 if f == 0 else 1.8
+        ls = "-" if f == 0 else "--"
+        ax.plot(layers, mccs, marker="o", linestyle=ls, linewidth=lw,
+                markersize=5, color=color, label=f"α={f:g}")
+
+    ax.axhline(0, color="gray", linestyle=":", linewidth=0.8, alpha=0.6)
+    ax.set_xlabel("Layer", fontsize=11)
+    ax.set_ylabel("MCC  [sign(κ_a_steered) vs greedy_match_steered]", fontsize=10)
+    ax.set_title(
+        f"{behavior}: MCC of sign(κ_a + 2α) predicting steered greedy choice, by layer\n"
+        f"κ_a_steered = κ_a_baseline + 2α  (exact shift from steering)",
+        fontsize=11, fontweight="bold",
+    )
+    ax.legend(title="Steering factor α", fontsize=9, loc="best")
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close()
+
+
+def plot_sign_mcc_vs_steered_acc(layer_df_all: pd.DataFrame, behavior: str,
+                                  output_path: Path):
+    """
+    The key cross-factor question:
+    "At each layer, if sign(κ_a) already predicted baseline behavior (high MCC),
+    does steering at that layer also work well — and does this hold across factors?"
+
+    Left axis:  sign(κ_a) MCC vs greedy_match_baseline  (factor-independent,
+                drawn once as a thick black line)
+    Right axis: steered greedy accuracy, one colored line per steering factor.
+
+    If the two sets of curves peak at the same layers, the diff-in-means direction
+    at those layers both encodes and steers behavior.
+    """
+    if layer_df_all.empty:
+        return
+    factors = sorted(layer_df_all["steering_factor"].unique())
+    if not factors:
+        return
+
+    fig, ax1 = plt.subplots(figsize=(12, 5))
+    ax2 = ax1.twinx()
+
+    # sign(κ_a) MCC — factor-independent; use any factor's rows (same values).
+    ref = layer_df_all[layer_df_all["steering_factor"] == factors[0]].sort_values("layer")
+    if "proj_sign_mcc" in ref.columns:
+        ax1.plot(ref["layer"].values, ref["proj_sign_mcc"].values,
+                 "k-", linewidth=3, marker="s", markersize=6,
+                 label="sign(κ_a) MCC (baseline, left axis)", zorder=5)
+    ax1.axhline(0, color="gray", linestyle="--", linewidth=0.8, alpha=0.5)
+    ax1.set_ylabel("sign(κ_a) MCC  [baseline, unsteered]", fontsize=11, color="black")
+    ax1.tick_params(axis="y", labelcolor="black")
+
+    # Steered greedy accuracy per factor.
+    cmap = plt.get_cmap("plasma")
+    for i, f in enumerate(factors):
+        sub = layer_df_all[layer_df_all["steering_factor"] == f].sort_values("layer")
+        if "steered_greedy_acc" not in sub.columns:
+            continue
+        color = cmap(i / max(1, len(factors) - 1))
+        ax2.plot(sub["layer"].values, sub["steered_greedy_acc"].values,
+                 "o--", color=color, linewidth=1.8, markersize=4,
+                 label=f"steered greedy acc α={f:g} (right axis)", alpha=0.85)
+
+    ax2.set_ylabel("Steered greedy accuracy", fontsize=11, color="#8B0000")
+    ax2.tick_params(axis="y", labelcolor="#8B0000")
+
+    ax1.set_xlabel("Layer", fontsize=11)
+    ax1.set_title(
+        f"{behavior}: sign(κ_a) MCC [left] vs steered greedy accuracy [right] by layer\n"
+        f"Do the same layers where projection is informative also respond best to steering?",
+        fontsize=11, fontweight="bold",
+    )
+
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, fontsize=8, loc="lower right")
+    fig.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close()
+
+
 def plot_factor_sweep(layer_df_all: pd.DataFrame, metric: str, metric_label: str,
                       behavior: str, output_path: Path):
     """One line per steering factor, y = metric by layer."""
@@ -1233,6 +1358,14 @@ def main():
             )
 
     # Cross-factor sweep plots (one line per factor).
+    plot_steered_sign_mcc_by_layer(
+        per_prompt_df, args.behavior,
+        plots_dir / "steered_sign_mcc_by_layer.png",
+    )
+    plot_sign_mcc_vs_steered_acc(
+        layer_df_all, args.behavior,
+        plots_dir / "sign_mcc_vs_steered_acc.png",
+    )
     plot_factor_sweep(layer_df_all, "steered_acc_mean",
                       "Steered P(matching)", args.behavior,
                       plots_dir / "factor_sweep_steered_acc.png")
