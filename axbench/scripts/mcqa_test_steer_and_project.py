@@ -608,30 +608,63 @@ def main():
 
     # ----------------------------------------------------------------------
     # Pre-tokenize all (prompt, candidate) pairs once.
+    # MCQA rows are *not* always (A, B): e.g. some survival-instinct rows are
+    # (A, C) or (A, E). Candidates come from this row's actual
+    # answer_matching_behavior / answer_not_matching_behavior.
     # ----------------------------------------------------------------------
-    candidates = [" (A)", " (B)"]
-    letter_of = {c: extract_matching_letter(c) for c in candidates}
-    # For each prompt j and letter L, store: full_ids (list), prompt_len, letter_pos.
+    # For each prompt j, store prompt_meta[j] = {matching_letter, notmatch_letter}.
+    # For tokenization, store per-prompt dict keyed by that row's letters.
+    prompt_meta = []
     pre_tok = []
-    for item in test_data:
+    dropped = 0
+    for j, item in enumerate(test_data):
         q = item["question"]
+        matching_letter = extract_matching_letter(item["answer_matching_behavior"])
+        notmatch_letter = extract_matching_letter(item["answer_not_matching_behavior"])
+        if matching_letter == notmatch_letter:
+            logger.warning(
+                f"Prompt {j}: matching and not-matching letters both "
+                f"'{matching_letter}'; skipping."
+            )
+            prompt_meta.append(None)
+            pre_tok.append(None)
+            dropped += 1
+            continue
         row = {}
-        for cand in candidates:
+        for letter in (matching_letter, notmatch_letter):
+            cand = f" ({letter})"
             prompt_ids, full_ids, letter_pos = build_prompt_and_full_ids(tokenizer, q, cand)
-            row[letter_of[cand]] = {
+            row[letter] = {
                 "full_ids": full_ids,
                 "prompt_len": len(prompt_ids),
                 "letter_pos": letter_pos,
             }
         pre_tok.append(row)
+        prompt_meta.append({
+            "matching_letter": matching_letter,
+            "notmatch_letter": notmatch_letter,
+        })
+    if dropped:
+        logger.warning(
+            f"Dropped {dropped} malformed prompt(s); "
+            f"continuing with {len(test_data) - dropped} prompts."
+        )
 
-    # Flatten into a single list of "items" we batch: (prompt_idx, letter).
-    flat_items = []  # list of dict: prompt_idx, letter, full_ids, prompt_len, letter_pos
+    # Flatten into a single list of "items" we batch: (prompt_idx, letter, role).
+    flat_items = []
     for j, row in enumerate(pre_tok):
-        for letter in ("A", "B"):
+        if row is None:
+            continue
+        meta = prompt_meta[j]
+        for role, letter in (
+            ("match", meta["matching_letter"]),
+            ("notmatch", meta["notmatch_letter"]),
+        ):
             e = row[letter]
             flat_items.append({
-                "prompt_idx": j, "letter": letter,
+                "prompt_idx": j,
+                "letter": letter,
+                "role": role,
                 "full_ids": e["full_ids"],
                 "prompt_len": e["prompt_len"],
                 "letter_pos": e["letter_pos"],
@@ -646,8 +679,8 @@ def main():
     # ----------------------------------------------------------------------
     logger.warning(f"\n=== Phase A: batched baseline forward (B={B}, {n_items} items) ===")
     pad_id = tokenizer.pad_token_id
-    baseline_logps = {}  # (j, letter) -> float
-    act_at_letter = {}  # (j, letter, layer) -> tensor [hidden] on cpu
+    baseline_logps = {}  # (j, role) -> float         role in {"match", "notmatch"}
+    act_at_letter = {}  # (j, role, layer) -> tensor [hidden] on cpu
     for start in tqdm(range(0, n_items, B), desc="Baseline batches"):
         batch = flat_items[start:start + B]
         token_lists = [b["full_ids"] for b in batch]
@@ -656,9 +689,9 @@ def main():
         prompt_lens = [b["prompt_len"] for b in batch]
         logps = batched_answer_logprobs(logits, input_ids, prompt_lens, lens)
         for i, b in enumerate(batch):
-            baseline_logps[(b["prompt_idx"], b["letter"])] = logps[i]
+            baseline_logps[(b["prompt_idx"], b["role"])] = logps[i]
             for l in layers:
-                act_at_letter[(b["prompt_idx"], b["letter"], l)] = (
+                act_at_letter[(b["prompt_idx"], b["role"], l)] = (
                     layer_hiddens[l][i, b["letter_pos"], :].float().cpu()
                 )
         del logits, layer_hiddens, input_ids, attn
@@ -666,30 +699,34 @@ def main():
     # Build baseline_records from the log-probs; pick greedy-letter activation per layer.
     baseline_records = []
     for j, item in enumerate(test_data):
-        matching_letter = extract_matching_letter(item["answer_matching_behavior"])
-        lp_A = baseline_logps[(j, "A")]
-        lp_B = baseline_logps[(j, "B")]
-        logp_m = lp_A if matching_letter == "A" else lp_B
-        logp_n = lp_B if matching_letter == "A" else lp_A
+        if prompt_meta[j] is None:
+            continue
+        matching_letter = prompt_meta[j]["matching_letter"]
+        notmatch_letter = prompt_meta[j]["notmatch_letter"]
+        logp_m = baseline_logps[(j, "match")]
+        logp_n = baseline_logps[(j, "notmatch")]
         p_match = float(np.exp(logp_m) / (np.exp(logp_m) + np.exp(logp_n)))
-        greedy_letter = "A" if lp_A > lp_B else "B"
-        greedy_match = int(greedy_letter == matching_letter)
+        is_match_greedy = logp_m > logp_n
+        greedy_letter = matching_letter if is_match_greedy else notmatch_letter
+        greedy_role = "match" if is_match_greedy else "notmatch"
+        greedy_match = int(is_match_greedy)
         baseline_records.append({
             "prompt_idx": j,
             "question": item["question"],
             "answer_matching_behavior": item["answer_matching_behavior"],
             "answer_not_matching_behavior": item.get("answer_not_matching_behavior", ""),
             "matching_letter": matching_letter,
+            "notmatch_letter": notmatch_letter,
             "greedy_letter": greedy_letter,
             "baseline_p_match": p_match,
             "greedy_match_baseline": greedy_match,
-            "baseline_logp_A": float(lp_A),
-            "baseline_logp_B": float(lp_B),
+            "baseline_logp_match": float(logp_m),
+            "baseline_logp_notmatch": float(logp_n),
             "activations": {
-                l: act_at_letter[(j, greedy_letter, l)] for l in layers
+                l: act_at_letter[(j, greedy_role, l)] for l in layers
             },
         })
-    del act_at_letter  # free memory; we only needed the greedy letter's activations
+    del act_at_letter
 
     # ----------------------------------------------------------------------
     # Phase B - batched steered forward per factor per layer.
@@ -717,25 +754,28 @@ def main():
                 prompt_lens = [b["prompt_len"] for b in batch]
                 logps = batched_answer_logprobs(logits, input_ids, prompt_lens, lens)
                 for i, b in enumerate(batch):
-                    per_item_logp[start + i] = (b["prompt_idx"], b["letter"], logps[i])
+                    per_item_logp[start + i] = (b["prompt_idx"], b["role"], logps[i])
                 del logits, input_ids, attn
-            # Aggregate per prompt.
+            # Aggregate per prompt: {role -> logp}.
             by_prompt = {}
-            for pj, letter, lp in per_item_logp:
-                by_prompt.setdefault(pj, {})[letter] = lp
+            for pj, role, lp in per_item_logp:
+                by_prompt.setdefault(pj, {})[role] = lp
             for j, item in enumerate(test_data):
-                ml = extract_matching_letter(item["answer_matching_behavior"])
-                logps = by_prompt[j]
-                logp_m = logps[ml]
-                logp_n = logps["B" if ml == "A" else "A"]
+                if prompt_meta[j] is None:
+                    continue
+                ml = prompt_meta[j]["matching_letter"]
+                nl = prompt_meta[j]["notmatch_letter"]
+                logp_m = by_prompt[j]["match"]
+                logp_n = by_prompt[j]["notmatch"]
                 p_match_s = float(np.exp(logp_m) / (np.exp(logp_m) + np.exp(logp_n)))
-                greedy_letter_s = "A" if logps["A"] > logps["B"] else "B"
+                is_match_greedy = logp_m > logp_n
+                greedy_letter_s = ml if is_match_greedy else nl
                 steered_map[factor][(l, j)] = {
                     "p_match_steered": p_match_s,
-                    "greedy_match_steered": int(greedy_letter_s == ml),
+                    "greedy_match_steered": int(is_match_greedy),
                     "greedy_letter_steered": greedy_letter_s,
-                    "steered_logp_A": float(logps["A"]),
-                    "steered_logp_B": float(logps["B"]),
+                    "steered_logp_match": float(logp_m),
+                    "steered_logp_notmatch": float(logp_n),
                 }
             outer.update(1)
     outer.close()
@@ -776,14 +816,15 @@ def main():
                     "answer_matching_behavior": rec["answer_matching_behavior"],
                     "answer_not_matching_behavior": rec["answer_not_matching_behavior"],
                     "matching_letter": rec["matching_letter"],
+                    "notmatch_letter": rec["notmatch_letter"],
                     "greedy_letter_baseline": rec["greedy_letter"],
-                    "baseline_logp_A": rec["baseline_logp_A"],
-                    "baseline_logp_B": rec["baseline_logp_B"],
+                    "baseline_logp_match": rec["baseline_logp_match"],
+                    "baseline_logp_notmatch": rec["baseline_logp_notmatch"],
                     "baseline_p_match": rec["baseline_p_match"],
                     "greedy_match_baseline": rec["greedy_match_baseline"],
                     "greedy_letter_steered": st["greedy_letter_steered"],
-                    "steered_logp_A": st["steered_logp_A"],
-                    "steered_logp_B": st["steered_logp_B"],
+                    "steered_logp_match": st["steered_logp_match"],
+                    "steered_logp_notmatch": st["steered_logp_notmatch"],
                     "steered_p_match": st["p_match_steered"],
                     "greedy_match_steered": st["greedy_match_steered"],
                     "kappa_a": kappa_map[(l, j)],
@@ -810,9 +851,10 @@ def main():
                 "answer_matching_behavior": rec["answer_matching_behavior"],
                 "answer_not_matching_behavior": rec["answer_not_matching_behavior"],
                 "matching_letter": rec["matching_letter"],
+                "notmatch_letter": rec["notmatch_letter"],
                 "baseline_greedy_letter": rec["greedy_letter"],
-                "baseline_logp_A": rec["baseline_logp_A"],
-                "baseline_logp_B": rec["baseline_logp_B"],
+                "baseline_logp_match": rec["baseline_logp_match"],
+                "baseline_logp_notmatch": rec["baseline_logp_notmatch"],
                 "baseline_p_match": rec["baseline_p_match"],
                 "greedy_match_baseline": rec["greedy_match_baseline"],
             }, ensure_ascii=False) + "\n")
@@ -830,13 +872,14 @@ def main():
                         "steering_factor": factor,
                         "question": rec["question"],
                         "matching_letter": rec["matching_letter"],
+                        "notmatch_letter": rec["notmatch_letter"],
                         "baseline_greedy_letter": rec["greedy_letter"],
                         "steered_greedy_letter": st["greedy_letter_steered"],
                         "flipped": bool(rec["greedy_letter"] != st["greedy_letter_steered"]),
                         "baseline_p_match": rec["baseline_p_match"],
                         "steered_p_match": st["p_match_steered"],
-                        "steered_logp_A": st["steered_logp_A"],
-                        "steered_logp_B": st["steered_logp_B"],
+                        "steered_logp_match": st["steered_logp_match"],
+                        "steered_logp_notmatch": st["steered_logp_notmatch"],
                         "greedy_match_baseline": rec["greedy_match_baseline"],
                         "greedy_match_steered": st["greedy_match_steered"],
                     }, ensure_ascii=False) + "\n")
