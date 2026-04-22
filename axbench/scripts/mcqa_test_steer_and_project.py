@@ -34,7 +34,6 @@ Usage:
 """
 import json
 import re
-import shutil
 import sys
 from pathlib import Path
 
@@ -271,6 +270,15 @@ def forward_with_steering_batch(model, input_ids, attention_mask,
 # ============================================================================
 # Plots
 # ============================================================================
+def _format_factor_tag(layer_df: pd.DataFrame) -> str:
+    """Return an α-label based on the steering_factor column (if present & unique)."""
+    if "steering_factor" in layer_df.columns:
+        uniq = sorted(set(float(x) for x in layer_df["steering_factor"].dropna().unique()))
+        if len(uniq) == 1:
+            return f"α={uniq[0]:g}"
+    return "α=steering"
+
+
 def _plot_predictor_vs_steering(
     layer_df: pd.DataFrame, pred_col: str, pred_label: str, pred_color: str,
     behavior: str, output_path: Path, title_suffix: str,
@@ -281,6 +289,7 @@ def _plot_predictor_vs_steering(
     sub = layer_df.dropna(subset=[pred_col, "steered_acc_mean"])
     if len(sub) < 3:
         return
+    alpha_tag = _format_factor_tag(sub)
     layers = sub["layer"].values
     fig, ax1 = plt.subplots(figsize=(10, 5))
 
@@ -294,7 +303,7 @@ def _plot_predictor_vs_steering(
     color_st = "#2E86AB"
     ax2 = ax1.twinx()
     ax2.plot(layers, sub["steered_acc_mean"].values, "s-", color=color_st,
-             linewidth=2, markersize=6, label="Steered acc (test, α=1)")
+             linewidth=2, markersize=6, label=f"Steered acc (test, {alpha_tag})")
     ax2.plot(layers, sub["baseline_acc_mean"].values, "D--", color="gray",
              linewidth=1.5, markersize=5, alpha=0.7, label="Baseline acc (test, α=0)")
     ax2.set_ylabel("Test P(matching)", color=color_st, fontsize=11)
@@ -324,7 +333,8 @@ def _plot_predictor_vs_steering(
     lines1, labels1 = ax1.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
     ax1.legend(lines1 + lines2, labels1 + labels2, loc="lower right", fontsize=8)
-    ax1.set_title(f"{behavior}: {title_suffix}", fontsize=12, fontweight="bold")
+    ax1.set_title(f"{behavior}: {title_suffix.format(alpha=alpha_tag)}",
+                  fontsize=12, fontweight="bold")
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close()
@@ -334,7 +344,7 @@ def plot_dprime_vs_steering(layer_df: pd.DataFrame, behavior: str, output_path: 
     _plot_predictor_vs_steering(
         layer_df, "dprime", "d' (train)", "#E94F37",
         behavior, output_path,
-        title_suffix="d' (train) vs Steered Accuracy (test, α=1) by Layer",
+        title_suffix="d' (train) vs Steered Accuracy (test, {alpha}) by Layer",
     )
 
 
@@ -342,7 +352,7 @@ def plot_kappa_rho_vs_steering(layer_df: pd.DataFrame, behavior: str, output_pat
     _plot_predictor_vs_steering(
         layer_df, "proj_spearman_rho", "ρ(κ_a, P_base) (test, N=50)", "#6B2D5C",
         behavior, output_path,
-        title_suffix="Projection quality (κ_a → baseline) vs Steered Accuracy by Layer",
+        title_suffix="Projection quality (κ_a → baseline) vs Steered Accuracy ({alpha}) by Layer",
     )
 
 
@@ -353,12 +363,12 @@ def plot_combined_predictors(layer_df: pd.DataFrame, behavior: str, output_path:
     sub = layer_df.dropna(subset=["steered_acc_mean"])
     if len(sub) < 3:
         return
+    alpha_tag = _format_factor_tag(sub)
     layers = sub["layer"].values
 
     fig, ax1 = plt.subplots(figsize=(11, 5))
     color_dp, color_kappa, color_st = "#E94F37", "#6B2D5C", "#2E86AB"
 
-    # Left axis: z-scored predictors so they share a scale
     def _z(x):
         x = np.asarray(x, dtype=float)
         mask = ~np.isnan(x)
@@ -379,7 +389,7 @@ def plot_combined_predictors(layer_df: pd.DataFrame, behavior: str, output_path:
 
     ax2 = ax1.twinx()
     ax2.plot(layers, sub["steered_acc_mean"].values, "s-", color=color_st,
-             linewidth=2.5, markersize=6, label="Steered acc (test, α=1)")
+             linewidth=2.5, markersize=6, label=f"Steered acc (test, {alpha_tag})")
     ax2.set_ylabel("Steered P(matching)", color=color_st, fontsize=11)
     ax2.tick_params(axis="y", labelcolor=color_st)
     ax2.set_ylim(0, 1.05)
@@ -388,7 +398,63 @@ def plot_combined_predictors(layer_df: pd.DataFrame, behavior: str, output_path:
     lines2, labels2 = ax2.get_legend_handles_labels()
     ax1.legend(lines1 + lines2, labels1 + labels2, loc="lower right", fontsize=8)
     ax1.set_title(
-        f"{behavior}: Train-side (d') vs Test-side (κ_a ρ) predictors of Steering",
+        f"{behavior}: Train-side (d') vs Test-side (κ_a ρ) predictors of Steering "
+        f"({alpha_tag})",
+        fontsize=12, fontweight="bold",
+    )
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close()
+
+
+def plot_sign_agreement_by_layer(layer_df: pd.DataFrame, behavior: str, output_path: Path):
+    """Per-layer accuracy of sign(κ_a) as a predictor of greedy_match_baseline.
+
+    Y axis: agreement rate = mean( (κ_a > 0) == greedy_match_baseline ).
+    Dashed line = majority-class baseline (what you'd get predicting the majority
+    label every time); solid gray = chance (0.5). A secondary line shows MCC on a
+    right axis (robust to class imbalance).
+    """
+    if layer_df.empty or "proj_sign_agreement" not in layer_df.columns:
+        return
+    sub = layer_df.dropna(subset=["proj_sign_agreement"])
+    if len(sub) < 3:
+        return
+    layers = sub["layer"].values
+    fig, ax1 = plt.subplots(figsize=(10, 5))
+
+    ax1.plot(layers, sub["proj_sign_agreement"].values, "o-",
+             color="#2E86AB", linewidth=2.5, markersize=7,
+             label="Agreement: sign(κ_a) = greedy_match")
+    if "proj_sign_majority_baseline" in sub.columns:
+        ax1.plot(layers, sub["proj_sign_majority_baseline"].values, "D--",
+                 color="gray", linewidth=1.5, markersize=5, alpha=0.7,
+                 label="Majority-class baseline")
+    ax1.axhline(0.5, color="red", linestyle=":", alpha=0.4, label="Chance (0.5)")
+    ax1.set_xlabel("Layer", fontsize=11)
+    ax1.set_ylabel("Binary sign agreement (N=50)", color="#2E86AB", fontsize=11)
+    ax1.tick_params(axis="y", labelcolor="#2E86AB")
+    ax1.set_ylim(0, 1.05)
+    ax1.set_xticks(layers)
+
+    if "proj_sign_mcc" in sub.columns:
+        ax2 = ax1.twinx()
+        ax2.plot(layers, sub["proj_sign_mcc"].values, "s-",
+                 color="#E94F37", linewidth=2, markersize=6,
+                 label="MCC (sign(κ_a) vs greedy_match)")
+        ax2.axhline(0, color="#E94F37", linestyle=":", alpha=0.3)
+        ax2.set_ylabel("Matthews correlation", color="#E94F37", fontsize=11)
+        ax2.tick_params(axis="y", labelcolor="#E94F37")
+        ax2.set_ylim(-1.05, 1.05)
+
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    if "proj_sign_mcc" in sub.columns:
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2, labels1 + labels2, loc="lower right", fontsize=8)
+    else:
+        ax1.legend(lines1, labels1, loc="lower right", fontsize=8)
+    ax1.set_title(
+        f"{behavior}: Does sign(κ_a) predict the unsteered model's greedy choice?",
         fontsize=12, fontweight="bold",
     )
     plt.tight_layout()
@@ -442,7 +508,29 @@ def plot_scatter_for_layer(per_prompt: pd.DataFrame, layer: int, behavior: str,
     rho, sp = scipy_stats.spearmanr(valid["kappa_a"], valid["baseline_p_match"])
     r, pr = scipy_stats.pearsonr(valid["kappa_a"], valid["baseline_p_match"])
 
+    # Binary-agreement stats: sign(κ_a) vs greedy_match_baseline.
+    sign_df = ldf[["kappa_a", "greedy_match_baseline"]].dropna()
+    pred = (sign_df["kappa_a"].values > 0).astype(int)
+    actual = sign_df["greedy_match_baseline"].astype(int).values
+    sign_acc = float((pred == actual).mean()) if len(actual) else float("nan")
+    tp = int(((pred == 1) & (actual == 1)).sum())
+    tn = int(((pred == 0) & (actual == 0)).sum())
+    fp = int(((pred == 1) & (actual == 0)).sum())
+    fn = int(((pred == 0) & (actual == 1)).sum())
+    majority = (
+        max(actual.sum(), len(actual) - actual.sum()) / len(actual)
+        if len(actual) else float("nan")
+    )
+
     fig, ax = plt.subplots(figsize=(8, 5))
+
+    # Shade quadrants: top-right and bottom-left are "sign(κ_a) agrees with
+    # greedy_match (using P_base>0.5 as the continuous proxy for match=1)".
+    xlim = (float(min(valid["kappa_a"].min(), -1.2)),
+            float(max(valid["kappa_a"].max(), 1.2)))
+    ax.axvspan(0, xlim[1], ymin=0.5, ymax=1.0, color="#2ca02c", alpha=0.06, zorder=0)
+    ax.axvspan(xlim[0], 0, ymin=0.0, ymax=0.5, color="#d62728", alpha=0.06, zorder=0)
+
     match_col = np.where(ldf["greedy_match_baseline"] > 0.5, "#2ca02c", "#d62728")
     ax.scatter(ldf["kappa_a"], ldf["baseline_p_match"], s=60, c=match_col,
                edgecolors="k", linewidths=0.5, zorder=3, alpha=0.85)
@@ -451,16 +539,21 @@ def plot_scatter_for_layer(per_prompt: pd.DataFrame, layer: int, behavior: str,
     ax.plot(xr, np.polyval(z, xr), "--", color="black", alpha=0.5, linewidth=1.5)
 
     ax.axvline(x=-1, color="#d62728", linestyle=":", alpha=0.4, label="κ=−1 (μ⁻)")
-    ax.axvline(x=0, color="gray", linestyle=":", alpha=0.4, label="κ=0 (μ)")
+    ax.axvline(x=0, color="gray", linestyle="--", alpha=0.6,
+               label="κ=0 decision boundary")
     ax.axvline(x=+1, color="#2ca02c", linestyle=":", alpha=0.4, label="κ=+1 (μ⁺)")
     ax.axhline(y=0.5, color="gray", linestyle="-", alpha=0.25)
+    ax.set_xlim(xlim)
 
     ax.set_xlabel("κ_a  (projection onto diff-in-means line)", fontsize=10)
     ax.set_ylabel("Baseline P(matching)", fontsize=10)
     ax.set_title(
         f"{behavior} — Layer {layer}: κ_a vs baseline behavior score\n"
-        f"Spearman ρ={rho:+.3f} (p={sp:.3g}), Pearson r={r:+.3f} (p={pr:.3g})",
-        fontsize=11, fontweight="bold",
+        f"Continuous: Spearman ρ={rho:+.3f} (p={sp:.3g}), Pearson r={r:+.3f} (p={pr:.3g})\n"
+        f"Binary sign(κ_a) vs greedy_match: acc={sign_acc:.2f} "
+        f"(majority baseline={majority:.2f}); "
+        f"TP={tp} TN={tn} FP={fp} FN={fn}",
+        fontsize=10, fontweight="bold",
     )
     ax.legend(fontsize=8, loc="best")
     plt.tight_layout()
@@ -535,6 +628,11 @@ def main():
                         help="Limit number of test prompts (default: use all).")
     parser.add_argument("--use_bf16", action="store_true", default=True)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--force_recompute", action="store_true",
+        help="Ignore any existing per_prompt_results.csv in out_dir and redo "
+             "all baseline + steered forward passes.",
+    )
     args = parser.parse_args()
 
     if args.steering_factor is not None:
@@ -558,9 +656,6 @@ def main():
     logger.warning(f"Discovered layers: {layers}")
 
     out_dir = Path(args.output_dir) if args.output_dir else sweep_dir / "mcqa_analysis"
-    if out_dir.exists():
-        logger.warning(f"Removing existing {out_dir}")
-        shutil.rmtree(out_dir)
     (out_dir / "plots").mkdir(parents=True, exist_ok=True)
 
     test_path = Path(args.test_path or TEST_PATH_MAP[args.behavior])
@@ -584,15 +679,41 @@ def main():
         prefix_length = get_prefix_length(tokenizer)
     logger.warning(f"Steering prefix_length = {prefix_length}")
 
-    logger.warning(f"Loading model {args.model_name}...")
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_name,
-        torch_dtype=torch.bfloat16 if args.use_bf16 else None,
-        device_map=device,
-    )
-    model.eval()
+    # ----------------------------------------------------------------------
+    # Reuse previous results if per_prompt_results.csv already covers every
+    # requested (factor, layer) pair. No separate cache files needed -- that
+    # CSV already contains log-probs, greedy letters, kappa_a, etc.
+    # ----------------------------------------------------------------------
+    per_prompt_csv = out_dir / "per_prompt_results.csv"
+    cached_df = None
+    if (not args.force_recompute) and per_prompt_csv.exists():
+        try:
+            df = pd.read_csv(per_prompt_csv)
+            have = set(
+                (float(f), int(l))
+                for f, l in zip(df["steering_factor"], df["layer"])
+            )
+            want = set((float(f), int(l)) for f in factors for l in layers)
+            missing = want - have
+            if not missing:
+                cached_df = df
+                logger.warning(
+                    f"Reusing existing {per_prompt_csv} "
+                    f"(covers all {len(want)} (factor, layer) pairs). "
+                    f"Pass --force_recompute to redo forward passes."
+                )
+            else:
+                logger.warning(
+                    f"{per_prompt_csv} exists but is missing "
+                    f"{len(missing)} (factor, layer) pairs "
+                    f"(e.g. {sorted(missing)[:3]}); recomputing from scratch."
+                )
+        except Exception as e:
+            logger.warning(f"Could not reuse {per_prompt_csv}: {e}")
+    need_model = cached_df is None
 
-    # Load steering artifacts
+    # Steering artifacts: always needed (kappa recompute if need_model; dprime
+    # for summaries/plots regardless).
     steering_vecs = {}
     mu_poss, mu_negs, dprimes = {}, {}, {}
     for l in layers:
@@ -600,293 +721,319 @@ def main():
         w = torch.load(layer_dir / "DiffMean_weight.pt", map_location="cpu")
         if w.dim() == 2:
             w = w.squeeze(0)
-        steering_vecs[l] = w.to(device)
+        steering_vecs[l] = w.to(device) if need_model else w
         mu_poss[l] = torch.load(layer_dir / "mu_pos.pt", map_location="cpu")
         mu_negs[l] = torch.load(layer_dir / "mu_neg.pt", map_location="cpu")
         with open(layer_dir / "separability.json") as f:
             dprimes[l] = json.load(f).get("dprime")
 
-    # ----------------------------------------------------------------------
-    # Pre-tokenize all (prompt, candidate) pairs once.
-    # MCQA rows are *not* always (A, B): e.g. some survival-instinct rows are
-    # (A, C) or (A, E). Candidates come from this row's actual
-    # answer_matching_behavior / answer_not_matching_behavior.
-    # ----------------------------------------------------------------------
-    # For each prompt j, store prompt_meta[j] = {matching_letter, notmatch_letter}.
-    # For tokenization, store per-prompt dict keyed by that row's letters.
-    prompt_meta = []
-    pre_tok = []
-    dropped = 0
-    for j, item in enumerate(test_data):
-        q = item["question"]
-        matching_letter = extract_matching_letter(item["answer_matching_behavior"])
-        notmatch_letter = extract_matching_letter(item["answer_not_matching_behavior"])
-        if matching_letter == notmatch_letter:
-            logger.warning(
-                f"Prompt {j}: matching and not-matching letters both "
-                f"'{matching_letter}'; skipping."
-            )
-            prompt_meta.append(None)
-            pre_tok.append(None)
-            dropped += 1
-            continue
-        row = {}
-        for letter in (matching_letter, notmatch_letter):
-            cand = f" ({letter})"
-            prompt_ids, full_ids, letter_pos = build_prompt_and_full_ids(tokenizer, q, cand)
-            row[letter] = {
-                "full_ids": full_ids,
-                "prompt_len": len(prompt_ids),
-                "letter_pos": letter_pos,
-            }
-        pre_tok.append(row)
-        prompt_meta.append({
-            "matching_letter": matching_letter,
-            "notmatch_letter": notmatch_letter,
-        })
-    if dropped:
+    model = None
+    if need_model:
+        logger.warning(f"Loading model {args.model_name}...")
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_name,
+            torch_dtype=torch.bfloat16 if args.use_bf16 else None,
+            device_map=device,
+        )
+        model.eval()
+    else:
         logger.warning(
-            f"Dropped {dropped} malformed prompt(s); "
-            f"continuing with {len(test_data) - dropped} prompts."
+            "All requested (factor, layer) pairs already present in "
+            f"{per_prompt_csv.name}; skipping model load + forward passes."
         )
 
-    # Flatten into a single list of "items" we batch: (prompt_idx, letter, role).
-    flat_items = []
-    for j, row in enumerate(pre_tok):
-        if row is None:
-            continue
-        meta = prompt_meta[j]
-        for role, letter in (
-            ("match", meta["matching_letter"]),
-            ("notmatch", meta["notmatch_letter"]),
-        ):
-            e = row[letter]
-            flat_items.append({
-                "prompt_idx": j,
-                "letter": letter,
-                "role": role,
-                "full_ids": e["full_ids"],
-                "prompt_len": e["prompt_len"],
-                "letter_pos": e["letter_pos"],
-            })
-
-    B = args.batch_size
-    n_items = len(flat_items)
-
-    # ----------------------------------------------------------------------
-    # Phase A - batched baseline forward + per-layer activation capture.
-    # Activations are stored per (prompt_idx, letter) at the letter token position.
-    # ----------------------------------------------------------------------
-    logger.warning(f"\n=== Phase A: batched baseline forward (B={B}, {n_items} items) ===")
-    pad_id = tokenizer.pad_token_id
-    baseline_logps = {}  # (j, role) -> float         role in {"match", "notmatch"}
-    act_at_letter = {}  # (j, role, layer) -> tensor [hidden] on cpu
-    for start in tqdm(range(0, n_items, B), desc="Baseline batches"):
-        batch = flat_items[start:start + B]
-        token_lists = [b["full_ids"] for b in batch]
-        input_ids, attn, lens = pad_batch(token_lists, pad_id, device)
-        logits, layer_hiddens = forward_capture_batch(model, input_ids, attn, layers)
-        prompt_lens = [b["prompt_len"] for b in batch]
-        logps = batched_answer_logprobs(logits, input_ids, prompt_lens, lens)
-        for i, b in enumerate(batch):
-            baseline_logps[(b["prompt_idx"], b["role"])] = logps[i]
-            for l in layers:
-                act_at_letter[(b["prompt_idx"], b["role"], l)] = (
-                    layer_hiddens[l][i, b["letter_pos"], :].float().cpu()
+    if not need_model:
+        # Reuse everything from per_prompt_results.csv; skip tokenization,
+        # Phase A, Phase B, kappa recompute, assembly, and generations dumps
+        # (the old jsonls on disk remain valid).
+        per_prompt_df = cached_df
+    else:
+        # ------------------------------------------------------------------
+        # Pre-tokenize all (prompt, candidate) pairs once.
+        # MCQA rows are *not* always (A, B): e.g. some survival-instinct rows
+        # are (A, C) or (A, E). Candidates come from this row's actual
+        # answer_matching_behavior / answer_not_matching_behavior.
+        # ------------------------------------------------------------------
+        prompt_meta = []
+        pre_tok = []
+        dropped = 0
+        for j, item in enumerate(test_data):
+            q = item["question"]
+            matching_letter = extract_matching_letter(item["answer_matching_behavior"])
+            notmatch_letter = extract_matching_letter(item["answer_not_matching_behavior"])
+            if matching_letter == notmatch_letter:
+                logger.warning(
+                    f"Prompt {j}: matching and not-matching letters both "
+                    f"'{matching_letter}'; skipping."
                 )
-        del logits, layer_hiddens, input_ids, attn
-
-    # Build baseline_records from the log-probs; pick greedy-letter activation per layer.
-    baseline_records = []
-    for j, item in enumerate(test_data):
-        if prompt_meta[j] is None:
-            continue
-        matching_letter = prompt_meta[j]["matching_letter"]
-        notmatch_letter = prompt_meta[j]["notmatch_letter"]
-        logp_m = baseline_logps[(j, "match")]
-        logp_n = baseline_logps[(j, "notmatch")]
-        p_match = float(np.exp(logp_m) / (np.exp(logp_m) + np.exp(logp_n)))
-        is_match_greedy = logp_m > logp_n
-        greedy_letter = matching_letter if is_match_greedy else notmatch_letter
-        greedy_role = "match" if is_match_greedy else "notmatch"
-        greedy_match = int(is_match_greedy)
-        baseline_records.append({
-            "prompt_idx": j,
-            "question": item["question"],
-            "answer_matching_behavior": item["answer_matching_behavior"],
-            "answer_not_matching_behavior": item.get("answer_not_matching_behavior", ""),
-            "matching_letter": matching_letter,
-            "notmatch_letter": notmatch_letter,
-            "greedy_letter": greedy_letter,
-            "baseline_p_match": p_match,
-            "greedy_match_baseline": greedy_match,
-            "baseline_logp_match": float(logp_m),
-            "baseline_logp_notmatch": float(logp_n),
-            "activations": {
-                l: act_at_letter[(j, greedy_role, l)] for l in layers
-            },
-        })
-    del act_at_letter
-
-    # ----------------------------------------------------------------------
-    # Phase B - batched steered forward per factor per layer.
-    # ----------------------------------------------------------------------
-    # steered_map[factor][(layer, prompt_idx)] = dict(logp_A, logp_B, p_match_steered, ...)
-    steered_map = {f: {} for f in factors}
-
-    total_fwds = len(factors) * len(layers)
-    logger.warning(
-        f"\n=== Phase B: batched steered scoring (factors={factors}, "
-        f"{total_fwds} layer×factor combos, B={B}) ==="
-    )
-    outer = tqdm(total=total_fwds, desc="Steered fwds (factor×layer)")
-    for factor in factors:
-        for l in layers:
-            sv = steering_vecs[l]
-            per_item_logp = [None] * n_items
-            for start in range(0, n_items, B):
-                batch = flat_items[start:start + B]
-                token_lists = [b["full_ids"] for b in batch]
-                input_ids, attn, lens = pad_batch(token_lists, pad_id, device)
-                logits = forward_with_steering_batch(
-                    model, input_ids, attn, l, sv, factor, prefix_length,
-                )
-                prompt_lens = [b["prompt_len"] for b in batch]
-                logps = batched_answer_logprobs(logits, input_ids, prompt_lens, lens)
-                for i, b in enumerate(batch):
-                    per_item_logp[start + i] = (b["prompt_idx"], b["role"], logps[i])
-                del logits, input_ids, attn
-            # Aggregate per prompt: {role -> logp}.
-            by_prompt = {}
-            for pj, role, lp in per_item_logp:
-                by_prompt.setdefault(pj, {})[role] = lp
-            for j, item in enumerate(test_data):
-                if prompt_meta[j] is None:
-                    continue
-                ml = prompt_meta[j]["matching_letter"]
-                nl = prompt_meta[j]["notmatch_letter"]
-                logp_m = by_prompt[j]["match"]
-                logp_n = by_prompt[j]["notmatch"]
-                p_match_s = float(np.exp(logp_m) / (np.exp(logp_m) + np.exp(logp_n)))
-                is_match_greedy = logp_m > logp_n
-                greedy_letter_s = ml if is_match_greedy else nl
-                steered_map[factor][(l, j)] = {
-                    "p_match_steered": p_match_s,
-                    "greedy_match_steered": int(is_match_greedy),
-                    "greedy_letter_steered": greedy_letter_s,
-                    "steered_logp_match": float(logp_m),
-                    "steered_logp_notmatch": float(logp_n),
+                prompt_meta.append(None)
+                pre_tok.append(None)
+                dropped += 1
+                continue
+            row = {}
+            for letter in (matching_letter, notmatch_letter):
+                cand = f" ({letter})"
+                prompt_ids, full_ids, letter_pos = build_prompt_and_full_ids(tokenizer, q, cand)
+                row[letter] = {
+                    "full_ids": full_ids,
+                    "prompt_len": len(prompt_ids),
+                    "letter_pos": letter_pos,
                 }
-            outer.update(1)
-    outer.close()
+            pre_tok.append(row)
+            prompt_meta.append({
+                "matching_letter": matching_letter,
+                "notmatch_letter": notmatch_letter,
+            })
+        if dropped:
+            logger.warning(
+                f"Dropped {dropped} malformed prompt(s); "
+                f"continuing with {len(test_data) - dropped} prompts."
+            )
 
-    # ----------------------------------------------------------------------
-    # Precompute kappa_a per (layer, prompt) -- factor-independent.
-    # ----------------------------------------------------------------------
-    kappa_map = {}  # (layer, j) -> float
-    for l in layers:
-        mu_pos, mu_neg = mu_poss[l].float(), mu_negs[l].float()
-        v = (mu_pos - mu_neg)
-        v_norm_sq = float(v.dot(v))
-        mu = 0.5 * (mu_pos + mu_neg)
-        for rec in baseline_records:
-            j = rec["prompt_idx"]
-            act = rec["activations"][l]
-            if v_norm_sq < 1e-12:
-                kappa_map[(l, j)] = float("nan")
-            else:
-                kappa_map[(l, j)] = float(
-                    2.0 * (act - mu).dot(v).item() / v_norm_sq
-                )
-
-    # ----------------------------------------------------------------------
-    # Assemble per-prompt × per-layer × per-factor rows.
-    # ----------------------------------------------------------------------
-    per_prompt_rows = []
-    for factor in factors:
-        for rec in baseline_records:
-            j = rec["prompt_idx"]
-            for l in layers:
-                st = steered_map[factor][(l, j)]
-                per_prompt_rows.append({
-                    "steering_factor": factor,
-                    "layer": l,
+        # Flatten into a single list of "items" we batch: (prompt_idx, letter, role).
+        flat_items = []
+        for j, row in enumerate(pre_tok):
+            if row is None:
+                continue
+            meta = prompt_meta[j]
+            for role, letter in (
+                ("match", meta["matching_letter"]),
+                ("notmatch", meta["notmatch_letter"]),
+            ):
+                e = row[letter]
+                flat_items.append({
                     "prompt_idx": j,
+                    "letter": letter,
+                    "role": role,
+                    "full_ids": e["full_ids"],
+                    "prompt_len": e["prompt_len"],
+                    "letter_pos": e["letter_pos"],
+                })
+
+        B = args.batch_size
+        n_items = len(flat_items)
+
+        # ----------------------------------------------------------------------
+        # Phase A - batched baseline forward + per-layer activation capture.
+        # Activations are stored per (prompt_idx, letter) at the letter token position.
+        # ----------------------------------------------------------------------
+        logger.warning(
+            f"\n=== Phase A: batched baseline forward (B={B}, {n_items} items) ==="
+        )
+        pad_id = tokenizer.pad_token_id
+        baseline_logps = {}  # (j, role) -> float, role ∈ {"match","notmatch"}
+        act_at_letter = {}   # (j, role, layer) -> tensor [hidden] on cpu
+        for start in tqdm(range(0, n_items, B), desc="Baseline batches"):
+            batch = flat_items[start:start + B]
+            token_lists = [b["full_ids"] for b in batch]
+            input_ids, attn, lens = pad_batch(token_lists, pad_id, device)
+            logits, layer_hiddens = forward_capture_batch(model, input_ids, attn, layers)
+            prompt_lens = [b["prompt_len"] for b in batch]
+            logps = batched_answer_logprobs(logits, input_ids, prompt_lens, lens)
+            for i, b in enumerate(batch):
+                baseline_logps[(b["prompt_idx"], b["role"])] = logps[i]
+                for l in layers:
+                    act_at_letter[(b["prompt_idx"], b["role"], l)] = (
+                        layer_hiddens[l][i, b["letter_pos"], :].float().cpu()
+                    )
+            del logits, layer_hiddens, input_ids, attn
+
+        # Build baseline_records from the log-probs; pick greedy-letter activation
+        # per layer.
+        baseline_records = []
+        for j, item in enumerate(test_data):
+            if prompt_meta[j] is None:
+                continue
+            matching_letter = prompt_meta[j]["matching_letter"]
+            notmatch_letter = prompt_meta[j]["notmatch_letter"]
+            logp_m = baseline_logps[(j, "match")]
+            logp_n = baseline_logps[(j, "notmatch")]
+            p_match = float(np.exp(logp_m) / (np.exp(logp_m) + np.exp(logp_n)))
+            is_match_greedy = logp_m > logp_n
+            greedy_letter = matching_letter if is_match_greedy else notmatch_letter
+            greedy_role = "match" if is_match_greedy else "notmatch"
+            greedy_match = int(is_match_greedy)
+            baseline_records.append({
+                "prompt_idx": j,
+                "question": item["question"],
+                "answer_matching_behavior": item["answer_matching_behavior"],
+                "answer_not_matching_behavior": item.get("answer_not_matching_behavior", ""),
+                "matching_letter": matching_letter,
+                "notmatch_letter": notmatch_letter,
+                "greedy_letter": greedy_letter,
+                "baseline_p_match": p_match,
+                "greedy_match_baseline": greedy_match,
+                "baseline_logp_match": float(logp_m),
+                "baseline_logp_notmatch": float(logp_n),
+                "activations": {
+                    l: act_at_letter[(j, greedy_role, l)] for l in layers
+                },
+            })
+        del act_at_letter
+
+
+        # ----------------------------------------------------------------------
+        # Phase B - batched steered forward per factor per layer (cached per pair).
+        # ----------------------------------------------------------------------
+        # steered_map[factor][(layer, prompt_idx)] = dict(logp_match, logp_notmatch,
+        #                                                  p_match_steered, ...).
+        # We first populate from disk-cached (factor, layer) files, then compute
+        # any missing pairs and persist each one immediately.
+        steered_map = {f: {} for f in factors}
+        pad_id = tokenizer.pad_token_id
+
+        total_fwds = len(factors) * len(layers)
+        logger.warning(
+            f"\n=== Phase B: batched steered scoring (factors={factors}, "
+            f"{total_fwds} layer*factor combos, B={B}) ==="
+        )
+        outer = tqdm(total=total_fwds, desc="Steered fwds (factor*layer)")
+        for factor in factors:
+            for l in layers:
+                sv = steering_vecs[l]
+                per_item_logp = [None] * n_items
+                for start in range(0, n_items, B):
+                    batch = flat_items[start:start + B]
+                    token_lists = [b["full_ids"] for b in batch]
+                    input_ids, attn, lens = pad_batch(token_lists, pad_id, device)
+                    logits = forward_with_steering_batch(
+                        model, input_ids, attn, l, sv, factor, prefix_length,
+                    )
+                    prompt_lens = [b["prompt_len"] for b in batch]
+                    logps = batched_answer_logprobs(logits, input_ids, prompt_lens, lens)
+                    for i, b in enumerate(batch):
+                        per_item_logp[start + i] = (b["prompt_idx"], b["role"], logps[i])
+                    del logits, input_ids, attn
+                by_prompt = {}
+                for pj, role, lp in per_item_logp:
+                    by_prompt.setdefault(pj, {})[role] = lp
+                for j, item in enumerate(test_data):
+                    if prompt_meta[j] is None:
+                        continue
+                    ml = prompt_meta[j]["matching_letter"]
+                    nl = prompt_meta[j]["notmatch_letter"]
+                    logp_m = by_prompt[j]["match"]
+                    logp_n = by_prompt[j]["notmatch"]
+                    p_match_s = float(np.exp(logp_m) / (np.exp(logp_m) + np.exp(logp_n)))
+                    is_match_greedy = logp_m > logp_n
+                    greedy_letter_s = ml if is_match_greedy else nl
+                    steered_map[factor][(l, j)] = {
+                        "p_match_steered": p_match_s,
+                        "greedy_match_steered": int(is_match_greedy),
+                        "greedy_letter_steered": greedy_letter_s,
+                        "steered_logp_match": float(logp_m),
+                        "steered_logp_notmatch": float(logp_n),
+                    }
+                outer.update(1)
+        outer.close()
+
+        # ----------------------------------------------------------------------
+        # Precompute kappa_a per (layer, prompt) -- factor-independent.
+        # ----------------------------------------------------------------------
+        kappa_map = {}  # (layer, j) -> float
+        for l in layers:
+            mu_pos, mu_neg = mu_poss[l].float(), mu_negs[l].float()
+            v = (mu_pos - mu_neg)
+            v_norm_sq = float(v.dot(v))
+            mu = 0.5 * (mu_pos + mu_neg)
+            for rec in baseline_records:
+                j = rec["prompt_idx"]
+                act = rec["activations"][l]
+                if v_norm_sq < 1e-12:
+                    kappa_map[(l, j)] = float("nan")
+                else:
+                    kappa_map[(l, j)] = float(
+                        2.0 * (act - mu).dot(v).item() / v_norm_sq
+                    )
+
+        # ----------------------------------------------------------------------
+        # Assemble per-prompt × per-layer × per-factor rows.
+        # ----------------------------------------------------------------------
+        per_prompt_rows = []
+        for factor in factors:
+            for rec in baseline_records:
+                j = rec["prompt_idx"]
+                for l in layers:
+                    st = steered_map[factor][(l, j)]
+                    per_prompt_rows.append({
+                        "steering_factor": factor,
+                        "layer": l,
+                        "prompt_idx": j,
+                        "question": rec["question"],
+                        "answer_matching_behavior": rec["answer_matching_behavior"],
+                        "answer_not_matching_behavior": rec["answer_not_matching_behavior"],
+                        "matching_letter": rec["matching_letter"],
+                        "notmatch_letter": rec["notmatch_letter"],
+                        "greedy_letter_baseline": rec["greedy_letter"],
+                        "baseline_logp_match": rec["baseline_logp_match"],
+                        "baseline_logp_notmatch": rec["baseline_logp_notmatch"],
+                        "baseline_p_match": rec["baseline_p_match"],
+                        "greedy_match_baseline": rec["greedy_match_baseline"],
+                        "greedy_letter_steered": st["greedy_letter_steered"],
+                        "steered_logp_match": st["steered_logp_match"],
+                        "steered_logp_notmatch": st["steered_logp_notmatch"],
+                        "steered_p_match": st["p_match_steered"],
+                        "greedy_match_steered": st["greedy_match_steered"],
+                        "kappa_a": kappa_map[(l, j)],
+                    })
+
+        per_prompt_df = pd.DataFrame(per_prompt_rows)
+        per_prompt_df.to_csv(out_dir / "per_prompt_results.csv", index=False)
+        logger.warning(
+            f"Wrote {len(per_prompt_df)} per-prompt rows "
+            f"({len(factors)} factors × {len(layers)} layers × {len(test_data)} prompts) "
+            f"to {out_dir/'per_prompt_results.csv'}"
+        )
+
+        # ----------------------------------------------------------------------
+        # Generations dumps (human-readable).
+        # ----------------------------------------------------------------------
+        gens_dir = out_dir / "generations"
+        gens_dir.mkdir(exist_ok=True)
+        with open(gens_dir / "baseline.jsonl", "w", encoding="utf-8") as f:
+            for rec in baseline_records:
+                f.write(json.dumps({
+                    "prompt_idx": rec["prompt_idx"],
                     "question": rec["question"],
                     "answer_matching_behavior": rec["answer_matching_behavior"],
                     "answer_not_matching_behavior": rec["answer_not_matching_behavior"],
                     "matching_letter": rec["matching_letter"],
                     "notmatch_letter": rec["notmatch_letter"],
-                    "greedy_letter_baseline": rec["greedy_letter"],
+                    "baseline_greedy_letter": rec["greedy_letter"],
                     "baseline_logp_match": rec["baseline_logp_match"],
                     "baseline_logp_notmatch": rec["baseline_logp_notmatch"],
                     "baseline_p_match": rec["baseline_p_match"],
                     "greedy_match_baseline": rec["greedy_match_baseline"],
-                    "greedy_letter_steered": st["greedy_letter_steered"],
-                    "steered_logp_match": st["steered_logp_match"],
-                    "steered_logp_notmatch": st["steered_logp_notmatch"],
-                    "steered_p_match": st["p_match_steered"],
-                    "greedy_match_steered": st["greedy_match_steered"],
-                    "kappa_a": kappa_map[(l, j)],
-                })
-
-    per_prompt_df = pd.DataFrame(per_prompt_rows)
-    per_prompt_df.to_csv(out_dir / "per_prompt_results.csv", index=False)
-    logger.warning(
-        f"Wrote {len(per_prompt_df)} per-prompt rows "
-        f"({len(factors)} factors × {len(layers)} layers × {len(test_data)} prompts) "
-        f"to {out_dir/'per_prompt_results.csv'}"
-    )
-
-    # ----------------------------------------------------------------------
-    # Generations dumps (human-readable).
-    # ----------------------------------------------------------------------
-    gens_dir = out_dir / "generations"
-    gens_dir.mkdir(exist_ok=True)
-    with open(gens_dir / "baseline.jsonl", "w", encoding="utf-8") as f:
-        for rec in baseline_records:
-            f.write(json.dumps({
-                "prompt_idx": rec["prompt_idx"],
-                "question": rec["question"],
-                "answer_matching_behavior": rec["answer_matching_behavior"],
-                "answer_not_matching_behavior": rec["answer_not_matching_behavior"],
-                "matching_letter": rec["matching_letter"],
-                "notmatch_letter": rec["notmatch_letter"],
-                "baseline_greedy_letter": rec["greedy_letter"],
-                "baseline_logp_match": rec["baseline_logp_match"],
-                "baseline_logp_notmatch": rec["baseline_logp_notmatch"],
-                "baseline_p_match": rec["baseline_p_match"],
-                "greedy_match_baseline": rec["greedy_match_baseline"],
-            }, ensure_ascii=False) + "\n")
-    for factor in factors:
-        f_tag = f"{factor:g}"
-        for l in layers:
-            out_path = gens_dir / f"steered_layer_{l}_factor_{f_tag}.jsonl"
-            with open(out_path, "w", encoding="utf-8") as f:
-                for rec in baseline_records:
-                    j = rec["prompt_idx"]
-                    st = steered_map[factor][(l, j)]
-                    f.write(json.dumps({
-                        "prompt_idx": j,
-                        "layer": l,
-                        "steering_factor": factor,
-                        "question": rec["question"],
-                        "matching_letter": rec["matching_letter"],
-                        "notmatch_letter": rec["notmatch_letter"],
-                        "baseline_greedy_letter": rec["greedy_letter"],
-                        "steered_greedy_letter": st["greedy_letter_steered"],
-                        "flipped": bool(rec["greedy_letter"] != st["greedy_letter_steered"]),
-                        "baseline_p_match": rec["baseline_p_match"],
-                        "steered_p_match": st["p_match_steered"],
-                        "steered_logp_match": st["steered_logp_match"],
-                        "steered_logp_notmatch": st["steered_logp_notmatch"],
-                        "greedy_match_baseline": rec["greedy_match_baseline"],
-                        "greedy_match_steered": st["greedy_match_steered"],
-                    }, ensure_ascii=False) + "\n")
-    logger.warning(
-        f"Wrote generations to {gens_dir}/ "
-        f"(baseline.jsonl + {len(factors) * len(layers)} steered_layer_*_factor_*.jsonl)"
-    )
+                }, ensure_ascii=False) + "\n")
+        for factor in factors:
+            f_tag = f"{factor:g}"
+            for l in layers:
+                out_path = gens_dir / f"steered_layer_{l}_factor_{f_tag}.jsonl"
+                with open(out_path, "w", encoding="utf-8") as f:
+                    for rec in baseline_records:
+                        j = rec["prompt_idx"]
+                        st = steered_map[factor][(l, j)]
+                        f.write(json.dumps({
+                            "prompt_idx": j,
+                            "layer": l,
+                            "steering_factor": factor,
+                            "question": rec["question"],
+                            "matching_letter": rec["matching_letter"],
+                            "notmatch_letter": rec["notmatch_letter"],
+                            "baseline_greedy_letter": rec["greedy_letter"],
+                            "steered_greedy_letter": st["greedy_letter_steered"],
+                            "flipped": bool(rec["greedy_letter"] != st["greedy_letter_steered"]),
+                            "baseline_p_match": rec["baseline_p_match"],
+                            "steered_p_match": st["p_match_steered"],
+                            "steered_logp_match": st["steered_logp_match"],
+                            "steered_logp_notmatch": st["steered_logp_notmatch"],
+                            "greedy_match_baseline": rec["greedy_match_baseline"],
+                            "greedy_match_steered": st["greedy_match_steered"],
+                        }, ensure_ascii=False) + "\n")
+        logger.warning(
+            f"Wrote generations to {gens_dir}/ "
+            f"(baseline.jsonl + {len(factors) * len(layers)} steered_layer_*_factor_*.jsonl)"
+        )
 
     # ----------------------------------------------------------------------
     # Per-layer summaries, per factor.
@@ -925,6 +1072,52 @@ def main():
                     "proj_spearman_rho": np.nan, "proj_spearman_p": np.nan,
                     "proj_pearson_r": np.nan, "proj_pearson_p": np.nan,
                 })
+
+            # Sign classification: does sign(κ_a) predict greedy_match_baseline?
+            # Encoding: pred = 1 iff κ_a > 0 (positive side of centroid ⇒ "should
+            # show behavior"); actual = greedy_match_baseline (1 if unsteered model
+            # greedily picked matching answer).
+            sign_df = ldf[["kappa_a", "greedy_match_baseline"]].dropna()
+            if len(sign_df) >= 4:
+                pred = (sign_df["kappa_a"].values > 0).astype(int)
+                actual = sign_df["greedy_match_baseline"].astype(int).values
+                n_pos_pred = int(pred.sum())
+                n_pos_actual = int(actual.sum())
+                acc = float((pred == actual).mean())
+                majority = float(max(n_pos_actual, len(actual) - n_pos_actual) / len(actual))
+                # Matthews correlation coefficient (binary); robust to class imbalance.
+                # TP,FP,FN,TN
+                tp = int(((pred == 1) & (actual == 1)).sum())
+                tn = int(((pred == 0) & (actual == 0)).sum())
+                fp = int(((pred == 1) & (actual == 0)).sum())
+                fn = int(((pred == 0) & (actual == 1)).sum())
+                denom = np.sqrt(float(tp + fp) * (tp + fn) * (tn + fp) * (tn + fn))
+                mcc = float((tp * tn - fp * fn) / denom) if denom > 0 else 0.0
+                # Precision/recall for the positive class.
+                precision = float(tp / (tp + fp)) if (tp + fp) > 0 else float("nan")
+                recall = float(tp / (tp + fn)) if (tp + fn) > 0 else float("nan")
+                row.update({
+                    "proj_sign_agreement": acc,
+                    "proj_sign_majority_baseline": majority,
+                    "proj_sign_mcc": mcc,
+                    "proj_sign_precision_pos": precision,
+                    "proj_sign_recall_pos": recall,
+                    "proj_sign_n_pred_pos": n_pos_pred,
+                    "proj_sign_n_actual_pos": n_pos_actual,
+                    "proj_sign_tp": tp, "proj_sign_tn": tn,
+                    "proj_sign_fp": fp, "proj_sign_fn": fn,
+                })
+            else:
+                row.update({
+                    "proj_sign_agreement": np.nan,
+                    "proj_sign_majority_baseline": np.nan,
+                    "proj_sign_mcc": np.nan,
+                    "proj_sign_precision_pos": np.nan,
+                    "proj_sign_recall_pos": np.nan,
+                    "proj_sign_n_pred_pos": 0, "proj_sign_n_actual_pos": 0,
+                    "proj_sign_tp": 0, "proj_sign_tn": 0,
+                    "proj_sign_fp": 0, "proj_sign_fn": 0,
+                })
             all_layer_rows.append(row)
 
     layer_df_all = pd.DataFrame(all_layer_rows).sort_values(
@@ -943,7 +1136,10 @@ def main():
                 f"steered_acc={r['steered_acc_mean']:.3f} "
                 f"(greedy={r['steered_greedy_acc']:.2f})  "
                 f"Δ={r['delta_acc']:+.3f}  "
-                f"proj_ρ={r['proj_spearman_rho']:+.3f} (p={r['proj_spearman_p']:.2g})"
+                f"proj_ρ={r['proj_spearman_rho']:+.3f} (p={r['proj_spearman_p']:.2g})  "
+                f"sign_acc={r['proj_sign_agreement']:.2f} "
+                f"(maj={r['proj_sign_majority_baseline']:.2f}) "
+                f"mcc={r['proj_sign_mcc']:+.3f}"
             )
 
     # ----------------------------------------------------------------------
@@ -954,11 +1150,14 @@ def main():
         "baseline_acc_mean", "steered_acc_mean", "delta_acc",
         "baseline_greedy_acc", "steered_greedy_acc", "delta_greedy_acc",
         "proj_spearman_rho", "proj_pearson_r",
+        "proj_sign_agreement", "proj_sign_mcc",
     ]
     predictors = [
         ("dprime", "d'"),
         ("proj_spearman_rho", "κ_a→P_base ρ"),
         ("proj_pearson_r", "κ_a→P_base r"),
+        ("proj_sign_agreement", "sign(κ_a) acc"),
+        ("proj_sign_mcc", "sign(κ_a) MCC"),
     ]
     for factor in factors:
         sub = layer_df_all[layer_df_all["steering_factor"] == factor]
@@ -1005,26 +1204,31 @@ def main():
         fdir.mkdir(parents=True, exist_ok=True)
         sub_layer = layer_df_all[layer_df_all["steering_factor"] == factor].copy()
         sub_prompt = per_prompt_df[per_prompt_df["steering_factor"] == factor].copy()
-        title_suffix = f" (α={f_tag})"
+        # Inner plots now auto-detect α from the filtered frame; no need to bake it
+        # into the behavior string.
         plot_dprime_vs_steering(
-            sub_layer, args.behavior + title_suffix,
+            sub_layer, args.behavior,
             fdir / "dprime_vs_steering_by_layer.png",
         )
         plot_kappa_rho_vs_steering(
-            sub_layer, args.behavior + title_suffix,
+            sub_layer, args.behavior,
             fdir / "kappa_rho_vs_steering_by_layer.png",
         )
         plot_combined_predictors(
-            sub_layer, args.behavior + title_suffix,
+            sub_layer, args.behavior,
             fdir / "combined_predictors_vs_steering.png",
         )
         plot_projection_rho_by_layer(
-            sub_layer, args.behavior + title_suffix,
+            sub_layer, args.behavior + f" (α={f_tag})",
             fdir / "projection_rho_by_layer.png",
+        )
+        plot_sign_agreement_by_layer(
+            sub_layer, args.behavior + f" (α={f_tag})",
+            fdir / "projection_sign_agreement_by_layer.png",
         )
         for l in layers:
             plot_scatter_for_layer(
-                sub_prompt, l, args.behavior + title_suffix,
+                sub_prompt, l, args.behavior + f" (α={f_tag})",
                 fdir / f"projection_scatter_layer_{l}.png",
             )
 
