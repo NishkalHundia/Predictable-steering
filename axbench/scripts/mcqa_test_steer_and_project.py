@@ -564,6 +564,111 @@ def plot_scatter_for_layer(per_prompt: pd.DataFrame, layer: int, behavior: str,
 # ============================================================================
 # Cross-factor plots
 # ============================================================================
+def plot_steered_sign_agreement_for_factor(
+    prompt_df_factor: pd.DataFrame, factor: float,
+    behavior: str, output_path: Path,
+):
+    """
+    Per-factor version of projection_sign_agreement_by_layer.
+
+    For a single steering factor α, per layer:
+      - κ_a_steered = kappa_a + 2α   (exact: steering shifts projection by 2α)
+      - pred  = sign(κ_a_steered) > 0
+      - actual = greedy_match_steered   (did the STEERED model pick matching?)
+
+    This is different for every factor folder because:
+      - At α=0: same as baseline (κ_a_steered = κ_a)
+      - At α=3: points that were near the centroid get pushed past it; if their
+        steered score also flips to 1, agreement goes up. If the score doesn't
+        flip, they become disagreements.
+
+    Both agreement and MCC are plotted alongside the unsteered baseline for
+    comparison.
+    """
+    if prompt_df_factor.empty or "kappa_a" not in prompt_df_factor.columns:
+        return
+    layers = sorted(prompt_df_factor["layer"].unique())
+
+    agreements, mccs, majorities = [], [], []
+    baseline_agreements, baseline_mccs = [], []
+
+    for l in layers:
+        sub = prompt_df_factor[prompt_df_factor["layer"] == l][
+            ["kappa_a", "greedy_match_steered", "greedy_match_baseline"]
+        ].dropna()
+        if len(sub) < 4:
+            agreements.append(float("nan"))
+            mccs.append(float("nan"))
+            majorities.append(float("nan"))
+            baseline_agreements.append(float("nan"))
+            baseline_mccs.append(float("nan"))
+            continue
+
+        ka_steered = sub["kappa_a"].values + 2.0 * factor
+        pred_s = (ka_steered > 0).astype(int)
+        actual_s = sub["greedy_match_steered"].astype(int).values
+        agreements.append(float((pred_s == actual_s).mean()))
+        n_pos = int(actual_s.sum())
+        majorities.append(float(max(n_pos, len(actual_s) - n_pos) / len(actual_s)))
+        tp = int(((pred_s == 1) & (actual_s == 1)).sum())
+        tn = int(((pred_s == 0) & (actual_s == 0)).sum())
+        fp = int(((pred_s == 1) & (actual_s == 0)).sum())
+        fn = int(((pred_s == 0) & (actual_s == 1)).sum())
+        denom = np.sqrt(float(tp + fp) * (tp + fn) * (tn + fp) * (tn + fn))
+        mccs.append(float((tp * tn - fp * fn) / denom) if denom > 0 else 0.0)
+
+        # Baseline comparison (α=0: κ_a vs greedy_match_baseline).
+        pred_b = (sub["kappa_a"].values > 0).astype(int)
+        actual_b = sub["greedy_match_baseline"].astype(int).values
+        baseline_agreements.append(float((pred_b == actual_b).mean()))
+        tp = int(((pred_b == 1) & (actual_b == 1)).sum())
+        tn = int(((pred_b == 0) & (actual_b == 0)).sum())
+        fp = int(((pred_b == 1) & (actual_b == 0)).sum())
+        fn = int(((pred_b == 0) & (actual_b == 1)).sum())
+        denom = np.sqrt(float(tp + fp) * (tp + fn) * (tn + fp) * (tn + fn))
+        baseline_mccs.append(float((tp * tn - fp * fn) / denom) if denom > 0 else 0.0)
+
+    fig, ax1 = plt.subplots(figsize=(11, 5))
+    ax2 = ax1.twinx()
+
+    layers_arr = np.array(layers)
+    # Steered (this factor).
+    ax1.plot(layers_arr, agreements, "o-", color="#2E86AB", linewidth=2.5,
+             markersize=7, label=f"Agreement: sign(κ_a+2α) = greedy_match_steered  α={factor:g}")
+    ax1.plot(layers_arr, majorities, "D--", color="gray", linewidth=1.5,
+             markersize=5, alpha=0.6, label="Majority-class baseline (steered)")
+    ax1.axhline(0.5, color="red", linestyle=":", alpha=0.4, label="Chance (0.5)")
+    # Baseline overlay for comparison.
+    ax1.plot(layers_arr, baseline_agreements, "o:", color="#2E86AB", linewidth=1.2,
+             markersize=4, alpha=0.4, label="Agreement: baseline (α=0, for ref)")
+
+    ax2.plot(layers_arr, mccs, "s-", color="#E94F37", linewidth=2,
+             markersize=6, label=f"MCC steered α={factor:g}")
+    ax2.plot(layers_arr, baseline_mccs, "s:", color="#E94F37", linewidth=1.2,
+             markersize=4, alpha=0.4, label="MCC baseline (α=0, for ref)")
+    ax2.axhline(0, color="#E94F37", linestyle=":", alpha=0.3)
+    ax2.set_ylabel("Matthews correlation", color="#E94F37", fontsize=11)
+    ax2.tick_params(axis="y", labelcolor="#E94F37")
+    ax2.set_ylim(-1.05, 1.05)
+
+    ax1.set_xlabel("Layer", fontsize=11)
+    ax1.set_ylabel("Binary sign agreement", color="#2E86AB", fontsize=11)
+    ax1.tick_params(axis="y", labelcolor="#2E86AB")
+    ax1.set_ylim(0, 1.05)
+    ax1.set_xticks(layers_arr)
+    ax1.set_title(
+        f"{behavior} (α={factor:g}): sign(κ_a + 2α) vs steered greedy choice\n"
+        f"Solid = steered  ·  Dotted = unsteered baseline (for comparison)",
+        fontsize=11, fontweight="bold",
+    )
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, fontsize=8, loc="lower right")
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close()
+
+
 def plot_steered_sign_mcc_by_layer(per_prompt_df: pd.DataFrame, behavior: str,
                                     output_path: Path):
     """
@@ -769,6 +874,9 @@ def main():
     if not factors:
         logger.error("No steering factors (use --steering-factors STR or --steering_factor α)")
         sys.exit(1)
+    # Always include α=0 (baseline) so all sweep plots have an unsteered reference.
+    if 0.0 not in factors:
+        factors = sorted([0.0] + factors)
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -820,6 +928,31 @@ def main():
             )
             want = set((float(f), int(l)) for f in factors for l in layers)
             missing = want - have
+
+            # Special case: if the only missing pairs are factor 0, synthesize
+            # them from the baseline columns already in the CSV (no GPU needed).
+            missing_nonzero = {(f, l) for f, l in missing if f != 0.0}
+            if missing and not missing_nonzero:
+                logger.warning(
+                    f"factor=0 rows missing from {per_prompt_csv.name}; "
+                    f"synthesizing from baseline columns (no GPU needed)."
+                )
+                base_rows = df.drop_duplicates(
+                    subset=["layer", "prompt_idx"]
+                ).copy()
+                # Pick one representative factor's rows to clone as factor=0.
+                rep_factor = df["steering_factor"].iloc[0]
+                base_rows = df[df["steering_factor"] == rep_factor].copy()
+                base_rows["steering_factor"] = 0.0
+                base_rows["greedy_letter_steered"] = base_rows["greedy_letter_baseline"]
+                base_rows["steered_logp_match"] = base_rows["baseline_logp_match"]
+                base_rows["steered_logp_notmatch"] = base_rows["baseline_logp_notmatch"]
+                base_rows["steered_p_match"] = base_rows["baseline_p_match"]
+                base_rows["greedy_match_steered"] = base_rows["greedy_match_baseline"]
+                df = pd.concat([df, base_rows], ignore_index=True)
+                df.to_csv(per_prompt_csv, index=False)
+                missing = set()
+
             if not missing:
                 cached_df = df
                 logger.warning(
@@ -830,8 +963,8 @@ def main():
             else:
                 logger.warning(
                     f"{per_prompt_csv} exists but is missing "
-                    f"{len(missing)} (factor, layer) pairs "
-                    f"(e.g. {sorted(missing)[:3]}); recomputing from scratch."
+                    f"{len(missing_nonzero)} non-zero (factor, layer) pairs "
+                    f"(e.g. {sorted(missing_nonzero)[:3]}); recomputing from scratch."
                 )
         except Exception as e:
             logger.warning(f"Could not reuse {per_prompt_csv}: {e}")
@@ -1007,13 +1140,27 @@ def main():
         steered_map = {f: {} for f in factors}
         pad_id = tokenizer.pad_token_id
 
-        total_fwds = len(factors) * len(layers)
+        # Factor 0 = no steering: steered scores == baseline scores. No GPU work.
+        if 0.0 in factors:
+            for l in layers:
+                for rec in baseline_records:
+                    j = rec["prompt_idx"]
+                    steered_map[0.0][(l, j)] = {
+                        "p_match_steered": rec["baseline_p_match"],
+                        "greedy_match_steered": rec["greedy_match_baseline"],
+                        "greedy_letter_steered": rec["greedy_letter"],
+                        "steered_logp_match": rec["baseline_logp_match"],
+                        "steered_logp_notmatch": rec["baseline_logp_notmatch"],
+                    }
+
+        nonzero_factors = [f for f in factors if f != 0.0]
+        total_fwds = len(nonzero_factors) * len(layers)
         logger.warning(
-            f"\n=== Phase B: batched steered scoring (factors={factors}, "
+            f"\n=== Phase B: batched steered scoring (factors={nonzero_factors}, "
             f"{total_fwds} layer*factor combos, B={B}) ==="
         )
         outer = tqdm(total=total_fwds, desc="Steered fwds (factor*layer)")
-        for factor in factors:
+        for factor in nonzero_factors:
             for l in layers:
                 sv = steering_vecs[l]
                 per_item_logp = [None] * n_items
@@ -1349,7 +1496,11 @@ def main():
         )
         plot_sign_agreement_by_layer(
             sub_layer, args.behavior + f" (α={f_tag})",
-            fdir / "projection_sign_agreement_by_layer.png",
+            fdir / "projection_sign_agreement_by_layer_baseline.png",
+        )
+        plot_steered_sign_agreement_for_factor(
+            sub_prompt, factor, args.behavior,
+            fdir / "projection_sign_agreement_by_layer_steered.png",
         )
         for l in layers:
             plot_scatter_for_layer(
