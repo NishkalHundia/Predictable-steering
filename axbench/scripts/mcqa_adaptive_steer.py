@@ -22,8 +22,9 @@ Usage:
     uv run python axbench/scripts/mcqa_adaptive_steer.py \
         --behavior corrigible-neutral-HHH \
         --model_name google/gemma-2-9b-it \
-        --sweep_dir results/mcqa_sweep/gemma-2-9b-it/corrigible-neutral-HHH \
-        --steering-factors=1,2,3,5,10
+        --layers 10-32 \
+        --max_examples 300 \
+        --steering-factors 1,2,3,5,7,10
 """
 import json
 import re
@@ -61,21 +62,34 @@ TEST_PATH_MAP = {
     ]
 }
 
+TRAIN_PATH_MAP = {
+    b: f"datasets/raw/{b}/dataset.json"
+    for b in [
+        "sycophancy", "survival-instinct", "corrigible-neutral-HHH",
+        "hallucination", "refusal", "myopic-reward", "coordinate-other-ais",
+    ]
+}
+
 
 # ============================================================================
-# Tokenization helpers (same as mcqa_test_steer_and_project.py)
+# Tokenization / layer helpers
 # ============================================================================
 def supports_chat_template(tokenizer) -> bool:
     return getattr(tokenizer, "chat_template", None) not in (None, "")
 
 
-def discover_layers(sweep_dir: Path) -> list:
-    layers = []
-    for d in sweep_dir.iterdir():
-        if d.is_dir() and d.name.startswith("layer_"):
-            if (d / "DiffMean_weight.pt").exists() and (d / "mu_pos.pt").exists():
-                layers.append(int(d.name.split("_")[1]))
-    return sorted(layers)
+def parse_layer_range(spec: str) -> list:
+    """Accept '10-32' or '10,15,20,32'."""
+    if "-" in spec and "," not in spec:
+        lo, hi = spec.split("-")
+        return list(range(int(lo), int(hi) + 1))
+    return sorted(int(x) for x in spec.split(","))
+
+
+def compute_dprime(pos: np.ndarray, neg: np.ndarray) -> float:
+    gap = abs(pos.mean() - neg.mean())
+    pooled = np.sqrt(0.5 * (pos.var() + neg.var()))
+    return float(gap / pooled) if pooled > 1e-12 else 0.0
 
 
 def extract_matching_letter(answer_str: str) -> str:
@@ -424,17 +438,22 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="MCQA per-prompt adaptive steering (project each prompt to c+).",
+        description="MCQA per-prompt adaptive steering (project each prompt to c+). "
+                    "Self-contained: computes DiffMean vectors from training data inline.",
     )
     parser.add_argument("--behavior", type=str, required=True,
                         choices=list(TEST_PATH_MAP.keys()))
     parser.add_argument("--model_name", type=str, default="google/gemma-2-9b-it")
-    parser.add_argument("--sweep_dir", type=str, required=True,
-                        help="Output of mcqa_train_diffmean_sweep.py")
+    parser.add_argument("--train_path", type=str, default=None,
+                        help="Default: datasets/raw/<behavior>/dataset.json")
     parser.add_argument("--test_path", type=str, default=None,
                         help="Default: datasets/test/<behavior>/test_dataset_ab.json")
     parser.add_argument("--output_dir", type=str, default=None,
-                        help="Default: <sweep_dir>/mcqa_adaptive")
+                        help="Default: results/mcqa_adaptive/<model>/<behavior>")
+    parser.add_argument("--layers", type=str, default="10-32",
+                        help="Layer range '10-32' or list '10,15,20'. Default: 10-32.")
+    parser.add_argument("--max_examples", type=int, default=300,
+                        help="Max training pairs for DiffMean (randomly sampled). Default: 300.")
     parser.add_argument(
         "--steering-factors", "--steering_factors", "--factors",
         dest="steering_factors",
@@ -442,7 +461,9 @@ def main():
         default="1,2,3",
         help="Comma-separated fixed factors for comparison (e.g. 1,2,3,5,10).",
     )
-    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--batch_size", type=int, default=16,
+                        help="Sequences per forward pass. Effective GPU batch for Phase B "
+                             "is batch_size * (1 + len(fixed_factors)). Reduce if OOM.")
     parser.add_argument("--max_test", type=int, default=None,
                         help="Limit number of test prompts (default: use all).")
     parser.add_argument("--use_bf16", action="store_true", default=True)
@@ -455,21 +476,36 @@ def main():
     if not fixed_factors:
         logger.warning("No fixed factors specified; only adaptive steering will be run.")
 
+    import random
+    random.seed(args.seed)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    sweep_dir = Path(args.sweep_dir)
-    layers = discover_layers(sweep_dir)
-    if not layers:
-        logger.error(f"No trained layers in {sweep_dir}")
-        sys.exit(1)
-    logger.warning(f"Discovered layers: {layers}")
+    layers = parse_layer_range(args.layers)
+    logger.warning(f"Target layers: {layers}")
 
-    out_dir = Path(args.output_dir) if args.output_dir else sweep_dir / "mcqa_adaptive"
+    model_short = args.model_name.split("/")[-1]
+    out_dir = (
+        Path(args.output_dir) if args.output_dir
+        else Path("results") / "mcqa_adaptive" / model_short / args.behavior
+    )
     (out_dir / "plots").mkdir(parents=True, exist_ok=True)
 
+    train_path = Path(args.train_path or TRAIN_PATH_MAP[args.behavior])
     test_path = Path(args.test_path or TEST_PATH_MAP[args.behavior])
-    logger.warning(f"Loading test set: {test_path}")
+
+    logger.warning(f"Loading training data: {train_path}")
+    with open(train_path) as f:
+        train_data = json.load(f)
+    if args.max_examples is not None and args.max_examples < len(train_data):
+        import random as _rnd
+        indices = _rnd.sample(range(len(train_data)), args.max_examples)
+        train_data = [train_data[i] for i in sorted(indices)]
+        logger.warning(f"  Subsampled to {len(train_data)} pairs (seed={args.seed})")
+    else:
+        logger.warning(f"  {len(train_data)} training pairs")
+
+    logger.warning(f"Loading test data: {test_path}")
     with open(test_path) as f:
         test_data = json.load(f)
     if args.max_test is not None:
@@ -489,26 +525,6 @@ def main():
         prefix_length = get_prefix_length(tokenizer)
     logger.warning(f"Steering prefix_length = {prefix_length}")
 
-    # ------------------------------------------------------------------
-    # Load per-layer steering artifacts
-    # ------------------------------------------------------------------
-    steering_vecs = {}
-    mu_poss, mu_negs, dprimes = {}, {}, {}
-    for l in layers:
-        layer_dir = sweep_dir / f"layer_{l}"
-        w = torch.load(layer_dir / "DiffMean_weight.pt", map_location="cpu")
-        if w.dim() == 2:
-            w = w.squeeze(0)
-        steering_vecs[l] = w.to(device)
-        mu_poss[l] = torch.load(layer_dir / "mu_pos.pt", map_location="cpu").float()
-        mu_negs[l] = torch.load(layer_dir / "mu_neg.pt", map_location="cpu").float()
-        dprime_path = layer_dir / "separability.json"
-        if dprime_path.exists():
-            with open(dprime_path) as f:
-                dprimes[l] = json.load(f).get("dprime")
-        else:
-            dprimes[l] = float("nan")
-
     logger.warning(f"Loading model {args.model_name}...")
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name,
@@ -516,6 +532,99 @@ def main():
         device_map=device,
     )
     model.eval()
+
+    # ------------------------------------------------------------------
+    # Phase 0: Compute DiffMean vectors from training data.
+    #
+    # For each training pair (question, answer_matching, answer_not_matching):
+    #   - tokenize both as [user: question | assistant: answer]
+    #   - one batched forward pass captures all target layers at once
+    #   - extract activation at the answer-letter token position
+    #   - accumulate pos/neg sums per layer
+    # Then: mu_pos = mean(pos_acts), mu_neg = mean(neg_acts), v = mu_pos - mu_neg.
+    # ------------------------------------------------------------------
+    logger.warning(
+        f"\n=== Phase 0: DiffMean training pass "
+        f"({len(train_data)} pairs × 2, {len(layers)} layers, B={args.batch_size}) ==="
+    )
+
+    # Build flat training items (one per (example, answer-class)).
+    train_flat = []
+    train_dropped = 0
+    for item in train_data:
+        q = item["question"]
+        for answer, label in [
+            (item["answer_matching_behavior"], 1),
+            (item["answer_not_matching_behavior"], 0),
+        ]:
+            try:
+                prompt_ids, full_ids, letter_pos = build_prompt_and_full_ids(
+                    tokenizer, q, answer
+                )
+            except (RuntimeError, ValueError):
+                train_dropped += 1
+                continue
+            train_flat.append({
+                "full_ids": full_ids,
+                "prompt_len": len(prompt_ids),
+                "letter_pos": letter_pos,
+                "label": label,
+            })
+    if train_dropped:
+        logger.warning(f"  Dropped {train_dropped} malformed training items.")
+    logger.warning(f"  {len(train_flat)} training items after filtering.")
+
+    # Accumulate per-layer activations at the letter position.
+    pos_acts = {l: [] for l in layers}
+    neg_acts = {l: [] for l in layers}
+    B = args.batch_size
+    pad_id = tokenizer.pad_token_id
+
+    for start in tqdm(range(0, len(train_flat), B), desc="Phase 0 batches"):
+        batch = train_flat[start:start + B_train]
+        token_lists = [b["full_ids"] for b in batch]
+        input_ids, attn, _ = pad_batch(token_lists, pad_id, device)
+        _, layer_hiddens = forward_capture_batch(model, input_ids, attn, layers)
+        for i, b in enumerate(batch):
+            for l in layers:
+                act = layer_hiddens[l][i, b["letter_pos"], :].float().cpu()
+                (pos_acts[l] if b["label"] == 1 else neg_acts[l]).append(act)
+        del layer_hiddens, input_ids, attn
+
+    # Compute steering vectors and d' per layer.
+    steering_vecs = {}
+    mu_poss, mu_negs, dprimes = {}, {}, {}
+    for l in layers:
+        if not pos_acts[l] or not neg_acts[l]:
+            logger.warning(f"Layer {l}: no pos or neg activations — skipping.")
+            continue
+        mu_pos = torch.stack(pos_acts[l]).mean(0)
+        mu_neg = torch.stack(neg_acts[l]).mean(0)
+        v = mu_pos - mu_neg
+        mu_poss[l] = mu_pos
+        mu_negs[l] = mu_neg
+        steering_vecs[l] = v.to(device)
+        # d': project training acts onto v_hat, compute signal-to-noise ratio.
+        v_norm_sq = float(v.dot(v))
+        mu_mid = 0.5 * (mu_pos + mu_neg)
+        if v_norm_sq > 1e-12:
+            pos_proj = np.array([
+                float(2.0 * (a - mu_mid).dot(v) / v_norm_sq) for a in pos_acts[l]
+            ])
+            neg_proj = np.array([
+                float(2.0 * (a - mu_mid).dot(v) / v_norm_sq) for a in neg_acts[l]
+            ])
+            dprimes[l] = compute_dprime(pos_proj, neg_proj)
+        else:
+            dprimes[l] = 0.0
+        logger.warning(
+            f"  Layer {l:2d}: ||v||={float(v.norm()):.4f}  d'={dprimes[l]:.3f}  "
+            f"n_pos={len(pos_acts[l])}  n_neg={len(neg_acts[l])}"
+        )
+
+    # Only keep layers where we successfully computed a steering vector.
+    layers = [l for l in layers if l in steering_vecs]
+    del pos_acts, neg_acts
 
     # ------------------------------------------------------------------
     # Pre-tokenize all (prompt, candidate) pairs
@@ -574,9 +683,7 @@ def main():
                 "letter_pos": e["letter_pos"],
             })
 
-    B = args.batch_size
     n_items = len(flat_items)
-    pad_id = tokenizer.pad_token_id
 
     # ------------------------------------------------------------------
     # Phase A: Batched baseline forward + per-layer activation capture
@@ -671,101 +778,102 @@ def main():
     del act_at_letter  # no longer needed
 
     # ------------------------------------------------------------------
-    # Phase B-adaptive: Per-layer batched forward passes with per-example factors.
+    # Phase B: Combined adaptive + fixed-factor steering in one pass per layer.
     #
-    # Both candidate sequences (match + notmatch) for prompt j use the same
-    # adaptive factor alpha_j(l). The factor is looked up by prompt_idx in the
-    # batch, so the vectorized per-example hook handles the rest.
+    # For each layer l and each batch of B flat_items, we replicate each
+    # sequence (1 + len(fixed_factors)) times in a single larger batch:
+    #
+    #   slots per item:  [adaptive_factor_j, fixed_f0, fixed_f1, ...]
+    #
+    # The per-example hook applies a different alpha to each slot, so all
+    # (adaptive + fixed) results come from ONE forward pass per layer instead
+    # of (1 + F) separate passes.  This is a ~(1+F)x speedup for Phase B at
+    # the cost of a (1+F)x larger batch size per pass.  Reduce --batch_size
+    # if you hit OOM (the effective GPU batch is B * (1 + len(fixed_factors))).
     # ------------------------------------------------------------------
-    logger.warning(f"\n=== Phase B-adaptive: Per-prompt adaptive steering "
-                   f"({len(layers)} layers) ===")
+    n_modes = 1 + len(fixed_factors)   # adaptive + one slot per fixed factor
+    eff_batch = B * n_modes
+    logger.warning(
+        f"\n=== Phase B: Combined adaptive + fixed steering "
+        f"({len(layers)} layers, {n_modes} modes, effective batch={eff_batch}) ==="
+    )
 
-    # adaptive_steered_map[(l, j)] -> dict(p_match, greedy_match, ...)
-    adaptive_steered_map = {}
+    adaptive_steered_map = {}               # (l, j) -> dict
+    fixed_steered_map = {}                  # (factor, l, j) -> dict
 
-    for l in tqdm(layers, desc="Adaptive steering layers"):
+    for l in tqdm(layers, desc="Phase B layers"):
         sv = steering_vecs[l]
-        per_item_logp = [None] * n_items
+
+        # Collect (prompt_idx, role, logp) per mode slot across all flat_items.
+        # Shape: per_mode_logp[mode_idx][item_idx] = (prompt_idx, role, logp)
+        per_mode_logp = [[None] * n_items for _ in range(n_modes)]
+
         for start in range(0, n_items, B):
             batch = flat_items[start:start + B]
-            token_lists = [b["full_ids"] for b in batch]
-            input_ids, attn, lens = pad_batch(token_lists, pad_id, device)
-            # Each item's factor = adaptive_factor_map[(l, prompt_idx)]
-            factors_batch = [
-                adaptive_factor_map.get((l, b["prompt_idx"]), 0.0) for b in batch
-            ]
+            Bi = len(batch)
+
+            # Build combined token list: for each item, one copy per mode.
+            combined_tokens = []
+            combined_factors = []
+            combined_prompt_lens = []
+            for b in batch:
+                j = b["prompt_idx"]
+                # Slot 0: adaptive factor for this prompt at this layer.
+                combined_tokens.append(b["full_ids"])
+                combined_factors.append(adaptive_factor_map.get((l, j), 0.0))
+                combined_prompt_lens.append(b["prompt_len"])
+                # Slots 1..F: fixed factors (same sequence, different alpha).
+                for f in fixed_factors:
+                    combined_tokens.append(b["full_ids"])
+                    combined_factors.append(f)
+                    combined_prompt_lens.append(b["prompt_len"])
+
+            input_ids, attn, lens = pad_batch(combined_tokens, pad_id, device)
             logits = forward_per_example_steering_batch(
-                model, input_ids, attn, l, sv, factors_batch, prefix_length,
+                model, input_ids, attn, l, sv, combined_factors, prefix_length,
             )
-            prompt_lens = [b["prompt_len"] for b in batch]
-            logps = answer_token_logprob_batch(logits, input_ids, prompt_lens, lens)
-            for i, b in enumerate(batch):
-                per_item_logp[start + i] = (b["prompt_idx"], b["role"], logps[i])
+            logps = answer_token_logprob_batch(logits, input_ids, combined_prompt_lens, lens)
             del logits, input_ids, attn
 
-        by_prompt = {}
-        for pj, role, lp in per_item_logp:
-            by_prompt.setdefault(pj, {})[role] = lp
+            # Unpack: combined batch is laid out as
+            #   [item0_mode0, item0_mode1, ..., item0_modeF,
+            #    item1_mode0, item1_mode1, ..., item1_modeF, ...]
+            for i, b in enumerate(batch):
+                global_idx = start + i
+                base = i * n_modes
+                for m in range(n_modes):
+                    per_mode_logp[m][global_idx] = (b["prompt_idx"], b["role"], logps[base + m])
 
+        # Decode mode 0 (adaptive) into adaptive_steered_map.
+        by_prompt = {}
+        for pj, role, lp in per_mode_logp[0]:
+            by_prompt.setdefault(pj, {})[role] = lp
         for rec in baseline_records:
             j = rec["prompt_idx"]
             logp_m = by_prompt[j]["match"]
             logp_n = by_prompt[j]["notmatch"]
             p_match_s = float(np.exp(logp_m) / (np.exp(logp_m) + np.exp(logp_n)))
-            is_match = logp_m > logp_n
             adaptive_steered_map[(l, j)] = {
                 "adaptive_p_match": p_match_s,
-                "adaptive_greedy_match": int(is_match),
+                "adaptive_greedy_match": int(logp_m > logp_n),
                 "adaptive_logp_match": float(logp_m),
                 "adaptive_logp_notmatch": float(logp_n),
             }
 
-    # ------------------------------------------------------------------
-    # Phase B-fixed: Uniform-factor steering for each fixed factor + layer.
-    # ------------------------------------------------------------------
-    if fixed_factors:
-        logger.warning(
-            f"\n=== Phase B-fixed: Uniform steering "
-            f"({len(fixed_factors)} factors × {len(layers)} layers) ==="
-        )
-
-    # fixed_steered_map[(factor, l, j)] -> dict(p_match, greedy_match)
-    fixed_steered_map = {}
-    total_fwds = len(fixed_factors) * len(layers)
-    outer = tqdm(total=total_fwds, desc="Fixed-factor fwds (factor × layer)")
-    for factor in fixed_factors:
-        for l in layers:
-            sv = steering_vecs[l]
-            per_item_logp = [None] * n_items
-            for start in range(0, n_items, B):
-                batch = flat_items[start:start + B]
-                token_lists = [b["full_ids"] for b in batch]
-                input_ids, attn, lens = pad_batch(token_lists, pad_id, device)
-                logits = forward_uniform_steering_batch(
-                    model, input_ids, attn, l, sv, factor, prefix_length,
-                )
-                prompt_lens = [b["prompt_len"] for b in batch]
-                logps = answer_token_logprob_batch(logits, input_ids, prompt_lens, lens)
-                for i, b in enumerate(batch):
-                    per_item_logp[start + i] = (b["prompt_idx"], b["role"], logps[i])
-                del logits, input_ids, attn
-
-            by_prompt = {}
-            for pj, role, lp in per_item_logp:
-                by_prompt.setdefault(pj, {})[role] = lp
-
+        # Decode modes 1..F (fixed factors) into fixed_steered_map.
+        for k, factor in enumerate(fixed_factors):
+            by_prompt_f = {}
+            for pj, role, lp in per_mode_logp[k + 1]:
+                by_prompt_f.setdefault(pj, {})[role] = lp
             for rec in baseline_records:
                 j = rec["prompt_idx"]
-                logp_m = by_prompt[j]["match"]
-                logp_n = by_prompt[j]["notmatch"]
+                logp_m = by_prompt_f[j]["match"]
+                logp_n = by_prompt_f[j]["notmatch"]
                 p_match_s = float(np.exp(logp_m) / (np.exp(logp_m) + np.exp(logp_n)))
-                is_match = logp_m > logp_n
                 fixed_steered_map[(factor, l, j)] = {
                     "fixed_p_match": p_match_s,
-                    "fixed_greedy_match": int(is_match),
+                    "fixed_greedy_match": int(logp_m > logp_n),
                 }
-            outer.update(1)
-    outer.close()
 
     # ------------------------------------------------------------------
     # Assemble per-prompt DataFrame
