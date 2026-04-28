@@ -778,75 +778,48 @@ def main():
     del act_at_letter  # no longer needed
 
     # ------------------------------------------------------------------
-    # Phase B: Combined adaptive + fixed-factor steering in one pass per layer.
+    # Phase B: Adaptive steering + fixed-factor steering, separate passes.
     #
-    # For each layer l and each batch of B flat_items, we replicate each
-    # sequence (1 + len(fixed_factors)) times in a single larger batch:
+    # Gemma-2 forces logits to float32 internally, making the logits tensor
+    # B × L × 256k × 4 bytes per forward pass. Combining multiple modes into
+    # a single larger batch causes OOM on 40 GB GPUs. We therefore run one
+    # forward pass per (mode, layer) at the normal batch size B.
     #
-    #   slots per item:  [adaptive_factor_j, fixed_f0, fixed_f1, ...]
-    #
-    # The per-example hook applies a different alpha to each slot, so all
-    # (adaptive + fixed) results come from ONE forward pass per layer instead
-    # of (1 + F) separate passes.  This is a ~(1+F)x speedup for Phase B at
-    # the cost of a (1+F)x larger batch size per pass.  Reduce --batch_size
-    # if you hit OOM (the effective GPU batch is B * (1 + len(fixed_factors))).
+    # Total passes: (1 + len(fixed_factors)) × len(layers).
     # ------------------------------------------------------------------
-    n_modes = 1 + len(fixed_factors)   # adaptive + one slot per fixed factor
-    eff_batch = B * n_modes
+    n_passes = (1 + len(fixed_factors)) * len(layers)
     logger.warning(
-        f"\n=== Phase B: Combined adaptive + fixed steering "
-        f"({len(layers)} layers, {n_modes} modes, effective batch={eff_batch}) ==="
+        f"\n=== Phase B: Adaptive + fixed steering "
+        f"({len(layers)} layers × {1 + len(fixed_factors)} modes = {n_passes} passes) ==="
     )
 
-    adaptive_steered_map = {}               # (l, j) -> dict
-    fixed_steered_map = {}                  # (factor, l, j) -> dict
+    adaptive_steered_map = {}    # (l, j) -> dict
+    fixed_steered_map = {}       # (factor, l, j) -> dict
 
-    for l in tqdm(layers, desc="Phase B layers"):
+    outer = tqdm(total=n_passes, desc="Phase B (mode × layer)")
+    for l in layers:
         sv = steering_vecs[l]
 
-        # Collect (prompt_idx, role, logp) per mode slot across all flat_items.
-        # Shape: per_mode_logp[mode_idx][item_idx] = (prompt_idx, role, logp)
-        per_mode_logp = [[None] * n_items for _ in range(n_modes)]
-
+        # --- Adaptive pass (per-example factors) ---
+        per_item_logp = [None] * n_items
         for start in range(0, n_items, B):
             batch = flat_items[start:start + B]
-            Bi = len(batch)
-
-            # Build combined token list: for each item, one copy per mode.
-            combined_tokens = []
-            combined_factors = []
-            combined_prompt_lens = []
-            for b in batch:
-                j = b["prompt_idx"]
-                # Slot 0: adaptive factor for this prompt at this layer.
-                combined_tokens.append(b["full_ids"])
-                combined_factors.append(adaptive_factor_map.get((l, j), 0.0))
-                combined_prompt_lens.append(b["prompt_len"])
-                # Slots 1..F: fixed factors (same sequence, different alpha).
-                for f in fixed_factors:
-                    combined_tokens.append(b["full_ids"])
-                    combined_factors.append(f)
-                    combined_prompt_lens.append(b["prompt_len"])
-
-            input_ids, attn, lens = pad_batch(combined_tokens, pad_id, device)
+            token_lists = [b["full_ids"] for b in batch]
+            input_ids, attn, lens = pad_batch(token_lists, pad_id, device)
+            factors_batch = [
+                adaptive_factor_map.get((l, b["prompt_idx"]), 0.0) for b in batch
+            ]
             logits = forward_per_example_steering_batch(
-                model, input_ids, attn, l, sv, combined_factors, prefix_length,
+                model, input_ids, attn, l, sv, factors_batch, prefix_length,
             )
-            logps = answer_token_logprob_batch(logits, input_ids, combined_prompt_lens, lens)
+            prompt_lens = [b["prompt_len"] for b in batch]
+            logps = answer_token_logprob_batch(logits, input_ids, prompt_lens, lens)
+            for i, b in enumerate(batch):
+                per_item_logp[start + i] = (b["prompt_idx"], b["role"], logps[i])
             del logits, input_ids, attn
 
-            # Unpack: combined batch is laid out as
-            #   [item0_mode0, item0_mode1, ..., item0_modeF,
-            #    item1_mode0, item1_mode1, ..., item1_modeF, ...]
-            for i, b in enumerate(batch):
-                global_idx = start + i
-                base = i * n_modes
-                for m in range(n_modes):
-                    per_mode_logp[m][global_idx] = (b["prompt_idx"], b["role"], logps[base + m])
-
-        # Decode mode 0 (adaptive) into adaptive_steered_map.
         by_prompt = {}
-        for pj, role, lp in per_mode_logp[0]:
+        for pj, role, lp in per_item_logp:
             by_prompt.setdefault(pj, {})[role] = lp
         for rec in baseline_records:
             j = rec["prompt_idx"]
@@ -859,11 +832,26 @@ def main():
                 "adaptive_logp_match": float(logp_m),
                 "adaptive_logp_notmatch": float(logp_n),
             }
+        outer.update(1)
 
-        # Decode modes 1..F (fixed factors) into fixed_steered_map.
-        for k, factor in enumerate(fixed_factors):
+        # --- Fixed-factor passes (uniform factor, batched across prompts) ---
+        for factor in fixed_factors:
+            per_item_logp = [None] * n_items
+            for start in range(0, n_items, B):
+                batch = flat_items[start:start + B]
+                token_lists = [b["full_ids"] for b in batch]
+                input_ids, attn, lens = pad_batch(token_lists, pad_id, device)
+                logits = forward_uniform_steering_batch(
+                    model, input_ids, attn, l, sv, factor, prefix_length,
+                )
+                prompt_lens = [b["prompt_len"] for b in batch]
+                logps = answer_token_logprob_batch(logits, input_ids, prompt_lens, lens)
+                for i, b in enumerate(batch):
+                    per_item_logp[start + i] = (b["prompt_idx"], b["role"], logps[i])
+                del logits, input_ids, attn
+
             by_prompt_f = {}
-            for pj, role, lp in per_mode_logp[k + 1]:
+            for pj, role, lp in per_item_logp:
                 by_prompt_f.setdefault(pj, {})[role] = lp
             for rec in baseline_records:
                 j = rec["prompt_idx"]
@@ -874,6 +862,9 @@ def main():
                     "fixed_p_match": p_match_s,
                     "fixed_greedy_match": int(logp_m > logp_n),
                 }
+            outer.update(1)
+
+    outer.close()
 
     # ------------------------------------------------------------------
     # Assemble per-prompt DataFrame
