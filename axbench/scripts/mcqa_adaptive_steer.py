@@ -581,7 +581,7 @@ def main():
     pad_id = tokenizer.pad_token_id
 
     for start in tqdm(range(0, len(train_flat), B), desc="Phase 0 batches"):
-        batch = train_flat[start:start + B_train]
+        batch = train_flat[start:start + B]
         token_lists = [b["full_ids"] for b in batch]
         input_ids, attn, _ = pad_batch(token_lists, pad_id, device)
         _, layer_hiddens = forward_capture_batch(model, input_ids, attn, layers)
