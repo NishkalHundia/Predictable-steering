@@ -313,18 +313,31 @@ def _plot_predictor_vs_steering(
     pred = sub[pred_col].values
     st = sub["steered_acc_mean"].values
     delta = st - sub["baseline_acc_mean"].values
+    def _safe_corr(x, y):
+        """Return (pearson_r, pearson_p, spearman_rho, spearman_p) or all nan if
+        either array is constant (undefined correlation)."""
+        if np.nanstd(x) < 1e-12 or np.nanstd(y) < 1e-12:
+            return float("nan"), float("nan"), float("nan"), float("nan")
+        r, p = scipy_stats.pearsonr(x, y)
+        rho, sp = scipy_stats.spearmanr(x, y)
+        return float(r), float(p), float(rho), float(sp)
+
     corr_lines = []
     if len(sub) >= 3:
-        r, p = scipy_stats.pearsonr(pred, st)
-        rho, sp = scipy_stats.spearmanr(pred, st)
-        corr_lines.append(
-            f"{pred_label} vs steered_acc:  r={r:+.3f} (p={p:.3f}), ρ={rho:+.3f} (p={sp:.3f})"
-        )
-        rd, pd_ = scipy_stats.pearsonr(pred, delta)
-        rhod, spd = scipy_stats.spearmanr(pred, delta)
-        corr_lines.append(
-            f"{pred_label} vs Δacc:         r={rd:+.3f} (p={pd_:.3f}), ρ={rhod:+.3f} (p={spd:.3f})"
-        )
+        r, p, rho, sp = _safe_corr(pred, st)
+        if not np.isnan(r):
+            corr_lines.append(
+                f"{pred_label} vs steered_acc:  r={r:+.3f} (p={p:.3f}), ρ={rho:+.3f} (p={sp:.3f})"
+            )
+        else:
+            corr_lines.append(f"{pred_label} vs steered_acc:  n/a (constant array)")
+        rd, pd_, rhod, spd = _safe_corr(pred, delta)
+        if not np.isnan(rd):
+            corr_lines.append(
+                f"{pred_label} vs Δacc:         r={rd:+.3f} (p={pd_:.3f}), ρ={rhod:+.3f} (p={spd:.3f})"
+            )
+        else:
+            corr_lines.append(f"{pred_label} vs Δacc:         n/a (constant array — likely α=0 or saturation)")
     if corr_lines:
         ax1.text(0.02, 0.98, "\n".join(corr_lines), transform=ax1.transAxes,
                  fontsize=8, verticalalignment="top", fontfamily="monospace",
@@ -1332,7 +1345,7 @@ def main():
                 "n_prompts": int(len(ldf)),
             }
             valid = ldf[["kappa_a", "baseline_p_match"]].dropna()
-            if len(valid) >= 4:
+            if len(valid) >= 4 and valid["kappa_a"].std() > 1e-12 and valid["baseline_p_match"].std() > 1e-12:
                 rho, sp = scipy_stats.spearmanr(valid["kappa_a"], valid["baseline_p_match"])
                 r, pr = scipy_stats.pearsonr(valid["kappa_a"], valid["baseline_p_match"])
                 row.update({
@@ -1443,6 +1456,8 @@ def main():
                 tv = sub[tgt].values
                 mask = ~(pd.isna(pv) | pd.isna(tv))
                 if mask.sum() < 3:
+                    continue
+                if np.std(pv[mask]) < 1e-12 or np.std(tv[mask]) < 1e-12:
                     continue
                 r, pr = scipy_stats.pearsonr(pv[mask], tv[mask])
                 rho, sp = scipy_stats.spearmanr(pv[mask], tv[mask])
