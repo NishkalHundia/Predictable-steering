@@ -132,25 +132,6 @@ def build_prompt_and_full_ids(tokenizer, question: str, candidate: str):
     return prompt_ids, full_ids, letter_pos
 
 
-def answer_token_logprob_batch(logits: torch.Tensor, input_ids: torch.Tensor,
-                                prompt_lens, lengths):
-    """Vectorized sum of log-probs over answer tokens. Returns list of floats."""
-    log_probs = torch.log_softmax(logits.float(), dim=-1)
-    results = []
-    for i in range(logits.shape[0]):
-        p_len = int(prompt_lens[i])
-        L_i = int(lengths[i])
-        if L_i <= p_len:
-            results.append(0.0)
-            continue
-        idx = torch.arange(p_len, L_i, device=logits.device)
-        token_ids = input_ids[i, idx]
-        dist = log_probs[i, idx - 1]
-        lp = dist.gather(-1, token_ids.unsqueeze(-1)).squeeze(-1).sum()
-        results.append(float(lp.item()))
-    return results
-
-
 def pad_batch(token_lists, pad_id: int, device):
     """Right-pad a list of token id lists. Returns input_ids, attention_mask, lengths."""
     max_len = max(len(t) for t in token_lists)
@@ -214,58 +195,94 @@ def make_per_example_steering_hook(steering_vec: torch.Tensor, factors: list,
 
 
 @torch.no_grad()
-def forward_capture_batch(model, input_ids, attention_mask, target_layers):
-    """Batched forward pass with per-layer hidden-state capture.
+def capture_and_greedy_decode_batch(model, input_ids, attention_mask,
+                                     target_layers, open_paren_positions):
+    """
+    Phase A utility: capture all-layer hidden states AND predict the next token
+    at each item's open_paren_position, all without materialising full logits.
 
-    Returns logits [B, L, V] and layer_hiddens {layer: [B, L, H]}.
+    open_paren_positions: list[int] length B — index of the '(' token in each
+        sequence. lm_head applied at this position gives P(next token | prefix),
+        i.e. what the model would greedily generate after '('.
+
+    Returns:
+        next_token_ids : list[int] length B
+        layer_hiddens  : {layer: tensor [B, L, H]}  (on CPU, float32)
     """
     storage = {}
-    handles = []
-    for l in target_layers:
-        h = model.model.layers[l].register_forward_hook(
+    handles = [
+        model.model.layers[l].register_forward_hook(
             make_capture_hook(storage, l), always_call=True,
         )
-        handles.append(h)
-    out = model(input_ids=input_ids, attention_mask=attention_mask)
-    for h in handles:
-        h.remove()
-    return out.logits, {l: storage[l] for l in target_layers}
-
-
-@torch.no_grad()
-def forward_uniform_steering_batch(model, input_ids, attention_mask,
-                                    steering_layer: int, steering_vec: torch.Tensor,
-                                    factor: float, prefix_length: int):
-    """Batched forward pass with a uniform steering factor at one layer."""
-    if factor == 0.0:
-        return model(input_ids=input_ids, attention_mask=attention_mask).logits
-    h = model.model.layers[steering_layer].register_forward_hook(
-        make_uniform_steering_hook(steering_vec, factor, prefix_length),
-        always_call=True,
-    )
+        for l in target_layers
+    ]
     try:
-        out = model(input_ids=input_ids, attention_mask=attention_mask)
+        hidden_states = model.model(
+            input_ids=input_ids, attention_mask=attention_mask,
+        ).last_hidden_state  # [B, L, H], bfloat16
     finally:
-        h.remove()
-    return out.logits
+        for h in handles:
+            h.remove()
+
+    next_token_ids = []
+    for i in range(input_ids.shape[0]):
+        pos = int(open_paren_positions[i])
+        logit = model.lm_head(hidden_states[i, pos, :]).float()  # [V]
+        next_token_ids.append(int(logit.argmax().item()))
+        del logit
+
+    del hidden_states
+    return next_token_ids, {l: storage[l] for l in target_layers}
 
 
 @torch.no_grad()
-def forward_per_example_steering_batch(model, input_ids, attention_mask,
-                                        steering_layer: int, steering_vec: torch.Tensor,
-                                        factors: list, prefix_length: int):
-    """Batched forward pass where each item in the batch has its own steering factor."""
-    if all(f == 0.0 for f in factors):
-        return model(input_ids=input_ids, attention_mask=attention_mask).logits
-    h = model.model.layers[steering_layer].register_forward_hook(
+def greedy_decode_with_steering(model, input_ids, attention_mask,
+                                  open_paren_positions,
+                                  steering_layer: int, steering_vec: torch.Tensor,
+                                  factors: list, prefix_length: int):
+    """
+    Phase B utility: per-example steering + greedy decode at open_paren_position.
+
+    Runs model.model() once with a per-example steering hook (combined batch =
+    all modes in one pass). Applies lm_head only at each item's '(' position
+    — one token, not the full sequence — so peak extra logits memory is
+    B × 1 × V × 4 bytes (trivially small).
+
+    factors: list[float] length B (adaptive or fixed, mix of both for combined batch).
+    open_paren_positions: list[int] length B.
+
+    Returns list[int] of next_token_ids, length B.
+    """
+    handle = model.model.layers[steering_layer].register_forward_hook(
         make_per_example_steering_hook(steering_vec, factors, prefix_length),
         always_call=True,
     )
     try:
-        out = model(input_ids=input_ids, attention_mask=attention_mask)
+        hidden_states = model.model(
+            input_ids=input_ids, attention_mask=attention_mask,
+        ).last_hidden_state  # [B, L, H], bfloat16
     finally:
-        h.remove()
-    return out.logits
+        handle.remove()
+
+    next_token_ids = []
+    for i in range(input_ids.shape[0]):
+        pos = int(open_paren_positions[i])
+        logit = model.lm_head(hidden_states[i, pos, :]).float()  # [V]
+        next_token_ids.append(int(logit.argmax().item()))
+        del logit
+
+    del hidden_states
+    return next_token_ids
+
+
+def token_to_letter(tokenizer, token_id: int) -> str:
+    """Decode a single token id to a stripped string."""
+    return tokenizer.decode([token_id]).strip()
+
+
+def is_on_format(letter_str: str) -> bool:
+    """True iff the decoded token is exactly one uppercase letter A–Z."""
+    return len(letter_str) == 1 and letter_str.isupper() and letter_str.isalpha()
 
 
 # ============================================================================
@@ -365,14 +382,14 @@ def plot_clamped_fraction(layer_df: pd.DataFrame, behavior: str, output_path: Pa
 
 def plot_kappa_vs_adaptive_delta(per_prompt_df: pd.DataFrame, layer: int,
                                   behavior: str, output_path: Path):
-    """Scatter: κ_a vs improvement (adaptive greedy match - baseline greedy match)."""
+    """Scatter: κ_a vs improvement (adaptive_correct - baseline_correct)."""
     ldf = per_prompt_df[per_prompt_df["layer"] == layer].dropna(
-        subset=["kappa_a", "adaptive_greedy_match", "greedy_match_baseline"]
+        subset=["kappa_a", "adaptive_correct", "baseline_correct"]
     )
     if len(ldf) < 4:
         return
     kappa = ldf["kappa_a"].values
-    delta = ldf["adaptive_greedy_match"].values - ldf["greedy_match_baseline"].values
+    delta = ldf["adaptive_correct"].astype(int).values - ldf["baseline_correct"].astype(int).values
 
     colors = np.where(delta > 0, "#2ca02c", np.where(delta < 0, "#d62728", "gray"))
     n_improved = int((delta > 0).sum())
@@ -584,7 +601,12 @@ def main():
         batch = train_flat[start:start + B]
         token_lists = [b["full_ids"] for b in batch]
         input_ids, attn, _ = pad_batch(token_lists, pad_id, device)
-        _, layer_hiddens = forward_capture_batch(model, input_ids, attn, layers)
+        # Use capture_and_greedy_decode_batch with dummy open_paren_positions
+        # (decode output discarded — we only need layer_hiddens).
+        dummy_positions = [0] * len(batch)
+        _, layer_hiddens = capture_and_greedy_decode_batch(
+            model, input_ids, attn, layers, dummy_positions,
+        )
         for i, b in enumerate(batch):
             for l in layers:
                 act = layer_hiddens[l][i, b["letter_pos"], :].float().cpu()
@@ -627,10 +649,13 @@ def main():
     del pos_acts, neg_acts
 
     # ------------------------------------------------------------------
-    # Pre-tokenize all (prompt, candidate) pairs
+    # Pre-tokenize using the MATCHING-letter sequence for each prompt.
+    # We only need one sequence per prompt because accuracy is now measured
+    # as the argmax at the '(' position — identical for any continuation
+    # (causal attention: '(' position only sees what comes before it).
     # ------------------------------------------------------------------
-    prompt_meta = []  # None for dropped prompts
-    pre_tok = []      # None for dropped prompts
+    prompt_meta = []   # None for dropped prompts
+    pre_tok = []       # None for dropped prompts
     dropped = 0
     for j, item in enumerate(test_data):
         q = item["question"]
@@ -647,16 +672,21 @@ def main():
             pre_tok.append(None)
             dropped += 1
             continue
-        row = {}
-        for letter in (matching_letter, notmatch_letter):
-            cand = f" ({letter})"
+        # Tokenize the matching-letter candidate to get letter_pos and open_paren_pos.
+        cand = f" ({matching_letter})"
+        try:
             prompt_ids, full_ids, letter_pos = build_prompt_and_full_ids(tokenizer, q, cand)
-            row[letter] = {
-                "full_ids": full_ids,
-                "prompt_len": len(prompt_ids),
-                "letter_pos": letter_pos,
-            }
-        pre_tok.append(row)
+        except (RuntimeError, ValueError):
+            prompt_meta.append(None)
+            pre_tok.append(None)
+            dropped += 1
+            continue
+        pre_tok.append({
+            "full_ids": full_ids,
+            "prompt_len": len(prompt_ids),
+            "letter_pos": letter_pos,
+            "open_paren_pos": letter_pos - 1,  # position of '(' before the letter
+        })
         prompt_meta.append({
             "matching_letter": matching_letter,
             "notmatch_letter": notmatch_letter,
@@ -664,91 +694,91 @@ def main():
     if dropped:
         logger.warning(f"Dropped {dropped} malformed prompt(s).")
 
+    # flat_items: ONE entry per prompt (matching-letter sequence).
     flat_items = []
-    for j, row in enumerate(pre_tok):
-        if row is None:
+    for j, tok in enumerate(pre_tok):
+        if tok is None:
             continue
-        meta = prompt_meta[j]
-        for role, letter in (
-            ("match", meta["matching_letter"]),
-            ("notmatch", meta["notmatch_letter"]),
-        ):
-            e = row[letter]
-            flat_items.append({
-                "prompt_idx": j,
-                "letter": letter,
-                "role": role,
-                "full_ids": e["full_ids"],
-                "prompt_len": e["prompt_len"],
-                "letter_pos": e["letter_pos"],
-            })
+        flat_items.append({
+            "prompt_idx": j,
+            "matching_letter": prompt_meta[j]["matching_letter"],
+            "notmatch_letter": prompt_meta[j]["notmatch_letter"],
+            **tok,
+        })
 
     n_items = len(flat_items)
 
     # ------------------------------------------------------------------
-    # Phase A: Batched baseline forward + per-layer activation capture
+    # Phase A: Baseline greedy decode + all-layer activation capture.
+    #
+    # Uses capture_and_greedy_decode_batch() which runs model.model() to avoid
+    # materialising full logits (same memory-efficient approach as Phase B).
+    #
+    # Greedy accuracy: argmax of lm_head applied at the '(' position.
+    #   - The '(' position (= letter_pos - 1) predicts what comes after '('.
+    #   - Argmax == matching_letter → correct; any non-letter → off-format.
+    #   - This is honest: high-alpha steering that pushes representations
+    #     off-manifold produces garbage tokens counted as wrong.
+    #
+    # kappa_a activation: hidden state at letter_pos of the matching sequence.
+    #   We always use the matching sequence (causal: '(' activation is the same
+    #   for any continuation, letter activation differs by continuation choice).
     # ------------------------------------------------------------------
-    logger.warning(f"\n=== Phase A: Baseline forward + activation capture "
-                   f"(B={B}, {n_items} items across {len(layers)} layers) ===")
+    logger.warning(
+        f"\n=== Phase A: Baseline greedy decode + activation capture "
+        f"(B={B}, {n_items} prompts across {len(layers)} layers) ==="
+    )
 
-    baseline_logps = {}   # (j, role) -> float
-    act_at_letter = {}    # (j, role, layer) -> tensor [hidden] on cpu
+    baseline_greedy_token_id = {}  # j -> int
+    act_at_letter = {}             # (j, layer) -> tensor [H] on cpu
 
-    for start in tqdm(range(0, n_items, B), desc="Baseline batches"):
+    for start in tqdm(range(0, n_items, B), desc="Phase A batches"):
         batch = flat_items[start:start + B]
         token_lists = [b["full_ids"] for b in batch]
-        input_ids, attn, lens = pad_batch(token_lists, pad_id, device)
-        logits, layer_hiddens = forward_capture_batch(model, input_ids, attn, layers)
-        prompt_lens = [b["prompt_len"] for b in batch]
-        logps = answer_token_logprob_batch(logits, input_ids, prompt_lens, lens)
+        open_paren_positions = [b["open_paren_pos"] for b in batch]
+        input_ids, attn, _ = pad_batch(token_lists, pad_id, device)
+        next_token_ids, layer_hiddens = capture_and_greedy_decode_batch(
+            model, input_ids, attn, layers, open_paren_positions,
+        )
         for i, b in enumerate(batch):
-            baseline_logps[(b["prompt_idx"], b["role"])] = logps[i]
+            j = b["prompt_idx"]
+            baseline_greedy_token_id[j] = next_token_ids[i]
             for l in layers:
-                act_at_letter[(b["prompt_idx"], b["role"], l)] = (
+                # Activation at letter_pos of the matching sequence — used for kappa_a.
+                act_at_letter[(j, l)] = (
                     layer_hiddens[l][i, b["letter_pos"], :].float().cpu()
                 )
-        del logits, layer_hiddens, input_ids, attn
+        del layer_hiddens, input_ids, attn
 
-    # Collect baseline records (greedy letter, p_match, etc.)
+    # Build baseline records from greedy token predictions.
     baseline_records = []
-    for j, item in enumerate(test_data):
-        if prompt_meta[j] is None:
-            continue
-        ml = prompt_meta[j]["matching_letter"]
-        nl = prompt_meta[j]["notmatch_letter"]
-        logp_m = baseline_logps[(j, "match")]
-        logp_n = baseline_logps[(j, "notmatch")]
-        p_match = float(np.exp(logp_m) / (np.exp(logp_m) + np.exp(logp_n)))
-        is_match_greedy = logp_m > logp_n
-        greedy_letter = ml if is_match_greedy else nl
-        greedy_role = "match" if is_match_greedy else "notmatch"
+    for item_info in flat_items:
+        j = item_info["prompt_idx"]
+        ml = item_info["matching_letter"]
+        nl = item_info["notmatch_letter"]
+        tid = baseline_greedy_token_id[j]
+        g_str = token_to_letter(tokenizer, tid)
+        on_fmt = is_on_format(g_str)
+        correct = on_fmt and (g_str == ml)
         baseline_records.append({
             "prompt_idx": j,
-            "question": item["question"],
-            "answer_matching_behavior": item["answer_matching_behavior"],
-            "answer_not_matching_behavior": item.get("answer_not_matching_behavior", ""),
+            "question": test_data[j]["question"],
+            "answer_matching_behavior": test_data[j]["answer_matching_behavior"],
             "matching_letter": ml,
             "notmatch_letter": nl,
-            "greedy_letter": greedy_letter,
-            "greedy_role": greedy_role,
-            "baseline_p_match": p_match,
-            "greedy_match_baseline": int(is_match_greedy),
-            "baseline_logp_match": float(logp_m),
-            "baseline_logp_notmatch": float(logp_n),
+            "baseline_token": g_str,
+            "baseline_on_format": on_fmt,
+            "baseline_correct": correct,
         })
 
     # ------------------------------------------------------------------
-    # Compute kappa_a and adaptive factors per (layer, prompt)
+    # Compute kappa_a and adaptive factors per (layer, prompt).
     #
     # kappa_a = 2 * (act - mu) . v / ||v||^2
-    #   where v = mu_pos - mu_neg, mu = (mu_pos + mu_neg) / 2
-    #   kappa_a = +1 at mu_pos, -1 at mu_neg, 0 at midpoint.
+    #   kappa_a = +1 at mu_pos (positive centroid), -1 at mu_neg, 0 at midpoint.
     #
     # Adaptive factor: alpha_j = max(0, (1 - kappa_a_j) / 2)
-    #   Derivation: steering adds alpha*v, shifting projection by alpha*||v||.
-    #   Setting new projection = c+ (positive centroid projection) gives:
-    #     p_j + alpha*||v|| = c+   =>   alpha = (c+ - p_j) / ||v||
-    #   In kappa_a terms (where kappa_a=1 iff p=c+): alpha = (1 - kappa_a) / 2.
+    #   Derived by setting the steered projection equal to c+ and solving.
     #   Clamped to 0 for prompts already at or beyond c+ (kappa_a >= 1).
     # ------------------------------------------------------------------
     logger.warning("\n=== Computing kappa_a and adaptive factors ===")
@@ -759,112 +789,100 @@ def main():
     for l in layers:
         mu_pos = mu_poss[l]
         mu_neg = mu_negs[l]
-        v = (mu_pos - mu_neg)
+        v = mu_pos - mu_neg
         v_norm_sq = float(v.dot(v))
         mu = 0.5 * (mu_pos + mu_neg)
-
         for rec in baseline_records:
             j = rec["prompt_idx"]
-            act = act_at_letter[(j, rec["greedy_role"], l)]
+            act = act_at_letter[(j, l)]
             if v_norm_sq < 1e-12:
-                kappa = float("nan")
-                alpha = 0.0
+                kappa, alpha = float("nan"), 0.0
             else:
                 kappa = float(2.0 * (act - mu).dot(v).item() / v_norm_sq)
                 alpha = max(0.0, (1.0 - kappa) / 2.0)
             kappa_map[(l, j)] = kappa
             adaptive_factor_map[(l, j)] = alpha
 
-    del act_at_letter  # no longer needed
+    del act_at_letter
 
     # ------------------------------------------------------------------
-    # Phase B: Adaptive steering + fixed-factor steering, separate passes.
+    # Phase B: Combined adaptive + fixed-factor greedy decode, one pass per layer.
     #
-    # Gemma-2 forces logits to float32 internally, making the logits tensor
-    # B × L × 256k × 4 bytes per forward pass. Combining multiple modes into
-    # a single larger batch causes OOM on 40 GB GPUs. We therefore run one
-    # forward pass per (mode, layer) at the normal batch size B.
+    # greedy_decode_with_steering() runs model.model() with a per-example hook
+    # (combined batch = all modes at once) and applies lm_head at each item's
+    # '(' position only — ONE token per item, not the full sequence.
+    # Peak logit memory: B*(1+F) × 1 × V × 4 bytes (trivially small).
     #
-    # Total passes: (1 + len(fixed_factors)) × len(layers).
+    # Phase B uses the same flat_items (one sequence per prompt) as Phase A.
+    # Effective batch: B prompts × (1 + len(fixed_factors)) modes.
     # ------------------------------------------------------------------
-    n_passes = (1 + len(fixed_factors)) * len(layers)
+    n_modes = 1 + len(fixed_factors)
+    eff_batch = B * n_modes
     logger.warning(
-        f"\n=== Phase B: Adaptive + fixed steering "
-        f"({len(layers)} layers × {1 + len(fixed_factors)} modes = {n_passes} passes) ==="
+        f"\n=== Phase B: Combined adaptive + fixed greedy decode "
+        f"({len(layers)} layers, {n_modes} modes, effective batch={eff_batch}) ==="
     )
 
-    adaptive_steered_map = {}    # (l, j) -> dict
-    fixed_steered_map = {}       # (factor, l, j) -> dict
+    adaptive_steered_map = {}  # (l, j) -> {"token": str, "on_format": bool, "correct": bool}
+    fixed_steered_map = {}     # (factor, l, j) -> same
 
-    outer = tqdm(total=n_passes, desc="Phase B (mode × layer)")
-    for l in layers:
+    for l in tqdm(layers, desc="Phase B layers"):
         sv = steering_vecs[l]
+        # per_mode_results[mode_idx][item_idx] = (prompt_idx, token_id)
+        per_mode_results = [[None] * n_items for _ in range(n_modes)]
 
-        # --- Adaptive pass (per-example factors) ---
-        per_item_logp = [None] * n_items
         for start in range(0, n_items, B):
             batch = flat_items[start:start + B]
-            token_lists = [b["full_ids"] for b in batch]
-            input_ids, attn, lens = pad_batch(token_lists, pad_id, device)
-            factors_batch = [
-                adaptive_factor_map.get((l, b["prompt_idx"]), 0.0) for b in batch
-            ]
-            logits = forward_per_example_steering_batch(
-                model, input_ids, attn, l, sv, factors_batch, prefix_length,
+            combined_tokens, combined_factors, combined_open_paren = [], [], []
+            for b in batch:
+                j = b["prompt_idx"]
+                # Mode 0: adaptive factor
+                combined_tokens.append(b["full_ids"])
+                combined_factors.append(adaptive_factor_map.get((l, j), 0.0))
+                combined_open_paren.append(b["open_paren_pos"])
+                # Modes 1..F: fixed factors
+                for f in fixed_factors:
+                    combined_tokens.append(b["full_ids"])
+                    combined_factors.append(f)
+                    combined_open_paren.append(b["open_paren_pos"])
+
+            input_ids, attn, _ = pad_batch(combined_tokens, pad_id, device)
+            token_ids = greedy_decode_with_steering(
+                model, input_ids, attn, combined_open_paren,
+                l, sv, combined_factors, prefix_length,
             )
-            prompt_lens = [b["prompt_len"] for b in batch]
-            logps = answer_token_logprob_batch(logits, input_ids, prompt_lens, lens)
+            del input_ids, attn
+
             for i, b in enumerate(batch):
-                per_item_logp[start + i] = (b["prompt_idx"], b["role"], logps[i])
-            del logits, input_ids, attn
+                base = i * n_modes
+                for m in range(n_modes):
+                    per_mode_results[m][start + i] = (b["prompt_idx"], token_ids[base + m])
 
-        by_prompt = {}
-        for pj, role, lp in per_item_logp:
-            by_prompt.setdefault(pj, {})[role] = lp
-        for rec in baseline_records:
-            j = rec["prompt_idx"]
-            logp_m = by_prompt[j]["match"]
-            logp_n = by_prompt[j]["notmatch"]
-            p_match_s = float(np.exp(logp_m) / (np.exp(logp_m) + np.exp(logp_n)))
-            adaptive_steered_map[(l, j)] = {
-                "adaptive_p_match": p_match_s,
-                "adaptive_greedy_match": int(logp_m > logp_n),
-                "adaptive_logp_match": float(logp_m),
-                "adaptive_logp_notmatch": float(logp_n),
-            }
-        outer.update(1)
-
-        # --- Fixed-factor passes (uniform factor, batched across prompts) ---
-        for factor in fixed_factors:
-            per_item_logp = [None] * n_items
-            for start in range(0, n_items, B):
-                batch = flat_items[start:start + B]
-                token_lists = [b["full_ids"] for b in batch]
-                input_ids, attn, lens = pad_batch(token_lists, pad_id, device)
-                logits = forward_uniform_steering_batch(
-                    model, input_ids, attn, l, sv, factor, prefix_length,
-                )
-                prompt_lens = [b["prompt_len"] for b in batch]
-                logps = answer_token_logprob_batch(logits, input_ids, prompt_lens, lens)
-                for i, b in enumerate(batch):
-                    per_item_logp[start + i] = (b["prompt_idx"], b["role"], logps[i])
-                del logits, input_ids, attn
-
-            by_prompt_f = {}
-            for pj, role, lp in per_item_logp:
-                by_prompt_f.setdefault(pj, {})[role] = lp
-            for rec in baseline_records:
-                j = rec["prompt_idx"]
-                logp_m = by_prompt_f[j]["match"]
-                logp_n = by_prompt_f[j]["notmatch"]
-                p_match_s = float(np.exp(logp_m) / (np.exp(logp_m) + np.exp(logp_n)))
-                fixed_steered_map[(factor, l, j)] = {
-                    "fixed_p_match": p_match_s,
-                    "fixed_greedy_match": int(logp_m > logp_n),
+        def _decode_results(token_id_list, matching_letters):
+            """Turn list of (prompt_idx, token_id) into a dict keyed by prompt_idx."""
+            out = {}
+            for pj, tid in token_id_list:
+                g_str = token_to_letter(tokenizer, tid)
+                on_fmt = is_on_format(g_str)
+                out[pj] = {
+                    "token": g_str,
+                    "on_format": on_fmt,
+                    "correct": on_fmt and (g_str == matching_letters[pj]),
                 }
-            outer.update(1)
+            return out
 
-    outer.close()
+        ml_lookup = {b["prompt_idx"]: b["matching_letter"] for b in flat_items}
+
+        # Adaptive (mode 0)
+        adp_decoded = _decode_results(per_mode_results[0], ml_lookup)
+        for pj, info in adp_decoded.items():
+            adaptive_steered_map[(l, pj)] = info
+
+        # Fixed factors (modes 1..F)
+        for k, factor in enumerate(fixed_factors):
+            fix_decoded = _decode_results(per_mode_results[k + 1], ml_lookup)
+            for pj, info in fix_decoded.items():
+                fixed_steered_map[(factor, l, pj)] = info
 
     # ------------------------------------------------------------------
     # Assemble per-prompt DataFrame
@@ -874,36 +892,36 @@ def main():
     for rec in baseline_records:
         j = rec["prompt_idx"]
         for l in layers:
-            adp = adaptive_steered_map[(l, j)]
+            adp = adaptive_steered_map.get((l, j), {})
             row = {
                 "layer": l,
                 "prompt_idx": j,
                 "question": rec["question"],
                 "matching_letter": rec["matching_letter"],
                 "notmatch_letter": rec["notmatch_letter"],
-                "greedy_letter_baseline": rec["greedy_letter"],
-                "baseline_logp_match": rec["baseline_logp_match"],
-                "baseline_logp_notmatch": rec["baseline_logp_notmatch"],
-                "baseline_p_match": rec["baseline_p_match"],
-                "greedy_match_baseline": rec["greedy_match_baseline"],
                 "kappa_a": kappa_map.get((l, j), float("nan")),
                 "adaptive_factor": adaptive_factor_map.get((l, j), 0.0),
-                "adaptive_logp_match": adp["adaptive_logp_match"],
-                "adaptive_logp_notmatch": adp["adaptive_logp_notmatch"],
-                "adaptive_p_match": adp["adaptive_p_match"],
-                "adaptive_greedy_match": adp["adaptive_greedy_match"],
+                # Baseline
+                "baseline_token": rec["baseline_token"],
+                "baseline_on_format": rec["baseline_on_format"],
+                "baseline_correct": rec["baseline_correct"],
+                # Adaptive
+                "adaptive_token": adp.get("token", ""),
+                "adaptive_on_format": adp.get("on_format", False),
+                "adaptive_correct": adp.get("correct", False),
             }
             for factor in fixed_factors:
                 fst = fixed_steered_map.get((factor, l, j), {})
                 f_tag = f"{factor:g}"
-                row[f"fixed_p_match_{f_tag}"] = fst.get("fixed_p_match", float("nan"))
-                row[f"fixed_greedy_match_{f_tag}"] = fst.get("fixed_greedy_match", float("nan"))
+                row[f"fixed_token_{f_tag}"] = fst.get("token", "")
+                row[f"fixed_on_format_{f_tag}"] = fst.get("on_format", False)
+                row[f"fixed_correct_{f_tag}"] = fst.get("correct", False)
             per_prompt_rows.append(row)
 
     per_prompt_df = pd.DataFrame(per_prompt_rows)
     per_prompt_df.to_csv(out_dir / "per_prompt_results.csv", index=False)
     logger.warning(
-        f"Wrote {len(per_prompt_df)} per-prompt rows "
+        f"Wrote {len(per_prompt_df)} rows "
         f"({len(layers)} layers × {len(baseline_records)} prompts) "
         f"to {out_dir / 'per_prompt_results.csv'}"
     )
@@ -925,39 +943,35 @@ def main():
             "layer": l,
             "dprime": dprimes.get(l, float("nan")),
             "n_prompts": int(len(ldf)),
-            "baseline_greedy_acc": float(ldf["greedy_match_baseline"].mean()),
-            "adaptive_greedy_acc": float(ldf["adaptive_greedy_match"].mean()),
-            "baseline_p_match_mean": float(ldf["baseline_p_match"].mean()),
-            "adaptive_p_match_mean": float(ldf["adaptive_p_match"].mean()),
+            # Accuracy (greedy token == matching letter)
+            "baseline_greedy_acc": float(ldf["baseline_correct"].mean()),
+            "adaptive_greedy_acc": float(ldf["adaptive_correct"].mean()),
             "delta_greedy_acc": float(
-                ldf["adaptive_greedy_match"].mean() - ldf["greedy_match_baseline"].mean()
+                ldf["adaptive_correct"].mean() - ldf["baseline_correct"].mean()
             ),
+            # Off-format rate (model output is not a valid letter)
+            "baseline_off_format_rate": float((~ldf["baseline_on_format"]).mean()),
+            "adaptive_off_format_rate": float((~ldf["adaptive_on_format"]).mean()),
+            # Kappa / adaptive factor stats
             "mean_kappa_a": float(np.nanmean(kappa_vals)),
             "mean_adaptive_factor": float(np.nanmean(alpha_vals)),
-            "mean_adaptive_factor_unclamped": float(
-                np.nanmean((1.0 - kappa_vals) / 2.0)
-            ),
             "frac_clamped": frac_clamped,
         }
 
         for factor in fixed_factors:
             f_tag = f"{factor:g}"
-            col = f"fixed_greedy_match_{f_tag}"
-            if col in ldf.columns:
-                row[f"fixed_greedy_acc_{f_tag}"] = float(ldf[col].mean())
-                row[f"fixed_p_match_mean_{f_tag}"] = float(
-                    ldf[f"fixed_p_match_{f_tag}"].mean()
-                )
+            correct_col = f"fixed_correct_{f_tag}"
+            fmt_col = f"fixed_on_format_{f_tag}"
+            if correct_col in ldf.columns:
+                row[f"fixed_greedy_acc_{f_tag}"] = float(ldf[correct_col].mean())
+                row[f"fixed_off_format_rate_{f_tag}"] = float((~ldf[fmt_col]).mean())
 
-        # Cross-layer correlations: kappa_a vs baseline p_match (sanity check)
-        valid = ldf[["kappa_a", "baseline_p_match"]].dropna()
+        # kappa_a vs baseline_correct correlation (sanity check)
+        valid = ldf[["kappa_a", "baseline_correct"]].dropna()
         if len(valid) >= 4:
-            rho, sp = scipy_stats.spearmanr(valid["kappa_a"], valid["baseline_p_match"])
-            r, pr = scipy_stats.pearsonr(valid["kappa_a"], valid["baseline_p_match"])
+            rho, sp = scipy_stats.spearmanr(valid["kappa_a"], valid["baseline_correct"].astype(float))
             row["kappa_baseline_spearman_rho"] = float(rho)
             row["kappa_baseline_spearman_p"] = float(sp)
-            row["kappa_baseline_pearson_r"] = float(r)
-            row["kappa_baseline_pearson_p"] = float(pr)
 
         layer_rows.append(row)
 
@@ -965,36 +979,37 @@ def main():
     layer_df.to_csv(out_dir / "per_layer_summary.csv", index=False)
 
     # Print per-layer table
-    fixed_greedy_cols = sorted(c for c in layer_df.columns if c.startswith("fixed_greedy_acc_"))
+    fixed_acc_cols = sorted(c for c in layer_df.columns if c.startswith("fixed_greedy_acc_"))
     logger.warning("\nPer-layer summary:")
     for _, r in layer_df.iterrows():
         fixed_str = "  ".join(
             f"fixed[{c.replace('fixed_greedy_acc_', '')}]={r[c]:.3f}"
-            for c in fixed_greedy_cols if c in r and not pd.isna(r[c])
+            for c in fixed_acc_cols if c in r and not pd.isna(r[c])
         )
         logger.warning(
             f"  L{int(r['layer']):2d}: d'={r['dprime']:.3f}  "
-            f"base={r['baseline_greedy_acc']:.3f}  "
-            f"adaptive={r['adaptive_greedy_acc']:.3f} "
-            f"(Δ={r['delta_greedy_acc']:+.3f})  "
-            f"mean_α={r['mean_adaptive_factor']:.3f}  "
-            f"clamped={r['frac_clamped']:.2f}  "
+            f"base={r['baseline_greedy_acc']:.3f} (off-fmt={r['baseline_off_format_rate']:.2f})  "
+            f"adaptive={r['adaptive_greedy_acc']:.3f} (off-fmt={r['adaptive_off_format_rate']:.2f}) "
+            f"Δ={r['delta_greedy_acc']:+.3f}  "
+            f"mean_α={r['mean_adaptive_factor']:.3f}  clamped={r['frac_clamped']:.2f}  "
             f"{fixed_str}"
         )
 
     # Aggregate summary across layers
     logger.warning("\nAggregate (mean across layers):")
     logger.warning(
-        f"  Baseline greedy acc:  {layer_df['baseline_greedy_acc'].mean():.3f}"
+        f"  Baseline greedy acc:       {layer_df['baseline_greedy_acc'].mean():.3f}  "
+        f"(off-format={layer_df['baseline_off_format_rate'].mean():.3f})"
     )
     logger.warning(
-        f"  Adaptive greedy acc:  {layer_df['adaptive_greedy_acc'].mean():.3f}"
+        f"  Adaptive greedy acc:       {layer_df['adaptive_greedy_acc'].mean():.3f}  "
+        f"(off-format={layer_df['adaptive_off_format_rate'].mean():.3f})"
     )
-    for col in fixed_greedy_cols:
+    for col in fixed_acc_cols:
         f_tag = col.replace("fixed_greedy_acc_", "")
-        logger.warning(
-            f"  Fixed α={f_tag} greedy acc: {layer_df[col].mean():.3f}"
-        )
+        off_col = f"fixed_off_format_rate_{f_tag}"
+        off_str = f"  off-format={layer_df[off_col].mean():.3f}" if off_col in layer_df.columns else ""
+        logger.warning(f"  Fixed α={f_tag} greedy acc: {layer_df[col].mean():.3f}{off_str}")
 
     # ------------------------------------------------------------------
     # Plots
@@ -1016,7 +1031,6 @@ def main():
         layer_df, args.behavior,
         plots_dir / "adaptive_vs_best_fixed_by_layer.png",
     )
-    # Per-layer scatter plots (kappa_a vs delta)
     for l in layers:
         plot_kappa_vs_adaptive_delta(
             per_prompt_df, l, args.behavior,
@@ -1026,24 +1040,30 @@ def main():
     # ------------------------------------------------------------------
     # Summary JSON
     # ------------------------------------------------------------------
-    fixed_greedy_cols_all = {
-        c: float(layer_df[c].mean()) for c in fixed_greedy_cols if c in layer_df.columns
+    fixed_acc_summary = {
+        c: float(layer_df[c].mean()) for c in fixed_acc_cols if c in layer_df.columns
+    }
+    fixed_off_fmt_summary = {
+        c: float(layer_df[c].mean())
+        for c in layer_df.columns if c.startswith("fixed_off_format_rate_")
     }
     summary = {
         "behavior": args.behavior,
         "model_name": args.model_name,
-        "sweep_dir": str(sweep_dir),
         "fixed_factors": fixed_factors,
         "n_layers": len(layers),
         "n_test_prompts": len(baseline_records),
         "layers": layers,
         "mean_across_layers": {
             "baseline_greedy_acc": float(layer_df["baseline_greedy_acc"].mean()),
+            "baseline_off_format_rate": float(layer_df["baseline_off_format_rate"].mean()),
             "adaptive_greedy_acc": float(layer_df["adaptive_greedy_acc"].mean()),
+            "adaptive_off_format_rate": float(layer_df["adaptive_off_format_rate"].mean()),
             "delta_greedy_acc": float(layer_df["delta_greedy_acc"].mean()),
             "mean_adaptive_factor": float(layer_df["mean_adaptive_factor"].mean()),
             "frac_clamped": float(layer_df["frac_clamped"].mean()),
-            **fixed_greedy_cols_all,
+            **fixed_acc_summary,
+            **fixed_off_fmt_summary,
         },
         "per_layer": layer_df.to_dict(orient="records"),
     }
