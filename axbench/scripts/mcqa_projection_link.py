@@ -319,29 +319,34 @@ def plot_steering_acc(layer_df, factors, behavior, out_path):
 def plot_projection_vs_steering(layer_df, factors, behavior, out_path):
     """
     The key plot: scatter of projection MCC (x) vs steered accuracy (y),
-    one point per layer, one panel per factor. If the story is true, high-MCC
-    layers should cluster at high steered accuracy.
+    one point per layer, one panel per factor + one panel for best-α-per-layer.
     """
-    factors_present = [f for f in factors if f"steered_acc_{f:g}" in layer_df.columns]
-    if not factors_present:
+    panels = []
+    for f in factors:
+        if f == "best":
+            if "best_steered_acc" in layer_df.columns:
+                panels.append(("best_steered_acc", "Best α per layer"))
+        else:
+            col = f"steered_acc_{f:g}"
+            if col in layer_df.columns:
+                panels.append((col, f"α={f:g}"))
+    if not panels:
         return
-    n = len(factors_present)
-    fig, axes = plt.subplots(1, n, figsize=(5 * n, 5), squeeze=False)
-    cmap = plt.get_cmap("plasma")
 
-    for idx, f in enumerate(factors_present):
+    n = len(panels)
+    fig, axes = plt.subplots(1, n, figsize=(5 * n, 5), squeeze=False)
+
+    for idx, (col, label) in enumerate(panels):
         ax = axes[0][idx]
-        col = f"steered_acc_{f:g}"
         x = layer_df["sign_kappa_mcc"].values
         y = layer_df[col].values
-        layers = layer_df["layer"].values
+        lyrs = layer_df["layer"].values
 
-        sc = ax.scatter(x, y, c=layers, cmap="viridis", s=80,
+        sc = ax.scatter(x, y, c=lyrs, cmap="viridis", s=80,
                         edgecolors="k", linewidths=0.4, zorder=3)
         plt.colorbar(sc, ax=ax, label="Layer")
 
-        # Annotate every 3rd layer to avoid clutter.
-        for xi, yi, li in zip(x, y, layers):
+        for xi, yi, li in zip(x, y, lyrs):
             if li % 3 == 0 and not (np.isnan(xi) or np.isnan(yi)):
                 ax.annotate(str(li), (xi, yi), fontsize=7,
                             xytext=(3, 3), textcoords="offset points")
@@ -349,9 +354,9 @@ def plot_projection_vs_steering(layer_df, factors, behavior, out_path):
         mask = ~(np.isnan(x) | np.isnan(y))
         if mask.sum() >= 3 and np.std(x[mask]) > 1e-9 and np.std(y[mask]) > 1e-9:
             r, p = scipy_stats.pearsonr(x[mask], y[mask])
-            ax.set_title(f"α={f:g}   r={r:+.3f} (p={p:.3f})", fontsize=11, fontweight="bold")
+            ax.set_title(f"{label}   r={r:+.3f} (p={p:.3g})", fontsize=11, fontweight="bold")
         else:
-            ax.set_title(f"α={f:g}", fontsize=11, fontweight="bold")
+            ax.set_title(label, fontsize=11, fontweight="bold")
 
         ax.set_xlabel("sign(κ_a) MCC vs baseline correct", fontsize=10)
         ax.set_ylabel("Steered greedy accuracy", fontsize=10)
@@ -361,7 +366,7 @@ def plot_projection_vs_steering(layer_df, factors, behavior, out_path):
 
     fig.suptitle(
         f"{behavior}: Projection quality → steering effectiveness (one point = one layer)\n"
-        f"If projection predicts behavior, those layers should also steer well",
+        f"Rightmost panel = best steering factor at each layer",
         fontsize=11, fontweight="bold",
     )
     plt.tight_layout()
@@ -748,6 +753,13 @@ def main():
         layer_rows.append(row)
 
     layer_df = pd.DataFrame(layer_rows).sort_values("layer").reset_index(drop=True)
+
+    # Add best-across-factors steered accuracy per layer.
+    acc_cols = [f"steered_acc_{f:g}" for f in factors if f"steered_acc_{f:g}" in layer_df.columns]
+    if acc_cols:
+        layer_df["best_steered_acc"] = layer_df[acc_cols].max(axis=1)
+        layer_df["best_factor"] = layer_df[acc_cols].idxmax(axis=1).str.replace("steered_acc_", "")
+
     layer_df.to_csv(out_dir / "per_layer_summary.csv", index=False)
 
     logger.warning("\nPer-layer summary:")
@@ -756,23 +768,30 @@ def main():
             f"α={f:g}={r[f'steered_acc_{f:g}']:.3f}"
             for f in factors if f"steered_acc_{f:g}" in r and not pd.isna(r[f"steered_acc_{f:g}"])
         )
+        best_str = f"  best={r['best_steered_acc']:.3f}@α={r['best_factor']}" \
+            if "best_steered_acc" in r else ""
         logger.warning(
             f"  L{int(r['layer']):2d}: d'={r['dprime']:.3f}  "
             f"base={r['baseline_acc']:.3f}  "
             f"MCC={r['sign_kappa_mcc']:+.3f}  ρ={r['kappa_spearman_rho']:+.3f}  "
-            f"{steered_str}"
+            f"{steered_str}{best_str}"
         )
 
-    # Cross-layer correlations.
+    # Cross-layer correlations: predictor vs each factor AND vs best-across-factors.
     cross_rows = []
     predictors = [("sign_kappa_mcc", "sign(κ_a) MCC"), ("kappa_spearman_rho", "κ_a Spearman ρ"),
                   ("dprime", "d'")]
+
+    targets = [(f"steered_acc_{f:g}", f"α={f:g}") for f in factors
+               if f"steered_acc_{f:g}" in layer_df.columns]
+    if "best_steered_acc" in layer_df.columns:
+        targets.append(("best_steered_acc", "best α per layer"))
+
     for pred_col, pred_label in predictors:
         if pred_col not in layer_df.columns:
             continue
         pv = layer_df[pred_col].values
-        for factor in factors:
-            tgt_col = f"steered_acc_{factor:g}"
+        for tgt_col, tgt_label in targets:
             if tgt_col not in layer_df.columns:
                 continue
             tv = layer_df[tgt_col].values
@@ -782,7 +801,7 @@ def main():
             r, p = scipy_stats.pearsonr(pv[mask], tv[mask])
             rho, sp = scipy_stats.spearmanr(pv[mask], tv[mask])
             cross_rows.append({
-                "predictor": pred_label, "factor": factor,
+                "predictor": pred_label, "target": tgt_label,
                 "pearson_r": float(r), "pearson_p": float(p),
                 "spearman_rho": float(rho), "spearman_p": float(sp),
                 "n_layers": int(mask.sum()),
@@ -794,7 +813,7 @@ def main():
         for _, r in cross_df.iterrows():
             sig = "*" if r["pearson_p"] < 0.05 else " "
             logger.warning(
-                f"  {r['predictor']:20s} → α={r['factor']:4g}: "
+                f"  {r['predictor']:20s} → {r['target']:20s}: "
                 f"r={r['pearson_r']:+.3f} (p={r['pearson_p']:.3g}){sig}  "
                 f"ρ={r['spearman_rho']:+.3f} (p={r['spearman_p']:.3g})"
             )
@@ -805,8 +824,12 @@ def main():
     plots = out_dir / "plots"
     plot_projection_quality(layer_df, args.behavior, plots / "projection_quality_by_layer.png")
     plot_steering_acc(layer_df, factors, args.behavior, plots / "steering_acc_by_layer.png")
-    plot_projection_vs_steering(layer_df, factors, args.behavior,
-                                plots / "projection_vs_steering.png")
+    plot_projection_vs_steering(
+        layer_df,
+        factors + (["best"] if "best_steered_acc" in layer_df.columns else []),
+        args.behavior,
+        plots / "projection_vs_steering.png",
+    )
     for l in sorted(per_prompt_df["layer"].unique()):
         plot_kappa_scatter(per_prompt_df, int(l), args.behavior,
                            plots / f"kappa_scatter_layer_{int(l)}.png")
