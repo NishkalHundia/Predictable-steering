@@ -505,10 +505,24 @@ def compute_r2_metrics(test_mean_acts, test_metadata, directions,
 # Phase 6 - steering effectiveness Delta_l
 # ============================================================================
 def compute_delta_l(sweep_dir, target_layers, behavior, normalize=True):
-    """Per layer, Delta_l = mean(score | factor>0) - mean(score | factor=0).
+    """Per layer, steering-effectiveness Delta_l.
 
-    If `normalize=True`, divide by the behavior's score range (max-min) so
-    Delta_l is dimensionless and comparable across behaviors.
+    Matches the convention in sweep_layers_open_ended.py:summarize_eval and
+    its downstream `factor_max_avg - factor_0_avg` reporting:
+
+        Delta_l = max_f mean(score | factor = f) - mean(score | factor = 0)
+
+    i.e. the best-achieved mean steered score across the swept factors,
+    minus the baseline. Averaging across all positive factors (the older
+    formulation) is not what the rest of the pipeline calls 'steering
+    effectiveness': at deep layers, large factors often degrade output and
+    drag that average back to baseline.
+
+    Also returns the older mean-of-positive-factors variant under
+    `delta_l_mean_pos` for reference.
+
+    If `normalize=True`, both Delta_l columns are divided by the behavior's
+    score range (max - min).
     """
     sweep_dir = Path(sweep_dir)
     score_min, score_max, _ = BEHAVIOR_SCALES.get(behavior, (None, None, None))
@@ -517,36 +531,73 @@ def compute_delta_l(sweep_dir, target_layers, behavior, normalize=True):
     rows = []
     for layer in target_layers:
         path = sweep_dir / f"layer_{layer}" / "eval" / "eval_results.parquet"
+        row = {
+            "layer": int(layer),
+            "n_baseline": 0, "n_steered": 0,
+            "baseline_mean": np.nan,
+            "best_factor": np.nan, "best_factor_mean": np.nan,
+            "steered_mean_pos": np.nan,
+            "delta_l_raw": np.nan, "delta_l": np.nan,
+            "delta_l_mean_pos_raw": np.nan, "delta_l_mean_pos": np.nan,
+        }
         if not path.exists():
-            rows.append({
-                "layer": int(layer), "n_baseline": 0, "n_steered": 0,
-                "baseline_mean": np.nan, "steered_mean": np.nan,
-                "delta_l_raw": np.nan, "delta_l": np.nan,
-            })
+            rows.append(row)
             continue
+
         df = pd.read_parquet(path)
         base = df[df["steering_factor"] == 0]["behavior_score"].dropna()
-        steered = df[df["steering_factor"] > 0]["behavior_score"].dropna()
-        if len(base) == 0 or len(steered) == 0:
-            rows.append({
-                "layer": int(layer), "n_baseline": int(len(base)),
-                "n_steered": int(len(steered)),
-                "baseline_mean": float(base.mean()) if len(base) else np.nan,
-                "steered_mean": float(steered.mean()) if len(steered) else np.nan,
-                "delta_l_raw": np.nan, "delta_l": np.nan,
-            })
+        if len(base) == 0:
+            rows.append(row)
             continue
-        delta_raw = float(steered.mean()) - float(base.mean())
-        delta = delta_raw / score_range if normalize else delta_raw
-        rows.append({
-            "layer": int(layer),
+        baseline_mean = float(base.mean())
+        row.update({
             "n_baseline": int(len(base)),
-            "n_steered": int(len(steered)),
-            "baseline_mean": float(base.mean()),
-            "steered_mean": float(steered.mean()),
-            "delta_l_raw": delta_raw,
-            "delta_l": float(delta),
+            "baseline_mean": baseline_mean,
         })
+
+        # Per-factor mean across all swept factors.
+        per_factor = (
+            df.dropna(subset=["behavior_score"])
+              .groupby("steering_factor")["behavior_score"]
+              .mean()
+              .sort_index()
+        )
+        if per_factor.empty:
+            rows.append(row)
+            continue
+
+        # Best factor in absolute terms (max avg_score).
+        best_factor = float(per_factor.idxmax())
+        best_factor_mean = float(per_factor.max())
+        delta_raw = best_factor_mean - baseline_mean
+
+        # Mean of positive-factor scores (legacy variant).
+        pos_factors = per_factor[per_factor.index > 0]
+        if not pos_factors.empty:
+            steered_mean_pos = float(pos_factors.mean())
+            delta_mp_raw = steered_mean_pos - baseline_mean
+            n_steered = int(
+                df[df["steering_factor"] > 0]["behavior_score"].notna().sum()
+            )
+        else:
+            steered_mean_pos = np.nan
+            delta_mp_raw = np.nan
+            n_steered = 0
+
+        row.update({
+            "n_steered": n_steered,
+            "best_factor": best_factor,
+            "best_factor_mean": best_factor_mean,
+            "steered_mean_pos": steered_mean_pos,
+            "delta_l_raw": delta_raw,
+            "delta_l": delta_raw / score_range if normalize else delta_raw,
+            "delta_l_mean_pos_raw": delta_mp_raw,
+            "delta_l_mean_pos": (
+                delta_mp_raw / score_range if (normalize and not np.isnan(delta_mp_raw))
+                else delta_mp_raw
+            ),
+        })
+        rows.append(row)
     return pd.DataFrame(rows)
 
 
@@ -623,7 +674,11 @@ def plot_layer_sweep(metrics_df, behavior, output_path, method,
 
 def plot_ratio_vs_steering(metrics_df, delta_df, behavior, output_path, method):
     """Plot 2: scatter of ratio vs Delta_l, one labeled point per layer."""
-    df = metrics_df.merge(delta_df[["layer", "delta_l"]], on="layer", how="inner")
+    # Only merge in delta_l if metrics_df doesn't already have it.
+    if "delta_l" in metrics_df.columns:
+        df = metrics_df.copy()
+    else:
+        df = metrics_df.merge(delta_df[["layer", "delta_l"]], on="layer", how="inner")
     df = df.dropna(subset=["ratio", "delta_l"]).sort_values("layer").reset_index(drop=True)
     if df.empty:
         logger.warning(f"plot_ratio_vs_steering [{method}]: empty after merge / dropna")
