@@ -453,6 +453,75 @@ def plot_kappa_scatter(prompt_df, layer, behavior, out_path):
     plt.close()
 
 
+def plot_projection_histograms(prompt_df, factors, behavior, layer, out_path):
+    """
+    For one layer: one subplot per factor (including baseline α=0).
+    X-axis = κ_a_steered = κ_a_baseline + 2α (points shift right as α grows).
+    Bars stacked by model output at that factor:
+      blue  = output matched behavior letter
+      red   = output matched non-behavior letter (on-format, wrong)
+      grey  = gibberish / off-format
+    """
+    ldf = prompt_df[prompt_df["layer"] == layer].dropna(subset=["kappa_a"]).copy()
+    if len(ldf) < 4:
+        return
+
+    all_factors = [0] + [f for f in factors if f != 0]
+    n_cols = len(all_factors)
+    fig, axes = plt.subplots(1, n_cols, figsize=(4 * n_cols, 4), sharey=False)
+    if n_cols == 1:
+        axes = [axes]
+
+    kappa_base = ldf["kappa_a"].values
+
+    # Determine shared x-range for context (baseline range).
+    x_min_base = kappa_base.min()
+    x_max_base = kappa_base.max()
+
+    for ax, f in zip(axes, all_factors):
+        kappa_steered = kappa_base + 2.0 * f
+
+        if f == 0:
+            matching    = ldf["baseline_correct"].astype(bool).values
+            on_format   = ldf["baseline_on_format"].astype(bool).values
+        else:
+            col_correct   = f"steered_correct_{f:g}"
+            col_on_format = f"steered_on_format_{f:g}"
+            if col_correct not in ldf.columns:
+                ax.set_visible(False)
+                continue
+            matching  = ldf[col_correct].astype(bool).values
+            on_format = ldf[col_on_format].astype(bool).values
+
+        # Three groups.
+        k_match    = kappa_steered[matching]
+        k_nonmatch = kappa_steered[~matching &  on_format]
+        k_gibber   = kappa_steered[~matching & ~on_format]
+
+        x_min = kappa_steered.min() - 0.2
+        x_max = kappa_steered.max() + 0.2
+        bins  = np.linspace(x_min, x_max, 20)
+
+        ax.hist(k_gibber,   bins=bins, color="#aaaaaa", alpha=0.85, label="Gibberish", stacked=True)
+        ax.hist(k_nonmatch, bins=bins, color="#d62728", alpha=0.85, label="Non-matching", stacked=True)
+        ax.hist(k_match,    bins=bins, color="#1f77b4", alpha=0.85, label="Matching", stacked=True)
+
+        ax.axvline(0, color="black", linestyle="--", linewidth=1.0, alpha=0.6)
+        ax.set_xlabel("κ_a steered", fontsize=9)
+        ax.set_title(f"α={f:g}", fontsize=10, fontweight="bold")
+        if ax is axes[0]:
+            ax.set_ylabel("# prompts", fontsize=9)
+            ax.legend(fontsize=7, loc="upper left")
+
+    fig.suptitle(
+        f"{behavior} — Layer {layer}: projection distribution by steering factor",
+        fontsize=11, fontweight="bold",
+    )
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close()
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -906,6 +975,8 @@ def main():
     for l in sorted(per_prompt_df["layer"].unique()):
         plot_kappa_scatter(per_prompt_df, int(l), args.behavior,
                            plots / f"kappa_scatter_layer_{int(l)}.png")
+        plot_projection_histograms(per_prompt_df, factors, args.behavior, int(l),
+                                   plots / f"projection_hist_layer_{int(l)}.png")
 
     # Summary JSON.
     summary = {
