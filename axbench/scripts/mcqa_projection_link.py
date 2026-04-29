@@ -480,16 +480,26 @@ def main():
     if (not args.force_recompute) and per_prompt_csv.exists():
         try:
             df = pd.read_csv(per_prompt_csv)
-            have_layers = set(int(l) for l in df["layer"].unique())
-            have_factors = set(float(f) for f in df["steering_factor"].unique()
-                               if "steering_factor" in df.columns) if "steering_factor" in df.columns else set()
+            have_layers  = set(int(l) for l in df["layer"].unique())
+            # Wide format: check for steered_correct_{f} columns.
+            have_factors = set(
+                float(c.replace("steered_correct_", ""))
+                for c in df.columns if c.startswith("steered_correct_")
+            )
             need_layers  = set(layers)
             need_factors = set(factors)
             if need_layers <= have_layers and need_factors <= have_factors:
                 per_prompt_df = df
                 logger.warning(
-                    f"Reusing {per_prompt_csv} — covers all requested layers and factors. "
+                    f"Reusing {per_prompt_csv} — covers all requested layers/factors. "
                     f"Pass --force_recompute to redo."
+                )
+            else:
+                missing_l = need_layers - have_layers
+                missing_f = need_factors - have_factors
+                logger.warning(
+                    f"CSV exists but missing layers={missing_l or 'none'} "
+                    f"factors={missing_f or 'none'}; recomputing."
                 )
         except Exception as e:
             logger.warning(f"Could not reuse CSV: {e}")
