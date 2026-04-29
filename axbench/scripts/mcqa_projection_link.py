@@ -473,15 +473,17 @@ def main():
 
     # ------------------------------------------------------------------
     # Check if we can skip forward passes (reuse saved CSV).
+    # d' is stored separately in dprime.json so it survives CSV reuse.
     # ------------------------------------------------------------------
     per_prompt_csv = out_dir / "per_prompt_results.csv"
-    per_prompt_df = None
+    dprime_json    = out_dir / "dprime.json"
+    per_prompt_df  = None
+    dprimes        = {}  # populated either from file or Phase 0
 
     if (not args.force_recompute) and per_prompt_csv.exists():
         try:
             df = pd.read_csv(per_prompt_csv)
             have_layers  = set(int(l) for l in df["layer"].unique())
-            # Wide format: check for steered_correct_{f} columns.
             have_factors = set(
                 float(c.replace("steered_correct_", ""))
                 for c in df.columns if c.startswith("steered_correct_")
@@ -504,7 +506,20 @@ def main():
         except Exception as e:
             logger.warning(f"Could not reuse CSV: {e}")
 
-    if per_prompt_df is None:
+    # Load d' from file if available (may exist even when CSV does too).
+    if dprime_json.exists():
+        try:
+            with open(dprime_json) as f:
+                dprimes = {int(k): float(v) for k, v in json.load(f).items()}
+            logger.warning(f"Loaded d' for {len(dprimes)} layers from {dprime_json}")
+        except Exception as e:
+            logger.warning(f"Could not load {dprime_json}: {e}")
+
+    # If CSV is reusable but d' is still missing, run Phase 0 only (no Phase A/B).
+    need_dprime = not dprimes and per_prompt_df is not None
+    need_full   = per_prompt_df is None
+
+    if need_dprime or need_full:
         # ------------------------------------------------------------------
         # Load tokenizer + model.
         # ------------------------------------------------------------------
@@ -583,155 +598,158 @@ def main():
         layers = [l for l in layers if l in steering_vecs]
         del pos_acts, neg_acts
 
-        # ------------------------------------------------------------------
-        # Tokenize test prompts (one sequence per prompt, using matching letter).
-        # ------------------------------------------------------------------
-        flat_items = []
-        for j, item in enumerate(test_data):
-            try:
-                ml = extract_letter(item["answer_matching_behavior"])
-                nl = extract_letter(item["answer_not_matching_behavior"])
-            except Exception:
-                continue
-            if ml == nl:
-                continue
-            try:
-                _, full_ids, letter_pos, open_paren_pos = build_full_ids(tokenizer, item["question"], ml)
-            except Exception:
-                continue
-            flat_items.append({
-                "prompt_idx": j,
-                "matching_letter": ml,
-                "notmatch_letter": nl,
-                "full_ids": full_ids,
-                "letter_pos": letter_pos,
-                "open_paren_pos": open_paren_pos,
-            })
-        n_items = len(flat_items)
-        logger.warning(f"Valid test items: {n_items}")
+        # Save d' so it survives future CSV-reuse runs.
+        with open(dprime_json, "w") as f:
+            json.dump({str(l): float(v) for l, v in dprimes.items()}, f, indent=2)
+        logger.warning(f"Saved d' to {dprime_json}")
 
-        # ------------------------------------------------------------------
-        # Phase A: Baseline greedy decode + activation capture.
-        # ------------------------------------------------------------------
-        logger.warning(f"\n=== Phase A: Baseline ({n_items} prompts) ===")
-
-        baseline_tok = {}    # j -> int (token id)
-        act_at_letter = {}   # (j, l) -> tensor [H]
-
-        for start in tqdm(range(0, n_items, B), desc="Phase A"):
-            batch = flat_items[start:start + B]
-            ids, mask, _ = pad_batch([b["full_ids"] for b in batch], pad_id, device)
-            toks, hiddens = forward_capture(
-                model, ids, mask, layers,
-                [b["open_paren_pos"] for b in batch],
-            )
-            for i, b in enumerate(batch):
-                j = b["prompt_idx"]
-                baseline_tok[j] = toks[i]
-                for l in layers:
-                    act_at_letter[(j, l)] = hiddens[l][i, b["letter_pos"], :]
-            del hiddens, ids, mask
-
-        # Build baseline records.
-        baseline_records = {}
-        for b in flat_items:
-            j = b["prompt_idx"]
-            g = decode_letter(tokenizer, baseline_tok[j])
-            baseline_records[j] = {
-                "question": test_data[j]["question"],
-                "answer_matching_behavior": test_data[j]["answer_matching_behavior"],
-                "matching_letter": b["matching_letter"],
-                "notmatch_letter": b["notmatch_letter"],
-                "baseline_token": g if g else tokenizer.decode([baseline_tok[j]]).strip(),
-                "baseline_on_format": g is not None,
-                "baseline_correct": g == b["matching_letter"],
-            }
-
-        # Compute κ_a per (layer, prompt).
-        kappa_map = {}
-        for l in layers:
-            mu_pos, mu_neg = mu_poss[l], mu_negs[l]
-            v = mu_pos - mu_neg
-            v_norm_sq = float(v.dot(v))
-            mu = 0.5 * (mu_pos + mu_neg)
-            for b in flat_items:
-                j = b["prompt_idx"]
-                act = act_at_letter[(j, l)]
-                kappa_map[(l, j)] = float(2.0 * (act - mu).dot(v) / v_norm_sq) \
-                    if v_norm_sq > 1e-12 else float("nan")
-        del act_at_letter
-
-        # ------------------------------------------------------------------
-        # Phase B: Fixed-factor steered greedy decode per (layer, factor).
-        # ------------------------------------------------------------------
-        logger.warning(f"\n=== Phase B: Steered ({len(layers)} layers × {len(factors)} factors) ===")
-
-        steered_tok = {}  # (factor, l, j) -> int
-
-        for l in tqdm(layers, desc="Phase B layers"):
-            sv = steering_vecs[l]
-            for factor in factors:
-                results = []
-                for start in range(0, n_items, B):
-                    batch = flat_items[start:start + B]
-                    ids, mask, _ = pad_batch([b["full_ids"] for b in batch], pad_id, device)
-                    toks = forward_steered(
-                        model, ids, mask,
-                        [b["open_paren_pos"] for b in batch],
-                        l, sv, factor, prefix_length,
-                    )
-                    for i, b in enumerate(batch):
-                        results.append((b["prompt_idx"], toks[i]))
-                    del ids, mask
-                for j, tid in results:
-                    steered_tok[(factor, l, j)] = tid
-
-        # ------------------------------------------------------------------
-        # Assemble per-prompt DataFrame.
-        # ------------------------------------------------------------------
-        rows = []
-        for l in layers:
-            for b in flat_items:
-                j = b["prompt_idx"]
-                rec = baseline_records[j]
-                row = {
-                    "layer": l,
+        if not need_full:
+            logger.warning("Phase 0 complete (d' only). Skipping Phase A/B — CSV reused.")
+        else:
+            # ----------------------------------------------------------------
+            # Tokenize test prompts.
+            # ----------------------------------------------------------------
+            flat_items = []
+            for j, item in enumerate(test_data):
+                try:
+                    ml = extract_letter(item["answer_matching_behavior"])
+                    nl = extract_letter(item["answer_not_matching_behavior"])
+                except Exception:
+                    continue
+                if ml == nl:
+                    continue
+                try:
+                    _, full_ids, letter_pos, open_paren_pos = build_full_ids(tokenizer, item["question"], ml)
+                except Exception:
+                    continue
+                flat_items.append({
                     "prompt_idx": j,
-                    "question": rec["question"],
-                    "answer_matching_behavior": rec["answer_matching_behavior"],
-                    "matching_letter": rec["matching_letter"],
-                    "notmatch_letter": rec["notmatch_letter"],
-                    "kappa_a": kappa_map.get((l, j), float("nan")),
-                    "baseline_token": rec["baseline_token"],
-                    "baseline_on_format": rec["baseline_on_format"],
-                    "baseline_correct": rec["baseline_correct"],
-                }
-                for factor in factors:
-                    tid = steered_tok.get((factor, l, j))
-                    if tid is None:
-                        row[f"steered_token_{factor:g}"] = ""
-                        row[f"steered_on_format_{factor:g}"] = False
-                        row[f"steered_correct_{factor:g}"] = False
-                        row[f"steering_factor"] = factor
-                    else:
-                        g = decode_letter(tokenizer, tid)
-                        row[f"steered_token_{factor:g}"] = g or tokenizer.decode([tid]).strip()
-                        row[f"steered_on_format_{factor:g}"] = g is not None
-                        row[f"steered_correct_{factor:g}"] = g == b["matching_letter"]
-                # Store all factors in a normalized long format by duplicating across factors.
-                # (We'll unpivot in analysis if needed; the wide format is most convenient here.)
-                rows.append(row)
+                    "matching_letter": ml,
+                    "notmatch_letter": nl,
+                    "full_ids": full_ids,
+                    "letter_pos": letter_pos,
+                    "open_paren_pos": open_paren_pos,
+                })
+            n_items = len(flat_items)
+            logger.warning(f"Valid test items: {n_items}")
 
-        per_prompt_df = pd.DataFrame(rows)
-        per_prompt_df.to_csv(per_prompt_csv, index=False)
-        logger.warning(f"Saved {len(per_prompt_df)} rows to {per_prompt_csv}")
+            # ----------------------------------------------------------------
+            # Phase A: Baseline greedy decode + activation capture.
+            # ----------------------------------------------------------------
+            logger.warning(f"\n=== Phase A: Baseline ({n_items} prompts) ===")
+
+            baseline_tok = {}    # j -> int (token id)
+            act_at_letter = {}   # (j, l) -> tensor [H]
+
+            for start in tqdm(range(0, n_items, B), desc="Phase A"):
+                batch = flat_items[start:start + B]
+                ids, mask, _ = pad_batch([b["full_ids"] for b in batch], pad_id, device)
+                toks, hiddens = forward_capture(
+                    model, ids, mask, layers,
+                    [b["open_paren_pos"] for b in batch],
+                )
+                for i, b in enumerate(batch):
+                    j = b["prompt_idx"]
+                    baseline_tok[j] = toks[i]
+                    for l in layers:
+                        act_at_letter[(j, l)] = hiddens[l][i, b["letter_pos"], :]
+                del hiddens, ids, mask
+
+            # Build baseline records.
+            baseline_records = {}
+            for b in flat_items:
+                j = b["prompt_idx"]
+                g = decode_letter(tokenizer, baseline_tok[j])
+                baseline_records[j] = {
+                    "question": test_data[j]["question"],
+                    "answer_matching_behavior": test_data[j]["answer_matching_behavior"],
+                    "matching_letter": b["matching_letter"],
+                    "notmatch_letter": b["notmatch_letter"],
+                    "baseline_token": g if g else tokenizer.decode([baseline_tok[j]]).strip(),
+                    "baseline_on_format": g is not None,
+                    "baseline_correct": g == b["matching_letter"],
+                }
+
+            # Compute κ_a per (layer, prompt).
+            kappa_map = {}
+            for l in layers:
+                mu_pos, mu_neg = mu_poss[l], mu_negs[l]
+                v = mu_pos - mu_neg
+                v_norm_sq = float(v.dot(v))
+                mu = 0.5 * (mu_pos + mu_neg)
+                for b in flat_items:
+                    j = b["prompt_idx"]
+                    act = act_at_letter[(j, l)]
+                    kappa_map[(l, j)] = float(2.0 * (act - mu).dot(v) / v_norm_sq) \
+                        if v_norm_sq > 1e-12 else float("nan")
+            del act_at_letter
+
+            # ----------------------------------------------------------------
+            # Phase B: Fixed-factor steered greedy decode per (layer, factor).
+            # ----------------------------------------------------------------
+            logger.warning(f"\n=== Phase B: Steered ({len(layers)} layers × {len(factors)} factors) ===")
+
+            steered_tok = {}  # (factor, l, j) -> int
+
+            for l in tqdm(layers, desc="Phase B layers"):
+                sv = steering_vecs[l]
+                for factor in factors:
+                    results = []
+                    for start in range(0, n_items, B):
+                        batch = flat_items[start:start + B]
+                        ids, mask, _ = pad_batch([b["full_ids"] for b in batch], pad_id, device)
+                        toks = forward_steered(
+                            model, ids, mask,
+                            [b["open_paren_pos"] for b in batch],
+                            l, sv, factor, prefix_length,
+                        )
+                        for i, b in enumerate(batch):
+                            results.append((b["prompt_idx"], toks[i]))
+                        del ids, mask
+                    for j, tid in results:
+                        steered_tok[(factor, l, j)] = tid
+
+            # ----------------------------------------------------------------
+            # Assemble per-prompt DataFrame.
+            # ----------------------------------------------------------------
+            rows = []
+            for l in layers:
+                for b in flat_items:
+                    j = b["prompt_idx"]
+                    rec = baseline_records[j]
+                    row = {
+                        "layer": l,
+                        "prompt_idx": j,
+                        "question": rec["question"],
+                        "answer_matching_behavior": rec["answer_matching_behavior"],
+                        "matching_letter": rec["matching_letter"],
+                        "notmatch_letter": rec["notmatch_letter"],
+                        "kappa_a": kappa_map.get((l, j), float("nan")),
+                        "baseline_token": rec["baseline_token"],
+                        "baseline_on_format": rec["baseline_on_format"],
+                        "baseline_correct": rec["baseline_correct"],
+                    }
+                    for factor in factors:
+                        tid = steered_tok.get((factor, l, j))
+                        if tid is None:
+                            row[f"steered_token_{factor:g}"] = ""
+                            row[f"steered_on_format_{factor:g}"] = False
+                            row[f"steered_correct_{factor:g}"] = False
+                            row[f"steering_factor"] = factor
+                        else:
+                            g = decode_letter(tokenizer, tid)
+                            row[f"steered_token_{factor:g}"] = g or tokenizer.decode([tid]).strip()
+                            row[f"steered_on_format_{factor:g}"] = g is not None
+                            row[f"steered_correct_{factor:g}"] = g == b["matching_letter"]
+                    rows.append(row)
+
+            per_prompt_df = pd.DataFrame(rows)
+            per_prompt_df.to_csv(per_prompt_csv, index=False)
+            logger.warning(f"Saved {len(per_prompt_df)} rows to {per_prompt_csv}")
 
     # ------------------------------------------------------------------
     # Analysis: per-layer summary.
     # ------------------------------------------------------------------
-    # Reload dprime if we used the CSV cache.
-    if "dprimes" not in dir():
-        dprimes = {}
 
     layer_rows = []
     for l in sorted(per_prompt_df["layer"].unique()):
