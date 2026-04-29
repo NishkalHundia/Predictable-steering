@@ -1,54 +1,53 @@
 """
-Experiment 1: Directional Information (R^2 ratio).
+Experiment 2: Directional Information with a PLS denominator.
 
-Run TWO methods side-by-side and save plots / CSVs for each:
+Same numerator as Experiment 1 (directional_information.py):
+    R^2(v) = R^2 of  y_b ~ p_v(h)   (univariate, projection along DiffMean v)
 
-  Method 1 ("test_only"):
-    v from training prompts; R^2(v), R^2(h) fit on TEST prompts only.
-    Test labels are the LM-judge baseline behavior scores (factor = 0).
+Different denominator. Instead of fitting y_b ~ h directly (high-d, overfits),
+we project h onto a k-dimensional PLS subspace W in H that maximally covaries
+with y_b, and fit
+    R^2(h_PLS, k) = held-out R^2 of  y_b ~ W h
+We sweep k = 1..k_max, compute held-out R^2 via K-fold CV at each k, and
+pick k* by the elbow / max held-out R^2. The reported ratio is
 
-  Method 2 ("train_plus_test"):
-    v from training prompts (same v); R^2(v), R^2(h) fit on TRAIN + TEST
-    prompts combined. Training labels y_b are mapped from the contrastive
-    label to the extremes of the behavior's score range
-      label = pos -> y_b = score_max,
-      label = neg -> y_b = score_min,
-    so train activations join test activations in the same y_b space.
+    R^2(v) / R^2(h_PLS, k*)
 
-For each layer l (both methods):
-  1. v^l = (mu_pos^l - mu_neg^l) / ||...||  from training activations only.
-     Centroid midpoint m and half-range h come from the training projections.
-  2. For each prompt in the chosen dataset, compute
-        p_v(h_i) = (h_i . v - m) / h.
-  3. Fit on that dataset:
-        y_b ~ p_v(h)  (univariate OLS)              -> R^2(v)
-        y_b ~ h       (RidgeCV on full activation)  -> R^2(h)
-  4. Ratio = R^2(v) / R^2(h)  (clip negative R^2 to 0 before dividing).
-  6. Pull steering effectiveness Delta_l from eval_results.parquet:
-        Delta_l = mean(score | factor > 0, layer = l)
-                  - mean(score | factor = 0, layer = l)
-     and (optionally) normalize by the behavior's score range.
+Run TWO methods side-by-side (same as Exp 1):
+  Method 1 ("test_only"):      v from train; R^2 fit on TEST only
+                                (y_b = LM-judge baseline behavior score)
+  Method 2 ("train_plus_test"): v from train; R^2 fit on TRAIN + TEST
+                                (train y_b mapped to behavior score extremes:
+                                 pos -> score_max, neg -> score_min)
+
+Activation caches reused if available (Exp 1's
+`{sweep_dir}/directional_information_analysis/{train,test}_activations.pt`),
+otherwise this script will extract + cache its own.
 
 Outputs:
-  {sweep_dir}/directional_information_analysis/
-    train_activations.pt
+  {sweep_dir}/directional_information_pls_analysis/
+    train_activations.pt              (cached or symlinked from Exp 1)
     test_activations.pt
-    r2_per_layer__test_only.csv
+    delta_l.csv                       (best-factor improvement, same as Exp 1)
+    pls_k_sweep__test_only.csv        (per (layer, k) held-out R^2)
+    pls_k_sweep__train_plus_test.csv
+    r2_per_layer__test_only.csv       (final R^2(v), R^2(h_PLS, k*), ratio)
     r2_per_layer__train_plus_test.csv
-    delta_l.csv
     analysis_summary.json
     plots/
       layer_sweep__test_only__{behavior}.png
       layer_sweep__train_plus_test__{behavior}.png
       ratio_vs_steering__test_only__{behavior}.png
       ratio_vs_steering__train_plus_test__{behavior}.png
+      pls_k_elbow__test_only__{behavior}.png
+      pls_k_elbow__train_plus_test__{behavior}.png
 
 Usage:
-    uv run python axbench/scripts/projection_tactics/directional_information.py \\
+    uv run python axbench/scripts/projection_tactics/directional_information_pls.py \\
         --behavior corrigible-neutral-HHH \\
         --model_name google/gemma-2-9b-it \\
-        --sweep_dir results/gemma-2-9b-it/corrigible-neutral-HHH-sweep \\
-        --train_dataset_path datasets/generated/gemma-2-9b-it/corrigible-neutral-HHH/train_contrastive.json
+        --sweep_dir /vol/filtered_sweep/gemma-2-9b-it/corrigible-neutral-HHH-sweep \\
+        --train_dataset_path /vol/expanded_datasets/generated/corrigible-neutral-HHH/train_contrastive.json
 """
 import sys
 import json
@@ -60,10 +59,12 @@ from pathlib import Path
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from scipy import stats as scipy_stats
-from sklearn.linear_model import RidgeCV, LinearRegression
+from sklearn.cross_decomposition import PLSRegression
+from sklearn.model_selection import KFold
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import warnings
 
 import logging
 logging.basicConfig(
@@ -75,7 +76,10 @@ logger = logging.getLogger(__name__)
 
 plt.style.use("seaborn-v0_8-whitegrid")
 
-# Same scales as the rest of projection_tactics/.
+# Suppress sklearn PLS warnings about y residual being too small (expected
+# when k approaches the rank of y).
+warnings.filterwarnings("ignore", category=UserWarning, module="sklearn.cross_decomposition")
+
 BEHAVIOR_SCALES = {
     "survival-instinct": (-5, 5, 0),
     "myopic-reward": (-5, 5, 0),
@@ -87,9 +91,14 @@ BEHAVIOR_SCALES = {
 }
 BEHAVIORS = list(BEHAVIOR_SCALES.keys())
 
+METHOD_LABELS = {
+    "test_only": "Method 1: v from train; R^2 fit on TEST only",
+    "train_plus_test": "Method 2: v from train; R^2 fit on TRAIN + TEST",
+}
+
 
 # ============================================================================
-# Helpers (shared with projection_diffmean / projection_lda)
+# Helpers (identical to directional_information.py)
 # ============================================================================
 def supports_chat_template(tokenizer) -> bool:
     return getattr(tokenizer, "chat_template", None) not in (None, "")
@@ -143,19 +152,16 @@ def _format_texts(tokenizer, use_chat, question, answer):
 def _get_mean_response_act(model, tokenizer, target_layers, question, answer,
                            use_chat, device):
     q_text, full_text = _format_texts(tokenizer, use_chat, question, answer)
-
     full_inputs = tokenizer(
         full_text, return_tensors="pt", truncation=True, max_length=1024,
     ).to(device)
     q_inputs = tokenizer(
         q_text, return_tensors="pt", truncation=True, max_length=1024,
     ).to(device)
-
     q_len = q_inputs["input_ids"].shape[1]
     f_len = full_inputs["input_ids"].shape[1]
     if f_len <= q_len:
         return None
-
     layer_acts = gather_multi_layer_activations(
         model, target_layers,
         {"input_ids": full_inputs["input_ids"],
@@ -168,9 +174,6 @@ def _get_mean_response_act(model, tokenizer, target_layers, question, answer,
     return result
 
 
-# ============================================================================
-# Phase 1 - training activations
-# ============================================================================
 @torch.no_grad()
 def extract_train_activations(model, tokenizer, train_dataset_path,
                               target_layers, device):
@@ -179,10 +182,8 @@ def extract_train_activations(model, tokenizer, train_dataset_path,
     with open(train_dataset_path, encoding="utf-8") as f:
         train_data = json.load(f)
     logger.warning(f"Extracting training activations for {len(train_data)} pairs")
-
     train_acts = {l: {"pos": [], "neg": []} for l in target_layers}
     train_meta = []
-
     for pair_idx, item in enumerate(tqdm(train_data, desc="Train activations")):
         for label, answer_key in [(1, "answer_matching_behavior"),
                                   (0, "answer_not_matching_behavior")]:
@@ -198,13 +199,11 @@ def extract_train_activations(model, tokenizer, train_dataset_path,
             for layer in target_layers:
                 train_acts[layer][key].append(mean_acts[layer])
             train_meta.append({
-                "pair_idx": pair_idx,
-                "label": label,
+                "pair_idx": pair_idx, "label": label,
                 "label_name": "pos" if label == 1 else "neg",
             })
         if torch.cuda.is_available() and pair_idx % 5 == 0:
             torch.cuda.empty_cache()
-
     for layer in target_layers:
         logger.warning(
             f"  Layer {layer}: {len(train_acts[layer]['pos'])} pos, "
@@ -213,16 +212,60 @@ def extract_train_activations(model, tokenizer, train_dataset_path,
     return train_acts, train_meta
 
 
-# ============================================================================
-# Phase 2 - DiffMean direction + centroid normalization
-# ============================================================================
-def compute_diffmean_directions(train_acts, target_layers):
-    """v^l = (mu_pos - mu_neg) / ||...||  per layer.
+@torch.no_grad()
+def extract_test_activations(model, tokenizer, sweep_dir, target_layers, device):
+    use_chat = supports_chat_template(tokenizer)
+    model.eval()
+    sweep_dir = Path(sweep_dir)
+    first_layer = target_layers[0]
+    eval_df = pd.read_parquet(
+        sweep_dir / f"layer_{first_layer}" / "eval" / "eval_results.parquet"
+    )
+    baseline_df = eval_df[eval_df["steering_factor"] == 0].copy().reset_index(drop=True)
+    if baseline_df.empty:
+        closest = eval_df.loc[eval_df["steering_factor"].abs().idxmin(), "steering_factor"]
+        baseline_df = eval_df[eval_df["steering_factor"] == closest].copy().reset_index(drop=True)
+        logger.warning(f"No factor=0 found; using factor={closest}")
+    baseline_scores = {}
+    for layer in target_layers:
+        layer_eval = pd.read_parquet(
+            sweep_dir / f"layer_{layer}" / "eval" / "eval_results.parquet"
+        )
+        f0 = layer_eval[layer_eval["steering_factor"] == 0]
+        baseline_scores[layer] = dict(zip(f0["question_idx"], f0["behavior_score"]))
+    logger.warning(f"Extracting test activations for {len(baseline_df)} prompts")
+    test_mean_acts = {}
+    test_metadata = []
+    for idx in tqdm(range(len(baseline_df)), desc="Test activations"):
+        row = baseline_df.iloc[idx]
+        question = row["question"]
+        generation = row["generation"]
+        question_idx = int(row.get("question_idx", idx))
+        if pd.isna(generation) or str(generation).strip() == "":
+            continue
+        mean_acts = _get_mean_response_act(
+            model, tokenizer, target_layers, question, str(generation),
+            use_chat, device,
+        )
+        if mean_acts is None:
+            continue
+        for layer in target_layers:
+            act = mean_acts[layer]
+            bs = baseline_scores.get(layer, {}).get(question_idx, np.nan)
+            test_mean_acts[(question_idx, int(layer))] = act.cpu()
+            test_metadata.append({
+                "question_idx": question_idx, "layer": int(layer),
+                "baseline_score": bs, "question": question,
+                "generation": str(generation),
+            })
+        if torch.cuda.is_available() and idx % 5 == 0:
+            torch.cuda.empty_cache()
+    logger.warning(f"Extracted {len(test_metadata)} (prompt, layer) entries")
+    return test_mean_acts, test_metadata
 
-    Also returns per-layer centroid midpoint m and half-range h (from
-    train projections) for the same centroid normalization used in
-    projection_diffmean / projection_lda.
-    """
+
+def compute_diffmean_directions(train_acts, target_layers):
+    """v^l = (mu_pos - mu_neg) / ||...||  per layer, plus centroid m, h."""
     directions = {}
     centroid_norm = {}
     for layer in target_layers:
@@ -232,12 +275,10 @@ def compute_diffmean_directions(train_acts, target_layers):
         mu_neg = neg.mean(dim=0)
         diff = mu_pos - mu_neg
         v = diff / max(diff.norm().item(), 1e-12)
-
         c_pos = mu_pos.dot(v).item()
         c_neg = mu_neg.dot(v).item()
         m = 0.5 * (c_pos + c_neg)
         h = 0.5 * (c_pos - c_neg)
-
         directions[layer] = v
         centroid_norm[layer] = {
             "c_pos": c_pos, "c_neg": c_neg, "midpoint": m, "half_range": h,
@@ -249,78 +290,7 @@ def compute_diffmean_directions(train_acts, target_layers):
     return directions, centroid_norm
 
 
-# ============================================================================
-# Phase 3 - test activations + projection
-# ============================================================================
-@torch.no_grad()
-def extract_test_activations(model, tokenizer, sweep_dir, target_layers, device):
-    """For each test prompt's unsteered (factor=0) generation, store the full
-    mean response-token activation h_i^l + the associated baseline score."""
-    use_chat = supports_chat_template(tokenizer)
-    model.eval()
-    sweep_dir = Path(sweep_dir)
-
-    first_layer = target_layers[0]
-    eval_df = pd.read_parquet(
-        sweep_dir / f"layer_{first_layer}" / "eval" / "eval_results.parquet"
-    )
-    baseline_df = eval_df[eval_df["steering_factor"] == 0].copy().reset_index(drop=True)
-    if baseline_df.empty:
-        closest = eval_df.loc[eval_df["steering_factor"].abs().idxmin(), "steering_factor"]
-        baseline_df = eval_df[eval_df["steering_factor"] == closest].copy().reset_index(drop=True)
-        logger.warning(f"No factor=0 found; using factor={closest}")
-
-    baseline_scores = {}
-    for layer in target_layers:
-        layer_eval = pd.read_parquet(
-            sweep_dir / f"layer_{layer}" / "eval" / "eval_results.parquet"
-        )
-        f0 = layer_eval[layer_eval["steering_factor"] == 0]
-        baseline_scores[layer] = dict(zip(f0["question_idx"], f0["behavior_score"]))
-
-    logger.warning(f"Extracting test activations for {len(baseline_df)} prompts")
-
-    test_mean_acts = {}   # (question_idx, layer) -> tensor
-    test_metadata = []
-
-    for idx in tqdm(range(len(baseline_df)), desc="Test activations"):
-        row = baseline_df.iloc[idx]
-        question = row["question"]
-        generation = row["generation"]
-        question_idx = int(row.get("question_idx", idx))
-
-        if pd.isna(generation) or str(generation).strip() == "":
-            continue
-
-        mean_acts = _get_mean_response_act(
-            model, tokenizer, target_layers, question, str(generation),
-            use_chat, device,
-        )
-        if mean_acts is None:
-            continue
-
-        for layer in target_layers:
-            act = mean_acts[layer]
-            bs = baseline_scores.get(layer, {}).get(question_idx, np.nan)
-            test_mean_acts[(question_idx, int(layer))] = act.cpu()
-            test_metadata.append({
-                "question_idx": question_idx,
-                "layer": int(layer),
-                "baseline_score": bs,
-                "question": question,
-                "generation": str(generation),
-            })
-
-        if torch.cuda.is_available() and idx % 5 == 0:
-            torch.cuda.empty_cache()
-
-    logger.warning(f"Extracted {len(test_metadata)} (prompt, layer) entries")
-    return test_mean_acts, test_metadata
-
-
 def stack_layer_test(test_mean_acts, test_metadata, layer):
-    """Per-layer (H, y, qids) arrays for the regressions, TEST prompts only.
-    y is the LM-judge baseline behavior score."""
     H, y, qids = [], [], []
     for entry in test_metadata:
         if int(entry["layer"]) != int(layer):
@@ -340,51 +310,95 @@ def stack_layer_test(test_mean_acts, test_metadata, layer):
 
 
 def train_label_to_yb(behavior, label):
-    """Map a binary contrastive label to a y_b value at the behavior's
-    score-range extremes (label = 1 -> max, label = 0 -> min)."""
     score_min, score_max, _ = BEHAVIOR_SCALES.get(behavior, (0.0, 1.0, None))
     return float(score_max) if int(label) == 1 else float(score_min)
 
 
 def stack_layer_train(train_acts, behavior, layer):
-    """Per-layer (H, y) for training prompts, with y_b mapped to the
-    behavior's score-range extremes."""
     H, y = [], []
     pos_acts = train_acts.get(layer, {}).get("pos", [])
     neg_acts = train_acts.get(layer, {}).get("neg", [])
     yb_pos = train_label_to_yb(behavior, 1)
     yb_neg = train_label_to_yb(behavior, 0)
     for a in pos_acts:
-        H.append(a.numpy())
-        y.append(yb_pos)
+        H.append(a.numpy()); y.append(yb_pos)
     for a in neg_acts:
-        H.append(a.numpy())
-        y.append(yb_neg)
+        H.append(a.numpy()); y.append(yb_neg)
     if not H:
         return np.zeros((0, 0)), np.zeros(0)
     return np.stack(H, axis=0), np.array(y, dtype=float)
 
 
-def stack_layer_combined(test_mean_acts, test_metadata, train_acts,
-                         behavior, layer):
-    """Per-layer (H, y) for TRAIN + TEST. Train rows use the mapped extreme
-    y_b; test rows use the LM-judge baseline behavior score."""
-    H_test, y_test, _ = stack_layer_test(test_mean_acts, test_metadata, layer)
-    H_train, y_train = stack_layer_train(train_acts, behavior, layer)
-    if H_test.size == 0 and H_train.size == 0:
-        return np.zeros((0, 0)), np.zeros(0)
-    if H_test.size == 0:
-        return H_train, y_train
-    if H_train.size == 0:
-        return H_test, y_test
-    return np.concatenate([H_train, H_test], axis=0), np.concatenate([y_train, y_test])
+# ============================================================================
+# Delta_l (best-factor improvement, identical to Exp 1)
+# ============================================================================
+def compute_delta_l(sweep_dir, target_layers, behavior, normalize=True):
+    sweep_dir = Path(sweep_dir)
+    score_min, score_max, _ = BEHAVIOR_SCALES.get(behavior, (None, None, None))
+    score_range = (score_max - score_min) if (score_min is not None and score_max is not None) else 1.0
+
+    rows = []
+    for layer in target_layers:
+        path = sweep_dir / f"layer_{layer}" / "eval" / "eval_results.parquet"
+        row = {
+            "layer": int(layer), "n_baseline": 0, "n_steered": 0,
+            "baseline_mean": np.nan,
+            "best_factor": np.nan, "best_factor_mean": np.nan,
+            "steered_mean_pos": np.nan,
+            "delta_l_raw": np.nan, "delta_l": np.nan,
+            "delta_l_mean_pos_raw": np.nan, "delta_l_mean_pos": np.nan,
+        }
+        if not path.exists():
+            rows.append(row); continue
+        df = pd.read_parquet(path)
+        base = df[df["steering_factor"] == 0]["behavior_score"].dropna()
+        if len(base) == 0:
+            rows.append(row); continue
+        baseline_mean = float(base.mean())
+        row.update({"n_baseline": int(len(base)), "baseline_mean": baseline_mean})
+
+        per_factor = (
+            df.dropna(subset=["behavior_score"])
+              .groupby("steering_factor")["behavior_score"]
+              .mean().sort_index()
+        )
+        if per_factor.empty:
+            rows.append(row); continue
+
+        best_factor = float(per_factor.idxmax())
+        best_factor_mean = float(per_factor.max())
+        delta_raw = best_factor_mean - baseline_mean
+
+        pos_factors = per_factor[per_factor.index > 0]
+        if not pos_factors.empty:
+            steered_mean_pos = float(pos_factors.mean())
+            delta_mp_raw = steered_mean_pos - baseline_mean
+            n_steered = int(df[df["steering_factor"] > 0]["behavior_score"].notna().sum())
+        else:
+            steered_mean_pos = np.nan
+            delta_mp_raw = np.nan
+            n_steered = 0
+
+        row.update({
+            "n_steered": n_steered,
+            "best_factor": best_factor, "best_factor_mean": best_factor_mean,
+            "steered_mean_pos": steered_mean_pos,
+            "delta_l_raw": delta_raw,
+            "delta_l": delta_raw / score_range if normalize else delta_raw,
+            "delta_l_mean_pos_raw": delta_mp_raw,
+            "delta_l_mean_pos": (
+                delta_mp_raw / score_range if (normalize and not np.isnan(delta_mp_raw))
+                else delta_mp_raw
+            ),
+        })
+        rows.append(row)
+    return pd.DataFrame(rows)
 
 
 # ============================================================================
-# Phase 4 / 5 - R^2 computations
+# PLS denominator
 # ============================================================================
 def _r2_score(y, y_pred):
-    """Standard 1 - SS_res/SS_tot."""
     y = np.asarray(y, dtype=float)
     y_pred = np.asarray(y_pred, dtype=float)
     ss_tot = float(((y - y.mean()) ** 2).sum())
@@ -394,28 +408,90 @@ def _r2_score(y, y_pred):
     return 1.0 - ss_res / ss_tot
 
 
-def compute_r2_metrics(test_mean_acts, test_metadata, directions,
+def _oof_pls_r2(X, y, k, n_splits=5, seed=0):
+    """Out-of-fold R^2 for PLS regression with k components."""
+    n = len(y)
+    if n < n_splits + 1 or k < 1:
+        return float("nan")
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    y_pred = np.full(n, np.nan, dtype=float)
+    for tr, te in kf.split(X):
+        # k cannot exceed min(n_train, d).
+        max_k = min(len(tr) - 1, X.shape[1])
+        k_fold = min(k, max_k)
+        if k_fold < 1:
+            return float("nan")
+        try:
+            pls = PLSRegression(n_components=k_fold, scale=True, max_iter=1000)
+            pls.fit(X[tr], y[tr])
+            pred = pls.predict(X[te])
+            y_pred[te] = pred.ravel()
+        except Exception as e:
+            logger.warning(f"PLS fit failed (k={k_fold}): {e}")
+            return float("nan")
+    if np.isnan(y_pred).any():
+        return float("nan")
+    ss_tot = float(((y - y.mean()) ** 2).sum())
+    if ss_tot < 1e-12:
+        return float("nan")
+    ss_res = float(((y - y_pred) ** 2).sum())
+    return 1.0 - ss_res / ss_tot
+
+
+def sweep_pls_k(X, y, k_min=1, k_max=20, n_splits=5, seed=0):
+    """Per-k held-out R^2. Returns DataFrame with columns layer-agnostic
+    (k, r2_held_out)."""
+    n = len(y)
+    d = X.shape[1] if X.size else 0
+    # Practical cap: PLS components <= min(n_train_per_fold-1, d)
+    if n < n_splits + 1:
+        return pd.DataFrame(columns=["k", "r2_held_out"])
+    n_train_per_fold = n - n // n_splits
+    hard_cap = min(n_train_per_fold - 1, d)
+    k_top = max(1, min(k_max, hard_cap))
+    rows = []
+    for k in range(k_min, k_top + 1):
+        r2 = _oof_pls_r2(X, y, k, n_splits=n_splits, seed=seed)
+        rows.append({"k": int(k), "r2_held_out": float(r2)})
+    return pd.DataFrame(rows)
+
+
+def pick_k_elbow(k_sweep_df):
+    """Return k* = smallest k whose held-out R^2 is within `tol` of the max
+    (kneedle-style 'elbow'); fallback to argmax if no clear elbow.
+
+    Tol: 5% of (max - min)  capped at 0.02 absolute.
+    """
+    if k_sweep_df.empty or k_sweep_df["r2_held_out"].isna().all():
+        return None, np.nan
+    df = k_sweep_df.dropna(subset=["r2_held_out"]).sort_values("k").reset_index(drop=True)
+    r2_max = float(df["r2_held_out"].max())
+    r2_min = float(df["r2_held_out"].min())
+    spread = r2_max - r2_min
+    tol = max(min(0.05 * spread, 0.02), 1e-6)
+    eligible = df[df["r2_held_out"] >= (r2_max - tol)]
+    if eligible.empty:
+        idx = int(df["r2_held_out"].idxmax())
+        return int(df.loc[idx, "k"]), r2_max
+    k_star = int(eligible["k"].min())
+    r2_star = float(df[df["k"] == k_star]["r2_held_out"].iloc[0])
+    return k_star, r2_star
+
+
+def compute_pls_metrics(test_mean_acts, test_metadata, directions,
                        centroid_norm, target_layers, train_acts, behavior,
-                       mode="test_only",
-                       ridge_alphas=(1e-1, 1.0, 10.0, 1e2, 1e3, 1e4, 1e5)):
-    """Per layer, fit R^2(v) and R^2(h) on the dataset selected by `mode`:
-
-      - "test_only":      regression dataset = test prompts only
-                          (y_b = LM-judge baseline score)
-      - "train_plus_test": regression dataset = train + test prompts
-                           (train y_b mapped to behavior score extremes;
-                            test y_b = LM-judge baseline score)
-
-    v is always the DiffMean direction computed from the training set.
+                       mode="test_only", k_max=20, n_splits=5, seed=0):
+    """Per layer, compute R^2(v), sweep PLS k for R^2(h_PLS), pick k*,
+    return one row per layer plus the full per-(layer, k) sweep table.
     """
     if mode not in ("test_only", "train_plus_test"):
         raise ValueError(f"Unknown mode: {mode}")
 
-    logger.warning(f"--- compute_r2_metrics (mode = {mode}) ---")
-
+    logger.warning(f"--- compute_pls_metrics (mode = {mode}) ---")
     rows = []
+    sweep_rows = []
+
     for layer in target_layers:
-        # Always pull both test and train so we can log sizes consistently.
         H_test, y_test, _ = stack_layer_test(test_mean_acts, test_metadata, layer)
         H_train, y_train = stack_layer_train(train_acts, behavior, layer)
         n_test = len(y_test)
@@ -439,19 +515,18 @@ def compute_r2_metrics(test_mean_acts, test_metadata, directions,
         logger.warning(
             f"  Layer {int(layer):2d} [{mode}]: "
             f"v from {n_train_pos} pos / {n_train_neg} neg train  |  "
-            f"regression on n_fit = {n_fit} "
+            f"PLS / R^2 on n_fit = {n_fit} "
             f"({'test only' if mode == 'test_only' else f'{n_train} train + {n_test} test'})  "
             f"d(h) = {d}"
         )
 
-        if n_fit < 4:
+        if n_fit < n_splits + 1:
             rows.append({
                 "layer": int(layer), "mode": mode,
                 "n_train_pos": int(n_train_pos), "n_train_neg": int(n_train_neg),
                 "n_test": int(n_test), "n_fit": int(n_fit), "d_h": int(d),
-                "r2_v": np.nan, "r2_h": np.nan, "ratio": np.nan,
-                "pearson_r_v": np.nan, "spearman_rho_v": np.nan,
-                "ridge_alpha": np.nan,
+                "r2_v": np.nan, "r2_h_pls": np.nan, "k_star": np.nan,
+                "ratio": np.nan, "pearson_r_v": np.nan, "spearman_rho_v": np.nan,
             })
             continue
 
@@ -462,22 +537,32 @@ def compute_r2_metrics(test_mean_acts, test_metadata, directions,
         proj_raw = H_fit @ v
         proj = (proj_raw - m) / (h if abs(h) > 1e-12 else 1.0)
 
-        # R^2(v) = in-sample R^2 of y_b ~ p_v(h)  (univariate OLS).
+        # R^2(v): Pearson r squared (univariate OLS in-sample = r^2).
         pr, _ = scipy_stats.pearsonr(proj, y_fit)
         sr, _ = scipy_stats.spearmanr(proj, y_fit)
         r2_v = float(pr * pr)
 
-        # R^2(h) = in-sample R^2 of y_b ~ h  with RidgeCV.
-        ridge = RidgeCV(alphas=ridge_alphas)
-        ridge.fit(H_fit.astype(np.float64), y_fit)
-        y_pred_h = ridge.predict(H_fit.astype(np.float64))
-        r2_h = _r2_score(y_fit, y_pred_h)
-        ridge_alpha = float(getattr(ridge, "alpha_", np.nan))
+        # R^2(h_PLS): sweep k, pick elbow.
+        k_sweep_df = sweep_pls_k(H_fit.astype(np.float64), y_fit,
+                                  k_min=1, k_max=k_max, n_splits=n_splits, seed=seed)
+        if k_sweep_df.empty:
+            r2_h_pls = np.nan
+            k_star = np.nan
+        else:
+            k_star, r2_h_pls = pick_k_elbow(k_sweep_df)
+            if r2_h_pls is None or np.isnan(r2_h_pls):
+                k_star = np.nan; r2_h_pls = np.nan
+
+        for _, kr in k_sweep_df.iterrows():
+            sweep_rows.append({
+                "layer": int(layer), "mode": mode,
+                "k": int(kr["k"]),
+                "r2_held_out": float(kr["r2_held_out"]) if not pd.isna(kr["r2_held_out"]) else np.nan,
+            })
 
         r2_v_clip = max(r2_v, 0.0) if not np.isnan(r2_v) else np.nan
-        r2_h_clip = max(r2_h, 0.0) if not np.isnan(r2_h) else np.nan
-        if (not np.isnan(r2_v_clip) and not np.isnan(r2_h_clip)
-                and r2_h_clip > 1e-6):
+        r2_h_clip = max(r2_h_pls, 0.0) if not np.isnan(r2_h_pls) else np.nan
+        if not np.isnan(r2_v_clip) and not np.isnan(r2_h_clip) and r2_h_clip > 1e-6:
             ratio = r2_v_clip / r2_h_clip
         else:
             ratio = np.nan
@@ -486,152 +571,46 @@ def compute_r2_metrics(test_mean_acts, test_metadata, directions,
             "layer": int(layer), "mode": mode,
             "n_train_pos": int(n_train_pos), "n_train_neg": int(n_train_neg),
             "n_test": int(n_test), "n_fit": int(n_fit), "d_h": int(d),
-            "r2_v": float(r2_v), "r2_h": float(r2_h),
-            "r2_v_clip": float(r2_v_clip), "r2_h_clip": float(r2_h_clip),
+            "r2_v": float(r2_v),
+            "r2_h_pls": float(r2_h_pls) if not np.isnan(r2_h_pls) else np.nan,
+            "r2_v_clip": float(r2_v_clip) if not np.isnan(r2_v_clip) else np.nan,
+            "r2_h_clip": float(r2_h_clip) if not np.isnan(r2_h_clip) else np.nan,
+            "k_star": int(k_star) if k_star is not None and not (isinstance(k_star, float) and np.isnan(k_star)) else np.nan,
             "ratio": float(ratio) if not np.isnan(ratio) else np.nan,
             "pearson_r_v": float(pr), "spearman_rho_v": float(sr),
-            "ridge_alpha": ridge_alpha,
         })
         logger.warning(
             f"  Layer {int(layer):2d} [{mode}]: "
-            f"R^2(v) = {r2_v:+.3f}  R^2(h) = {r2_h:+.3f}  "
-            f"ratio = {ratio if not np.isnan(ratio) else float('nan'):+.3f}  "
-            f"(ridge alpha = {ridge_alpha:.2g})"
+            f"R^2(v) = {r2_v:+.3f}  k* = {k_star}  R^2(h_PLS, k*) = "
+            f"{r2_h_pls if not np.isnan(r2_h_pls) else float('nan'):+.3f}  "
+            f"ratio = {ratio if not np.isnan(ratio) else float('nan'):+.3f}"
         )
-    return pd.DataFrame(rows)
-
-
-# ============================================================================
-# Phase 6 - steering effectiveness Delta_l
-# ============================================================================
-def compute_delta_l(sweep_dir, target_layers, behavior, normalize=True):
-    """Per layer, steering-effectiveness Delta_l.
-
-    Matches the convention in sweep_layers_open_ended.py:summarize_eval and
-    its downstream `factor_max_avg - factor_0_avg` reporting:
-
-        Delta_l = max_f mean(score | factor = f) - mean(score | factor = 0)
-
-    i.e. the best-achieved mean steered score across the swept factors,
-    minus the baseline. Averaging across all positive factors (the older
-    formulation) is not what the rest of the pipeline calls 'steering
-    effectiveness': at deep layers, large factors often degrade output and
-    drag that average back to baseline.
-
-    Also returns the older mean-of-positive-factors variant under
-    `delta_l_mean_pos` for reference.
-
-    If `normalize=True`, both Delta_l columns are divided by the behavior's
-    score range (max - min).
-    """
-    sweep_dir = Path(sweep_dir)
-    score_min, score_max, _ = BEHAVIOR_SCALES.get(behavior, (None, None, None))
-    score_range = (score_max - score_min) if (score_min is not None and score_max is not None) else 1.0
-
-    rows = []
-    for layer in target_layers:
-        path = sweep_dir / f"layer_{layer}" / "eval" / "eval_results.parquet"
-        row = {
-            "layer": int(layer),
-            "n_baseline": 0, "n_steered": 0,
-            "baseline_mean": np.nan,
-            "best_factor": np.nan, "best_factor_mean": np.nan,
-            "steered_mean_pos": np.nan,
-            "delta_l_raw": np.nan, "delta_l": np.nan,
-            "delta_l_mean_pos_raw": np.nan, "delta_l_mean_pos": np.nan,
-        }
-        if not path.exists():
-            rows.append(row)
-            continue
-
-        df = pd.read_parquet(path)
-        base = df[df["steering_factor"] == 0]["behavior_score"].dropna()
-        if len(base) == 0:
-            rows.append(row)
-            continue
-        baseline_mean = float(base.mean())
-        row.update({
-            "n_baseline": int(len(base)),
-            "baseline_mean": baseline_mean,
-        })
-
-        # Per-factor mean across all swept factors.
-        per_factor = (
-            df.dropna(subset=["behavior_score"])
-              .groupby("steering_factor")["behavior_score"]
-              .mean()
-              .sort_index()
-        )
-        if per_factor.empty:
-            rows.append(row)
-            continue
-
-        # Best factor in absolute terms (max avg_score).
-        best_factor = float(per_factor.idxmax())
-        best_factor_mean = float(per_factor.max())
-        delta_raw = best_factor_mean - baseline_mean
-
-        # Mean of positive-factor scores (legacy variant).
-        pos_factors = per_factor[per_factor.index > 0]
-        if not pos_factors.empty:
-            steered_mean_pos = float(pos_factors.mean())
-            delta_mp_raw = steered_mean_pos - baseline_mean
-            n_steered = int(
-                df[df["steering_factor"] > 0]["behavior_score"].notna().sum()
-            )
-        else:
-            steered_mean_pos = np.nan
-            delta_mp_raw = np.nan
-            n_steered = 0
-
-        row.update({
-            "n_steered": n_steered,
-            "best_factor": best_factor,
-            "best_factor_mean": best_factor_mean,
-            "steered_mean_pos": steered_mean_pos,
-            "delta_l_raw": delta_raw,
-            "delta_l": delta_raw / score_range if normalize else delta_raw,
-            "delta_l_mean_pos_raw": delta_mp_raw,
-            "delta_l_mean_pos": (
-                delta_mp_raw / score_range if (normalize and not np.isnan(delta_mp_raw))
-                else delta_mp_raw
-            ),
-        })
-        rows.append(row)
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows), pd.DataFrame(sweep_rows)
 
 
 # ============================================================================
 # Plots
 # ============================================================================
-METHOD_LABELS = {
-    "test_only": "Method 1: v from train; R^2 fit on TEST only",
-    "train_plus_test": "Method 2: v from train; R^2 fit on TRAIN + TEST",
-}
-
-
 def plot_layer_sweep(metrics_df, behavior, output_path, method,
                      layer_lo=10, layer_hi=32):
-    """Plot 1: 3-panel layer sweep (top R^2(h), middle R^2(v), bottom ratio)."""
+    """3-panel layer sweep: top R^2(h_PLS), middle R^2(v), bottom ratio."""
     df = metrics_df.sort_values("layer").reset_index(drop=True)
     layers = df["layer"].values
 
     fig, axes = plt.subplots(3, 1, figsize=(10, 9.5), sharex=True)
 
-    # Top: R^2(h)
     ax = axes[0]
-    ax.plot(layers, df["r2_h"].values, "o-", color="#1f77b4", linewidth=2,
-            markersize=6, label=r"$R^2(h)$")
+    ax.plot(layers, df["r2_h_pls"].values, "o-", color="#1f77b4", linewidth=2,
+            markersize=6, label=r"$R^2(h_{PLS}, k^\ast)$ (held-out)")
     ax.axhline(y=0, color="gray", linestyle=":", alpha=0.6)
-    ax.set_ylabel(r"$R^2(h)$  (full activation)", fontsize=10)
+    ax.set_ylabel(r"$R^2(h_{PLS})$  (PLS subspace)", fontsize=10)
     ax.set_title(
-        f"{behavior} - Layer sweep of directional information\n"
+        f"{behavior} - Layer sweep of directional information (PLS denominator)\n"
         f"{METHOD_LABELS.get(method, method)}",
         fontsize=12, fontweight="bold",
     )
     ax.legend(loc="best", fontsize=9)
 
-    # Middle: R^2(v)
     ax = axes[1]
     ax.plot(layers, df["r2_v"].values, "o-", color="#2ca02c", linewidth=2,
             markersize=6, label=r"$R^2(v)$")
@@ -639,28 +618,24 @@ def plot_layer_sweep(metrics_df, behavior, output_path, method,
     ax.set_ylabel(r"$R^2(v)$  (DiffMean projection)", fontsize=10)
     ax.legend(loc="best", fontsize=9)
 
-    # Bottom: ratio R^2(v) / R^2(h)
     ax = axes[2]
     ax.plot(layers, df["ratio"].values, "o-", color="#d62728", linewidth=2,
-            markersize=6, label=r"$R^2(v)/R^2(h)$")
+            markersize=6, label=r"$R^2(v)/R^2(h_{PLS}, k^\ast)$")
     ax.axhline(y=1.0, color="black", linestyle="--", alpha=0.7,
                label="ratio = 1")
-    ax.set_ylabel(r"$R^2(v)/R^2(h)$", fontsize=10)
+    ax.set_ylabel(r"$R^2(v)/R^2(h_{PLS})$", fontsize=10)
     ax.set_xlabel("Layer", fontsize=11)
     ax.legend(loc="best", fontsize=9)
 
-    # Annotate the per-layer fit-set sizes (constant across layers in
-    # practice, but captured in the metrics so we surface them).
     if not df.empty:
         n_fit = int(df["n_fit"].dropna().iloc[0]) if df["n_fit"].notna().any() else 0
         n_train_pos = int(df["n_train_pos"].dropna().iloc[0]) if df["n_train_pos"].notna().any() else 0
         n_train_neg = int(df["n_train_neg"].dropna().iloc[0]) if df["n_train_neg"].notna().any() else 0
         n_test = int(df["n_test"].dropna().iloc[0]) if df["n_test"].notna().any() else 0
         info = (f"v from train: {n_train_pos} pos / {n_train_neg} neg   "
-                f"|   regression n_fit = {n_fit}   "
+                f"|   PLS / R^2 on n_fit = {n_fit}   "
                 f"|   test n = {n_test}")
-        fig.text(0.5, 0.005, info, ha="center", fontsize=8.5,
-                 color="dimgray")
+        fig.text(0.5, 0.005, info, ha="center", fontsize=8.5, color="dimgray")
 
     for a in axes:
         a.set_xlim(layer_lo - 0.5, layer_hi + 0.5)
@@ -673,8 +648,6 @@ def plot_layer_sweep(metrics_df, behavior, output_path, method,
 
 
 def plot_ratio_vs_steering(metrics_df, delta_df, behavior, output_path, method):
-    """Plot 2: scatter of ratio vs Delta_l, one labeled point per layer."""
-    # Only merge in delta_l if metrics_df doesn't already have it.
     if "delta_l" in metrics_df.columns:
         df = metrics_df.copy()
     else:
@@ -685,10 +658,8 @@ def plot_ratio_vs_steering(metrics_df, delta_df, behavior, output_path, method):
         return
 
     fig, ax = plt.subplots(figsize=(9, 7))
-
     ax.scatter(df["ratio"], df["delta_l"], s=80,
                color="#2E86AB", edgecolors="black", linewidths=0.6, zorder=3)
-
     for _, r in df.iterrows():
         ax.annotate(
             f"{int(r['layer'])}",
@@ -696,7 +667,6 @@ def plot_ratio_vs_steering(metrics_df, delta_df, behavior, output_path, method):
             xytext=(5, 4), textcoords="offset points",
             fontsize=9, color="black",
         )
-
     ax.axvline(x=1.0, color="black", linestyle="--", alpha=0.6, linewidth=1,
                label="ratio = 1")
     ax.axhline(y=0.0, color="gray", linestyle=":", alpha=0.6, linewidth=1)
@@ -711,17 +681,68 @@ def plot_ratio_vs_steering(metrics_df, delta_df, behavior, output_path, method):
             bbox=dict(boxstyle="round,pad=0.35", facecolor="wheat", alpha=0.85),
         )
 
-    ax.set_xlabel(r"$R^2(v)/R^2(h)$  (directional information)", fontsize=11)
+    ax.set_xlabel(r"$R^2(v)/R^2(h_{PLS}, k^\ast)$  (PLS directional information)",
+                  fontsize=11)
     ax.set_ylabel(r"$\Delta_l$  (normalized steering improvement)", fontsize=11)
     ax.set_title(
-        f"{behavior}: directional information vs steering effectiveness\n"
+        f"{behavior}: PLS directional information vs steering effectiveness\n"
         f"{METHOD_LABELS.get(method, method)}",
         fontsize=12, fontweight="bold",
     )
     ax.legend(fontsize=9, loc="lower right")
     ax.grid(True, alpha=0.4)
-
     plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close()
+
+
+def plot_pls_k_elbow(sweep_df, metrics_df, behavior, output_path, method):
+    """Per-layer held-out R^2 vs k. One small-multiple panel per layer.
+    Marks chosen k* with a vertical line."""
+    if sweep_df.empty:
+        logger.warning(f"plot_pls_k_elbow [{method}]: sweep_df empty")
+        return
+
+    layers = sorted(sweep_df["layer"].unique())
+    n = len(layers)
+    cols = min(6, n) if n > 0 else 1
+    rows = int(np.ceil(n / cols))
+    fig, axes = plt.subplots(rows, cols, figsize=(cols * 2.6, rows * 2.4),
+                              sharex=False, sharey=False)
+    axes = np.atleast_2d(axes)
+
+    metrics_lookup = metrics_df.set_index("layer")["k_star"].to_dict() if not metrics_df.empty else {}
+
+    for idx, layer in enumerate(layers):
+        r, c = idx // cols, idx % cols
+        ax = axes[r][c]
+        ldf = sweep_df[sweep_df["layer"] == layer].sort_values("k")
+        ax.plot(ldf["k"].values, ldf["r2_held_out"].values, "o-",
+                color="#1f77b4", markersize=4, linewidth=1.5)
+        k_star = metrics_lookup.get(layer, np.nan)
+        if not (isinstance(k_star, float) and np.isnan(k_star)):
+            ax.axvline(x=k_star, color="#d62728", linestyle="--",
+                       linewidth=1.2, alpha=0.85)
+            ax.text(0.97, 0.05, f"k* = {int(k_star)}", transform=ax.transAxes,
+                    fontsize=8, ha="right", va="bottom",
+                    bbox=dict(boxstyle="round,pad=0.2",
+                              facecolor="wheat", alpha=0.85))
+        ax.axhline(y=0, color="gray", linestyle=":", alpha=0.5)
+        ax.set_title(f"Layer {int(layer)}", fontsize=10)
+        ax.grid(True, alpha=0.4)
+        ax.set_xlabel("k", fontsize=9)
+        ax.set_ylabel(r"OOF $R^2$", fontsize=9)
+
+    # Hide unused axes.
+    for idx in range(n, rows * cols):
+        r, c = idx // cols, idx % cols
+        axes[r][c].set_visible(False)
+
+    fig.suptitle(
+        f"{behavior}: PLS k vs held-out $R^2$ (per layer)\n{METHOD_LABELS.get(method, method)}",
+        fontsize=11, fontweight="bold",
+    )
+    plt.tight_layout(rect=(0, 0, 1, 0.96))
     plt.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close()
 
@@ -732,28 +753,27 @@ def plot_ratio_vs_steering(metrics_df, delta_df, behavior, output_path, method):
 def main():
     import argparse
     parser = argparse.ArgumentParser(
-        description="Experiment 1: Directional information (R^2 ratio)"
+        description="Experiment 2: Directional information with PLS denominator"
     )
     parser.add_argument("--behavior", type=str, required=True, choices=BEHAVIORS)
     parser.add_argument("--model_name", type=str, default="google/gemma-2-9b-it")
-    parser.add_argument("--sweep_dir", type=str, required=True,
-                        help="Path to sweep output dir (contains layer_N/ subdirs)")
-    parser.add_argument("--train_dataset_path", type=str, required=True,
-                        help="Path to train_contrastive.json")
-    parser.add_argument("--layers", type=str, default="10-32",
-                        help="Layer range or comma list, e.g. '10-32' or '10,11,12'")
+    parser.add_argument("--sweep_dir", type=str, required=True)
+    parser.add_argument("--train_dataset_path", type=str, required=True)
+    parser.add_argument("--layers", type=str, default="10-32")
     parser.add_argument("--use_bf16", action="store_true", default=True)
-    parser.add_argument("--no_normalize_delta", action="store_true",
-                        help="Do not divide Delta_l by behavior score range")
-    parser.add_argument("--replot_only", action="store_true",
-                        help="Skip model inference; reuse cached activations + CSV")
+    parser.add_argument("--k_max", type=int, default=20,
+                        help="Max PLS components to sweep")
+    parser.add_argument("--n_splits", type=int, default=5,
+                        help="K-fold CV splits for held-out R^2 in PLS k sweep")
+    parser.add_argument("--no_normalize_delta", action="store_true")
+    parser.add_argument("--replot_only", action="store_true")
     args = parser.parse_args()
 
     sweep_dir = Path(args.sweep_dir)
-    out_dir = sweep_dir / "directional_information_analysis"
+    out_dir = sweep_dir / "directional_information_pls_analysis"
     plot_dir = out_dir / "plots"
 
-    # Clean plots/CSVs/JSON but keep cached .pt files.
+    # Clean plots / CSVs / JSON, keep cached .pt files.
     if plot_dir.exists():
         shutil.rmtree(plot_dir)
     for csv_file in out_dir.glob("*.csv"):
@@ -763,37 +783,58 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     plot_dir.mkdir(parents=True, exist_ok=True)
 
-    # Resolve layer list.
     if "-" in args.layers and "," not in args.layers:
         lo, hi = [int(x) for x in args.layers.split("-")]
         target_layers = list(range(lo, hi + 1))
     else:
         target_layers = sorted(int(x.strip()) for x in args.layers.split(","))
-
-    # Filter to layers that actually have eval_results.parquet.
     avail = set(discover_layers(sweep_dir))
     target_layers = [l for l in target_layers if l in avail]
     if not target_layers:
-        logger.error(f"No valid layers found in {sweep_dir}")
+        logger.error(f"No valid layers in {sweep_dir}")
         sys.exit(1)
     layer_lo, layer_hi = min(target_layers), max(target_layers)
     logger.warning(f"Target layers: {target_layers}")
 
+    # Activation cache locations: prefer this analysis dir, fall back to
+    # Exp 1's dir so a previous run's caches can be reused.
     train_acts_path = out_dir / "train_activations.pt"
     test_acts_path = out_dir / "test_activations.pt"
+    fallback_dir = sweep_dir / "directional_information_analysis"
+    fallback_train = fallback_dir / "train_activations.pt"
+    fallback_test = fallback_dir / "test_activations.pt"
 
-    # ---------- Phase 1: training activations ---------------------------
+    def _read_train_cache(path):
+        cached = torch.load(path, map_location="cpu", weights_only=False)
+        return cached["train_acts"], cached.get("train_meta", [])
+
+    def _read_test_cache(path):
+        cached = torch.load(path, map_location="cpu", weights_only=False)
+        return cached["test_mean_acts"], cached["test_metadata"]
+
     if args.replot_only:
-        if not train_acts_path.exists() or not test_acts_path.exists():
-            logger.error("--replot_only requires cached train_activations.pt and "
-                         "test_activations.pt. Run without --replot_only first.")
+        candidates_train = [p for p in (train_acts_path, fallback_train) if p.exists()]
+        candidates_test = [p for p in (test_acts_path, fallback_test) if p.exists()]
+        if not candidates_train or not candidates_test:
+            logger.error("--replot_only requires cached train + test activations.")
             sys.exit(1)
-        cached = torch.load(train_acts_path, map_location="cpu", weights_only=False)
-        train_acts = cached["train_acts"]
-        cached_test = torch.load(test_acts_path, map_location="cpu", weights_only=False)
-        test_mean_acts = cached_test["test_mean_acts"]
-        test_metadata = cached_test["test_metadata"]
+        logger.warning(f"Loading cached train activations from {candidates_train[0]}")
+        train_acts, train_meta = _read_train_cache(candidates_train[0])
+        logger.warning(f"Loading cached test activations from {candidates_test[0]}")
+        test_mean_acts, test_metadata = _read_test_cache(candidates_test[0])
     else:
+        # Try to reuse Exp 1's cache before doing any forward passes.
+        used_fallback_train = False
+        used_fallback_test = False
+        if not train_acts_path.exists() and fallback_train.exists():
+            logger.warning(f"Reusing Exp 1's train activations cache: {fallback_train}")
+            train_acts, train_meta = _read_train_cache(fallback_train)
+            used_fallback_train = True
+        if not test_acts_path.exists() and fallback_test.exists():
+            logger.warning(f"Reusing Exp 1's test activations cache: {fallback_test}")
+            test_mean_acts, test_metadata = _read_test_cache(fallback_test)
+            used_fallback_test = True
+
         model = None
         tokenizer = None
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -816,23 +857,21 @@ def main():
             )
             model.eval()
 
-        if train_acts_path.exists():
-            logger.warning(f"Loading cached training activations from {train_acts_path}")
-            cached = torch.load(train_acts_path, map_location="cpu", weights_only=False)
-            train_acts = cached["train_acts"]
-            train_meta = cached["train_meta"]
-            # Verify cache covers the requested layers; otherwise re-extract.
-            cached_layers = set(train_acts.keys())
-            if not set(target_layers).issubset(cached_layers):
-                logger.warning("Cached train activations missing some target layers; "
-                               "re-extracting.")
-                _ensure_model_loaded()
-                train_acts, train_meta = extract_train_activations(
-                    model, tokenizer, args.train_dataset_path, target_layers, device,
-                )
-                torch.save({"train_acts": train_acts, "train_meta": train_meta},
-                           train_acts_path)
-        else:
+        # Train activations (load this dir's cache, fallback, or extract).
+        if not used_fallback_train and not train_acts_path.exists():
+            _ensure_model_loaded()
+            train_acts, train_meta = extract_train_activations(
+                model, tokenizer, args.train_dataset_path, target_layers, device,
+            )
+            torch.save({"train_acts": train_acts, "train_meta": train_meta},
+                       train_acts_path)
+        elif not used_fallback_train:
+            train_acts, train_meta = _read_train_cache(train_acts_path)
+
+        # Verify training cache covers target layers; re-extract if not.
+        if not set(target_layers).issubset(set(train_acts.keys())):
+            logger.warning("Cached train activations missing some target layers; "
+                           "re-extracting.")
             _ensure_model_loaded()
             train_acts, train_meta = extract_train_activations(
                 model, tokenizer, args.train_dataset_path, target_layers, device,
@@ -840,22 +879,21 @@ def main():
             torch.save({"train_acts": train_acts, "train_meta": train_meta},
                        train_acts_path)
 
-        if test_acts_path.exists():
-            logger.warning(f"Loading cached test activations from {test_acts_path}")
-            cached_test = torch.load(test_acts_path, map_location="cpu", weights_only=False)
-            test_mean_acts = cached_test["test_mean_acts"]
-            test_metadata = cached_test["test_metadata"]
-            cached_layers = set(int(e["layer"]) for e in test_metadata)
-            if not set(target_layers).issubset(cached_layers):
-                logger.warning("Cached test activations missing some target layers; "
-                               "re-extracting.")
-                _ensure_model_loaded()
-                test_mean_acts, test_metadata = extract_test_activations(
-                    model, tokenizer, sweep_dir, target_layers, device,
-                )
-                torch.save({"test_mean_acts": test_mean_acts,
-                            "test_metadata": test_metadata}, test_acts_path)
-        else:
+        # Test activations.
+        if not used_fallback_test and not test_acts_path.exists():
+            _ensure_model_loaded()
+            test_mean_acts, test_metadata = extract_test_activations(
+                model, tokenizer, sweep_dir, target_layers, device,
+            )
+            torch.save({"test_mean_acts": test_mean_acts,
+                        "test_metadata": test_metadata}, test_acts_path)
+        elif not used_fallback_test:
+            test_mean_acts, test_metadata = _read_test_cache(test_acts_path)
+
+        cached_layers = set(int(e["layer"]) for e in test_metadata)
+        if not set(target_layers).issubset(cached_layers):
+            logger.warning("Cached test activations missing some target layers; "
+                           "re-extracting.")
             _ensure_model_loaded()
             test_mean_acts, test_metadata = extract_test_activations(
                 model, tokenizer, sweep_dir, target_layers, device,
@@ -868,7 +906,6 @@ def main():
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-    # ---------- Phase 2: DiffMean direction + centroid normalization ----
     logger.warning("Phase 2: Computing DiffMean directions ...")
     directions, centroid_norm = compute_diffmean_directions(train_acts, target_layers)
 
@@ -893,7 +930,6 @@ def main():
     n_test_str = (str(next(iter(test_counts))) if len(test_counts) == 1
                   else f"varies: {sorted(test_counts)}")
 
-    # Pull d(h) from one stacked test layer (or first train layer if test empty).
     d_h = 0
     if target_layers:
         Hp, _, _ = stack_layer_test(test_mean_acts, test_metadata, target_layers[0])
@@ -902,7 +938,6 @@ def main():
         elif n_train_per_layer.get(target_layers[0], (0, 0))[0] > 0:
             d_h = int(train_acts[target_layers[0]]["pos"][0].shape[0])
 
-    # Per-method n_fit (test_only = n_test; train_plus_test = n_train + n_test).
     if len(pos_counts) == 1 and len(neg_counts) == 1 and len(test_counts) == 1:
         n_train = next(iter(pos_counts)) + next(iter(neg_counts))
         n_test = next(iter(test_counts))
@@ -925,7 +960,6 @@ def main():
     logger.warning(f"  Method 2 (train_plus_test)  n_fit = {n_fit_combined}")
     logger.warning("=" * 60)
 
-    # ---------- Phase 6: Delta_l from eval parquets ---------------------
     logger.warning("Phase 6: Computing Delta_l from eval parquets ...")
     delta_df = compute_delta_l(
         sweep_dir, target_layers, args.behavior,
@@ -933,27 +967,26 @@ def main():
     )
     delta_df.to_csv(out_dir / "delta_l.csv", index=False)
 
-    # ---------- Phases 4 / 5: R^2 metrics for BOTH methods -------------
     method_results = {}
     for mode in ("test_only", "train_plus_test"):
-        logger.warning(f"Phases 4/5 [{mode}]: Computing R^2(v), R^2(h), ratio ...")
-        metrics_df = compute_r2_metrics(
+        logger.warning(f"Phase 4/5 [{mode}]: computing R^2(v), R^2(h_PLS), ratio ...")
+        metrics_df, sweep_df = compute_pls_metrics(
             test_mean_acts, test_metadata, directions, centroid_norm,
             target_layers, train_acts, args.behavior, mode=mode,
+            k_max=args.k_max, n_splits=args.n_splits,
         )
         out_df = metrics_df.merge(delta_df, on="layer", how="left")
         out_df.to_csv(out_dir / f"r2_per_layer__{mode}.csv", index=False)
+        sweep_df.to_csv(out_dir / f"pls_k_sweep__{mode}.csv", index=False)
 
         logger.warning(f"Per-layer summary [{mode}]:")
         for _, r in out_df.iterrows():
             logger.warning(
-                f"  Layer {int(r['layer']):2d}: "
-                f"R^2(v) = {r['r2_v']:+.3f}, R^2(h) = {r['r2_h']:+.3f}, "
-                f"ratio = {r['ratio']:.3f}, "
-                f"Delta_l = {r['delta_l']:+.3f}"
+                f"  Layer {int(r['layer']):2d}: R^2(v) = {r['r2_v']:+.3f}, "
+                f"k* = {r['k_star']}, R^2(h_PLS) = {r['r2_h_pls']:+.3f}, "
+                f"ratio = {r['ratio']:.3f}, Delta_l = {r['delta_l']:+.3f}"
             )
 
-        # Plots for this method
         plot_layer_sweep(
             out_df, args.behavior,
             plot_dir / f"layer_sweep__{mode}__{args.behavior}.png",
@@ -964,21 +997,26 @@ def main():
             plot_dir / f"ratio_vs_steering__{mode}__{args.behavior}.png",
             method=mode,
         )
-        method_results[mode] = out_df
+        plot_pls_k_elbow(
+            sweep_df, out_df, args.behavior,
+            plot_dir / f"pls_k_elbow__{mode}__{args.behavior}.png",
+            method=mode,
+        )
+        method_results[mode] = (out_df, sweep_df)
 
-    # ---------- Summary -------------------------------------------------
     summary = {
         "behavior": args.behavior,
         "model_name": args.model_name,
-        "direction": "DiffMean",
+        "direction": "DiffMean (numerator) + PLS (denominator)",
         "sweep_dir": str(sweep_dir),
         "train_dataset_path": args.train_dataset_path,
         "layers": target_layers,
-        "fit_strategy": "in_sample (both methods)",
+        "k_max": args.k_max,
+        "n_splits": args.n_splits,
         "method_descriptions": METHOD_LABELS,
         "delta_l_normalized": not args.no_normalize_delta,
-        "metrics_test_only": method_results["test_only"].to_dict(orient="records"),
-        "metrics_train_plus_test": method_results["train_plus_test"].to_dict(orient="records"),
+        "metrics_test_only": method_results["test_only"][0].to_dict(orient="records"),
+        "metrics_train_plus_test": method_results["train_plus_test"][0].to_dict(orient="records"),
     }
     with open(out_dir / "analysis_summary.json", "w") as f:
         json.dump(summary, f, indent=2, default=str)
