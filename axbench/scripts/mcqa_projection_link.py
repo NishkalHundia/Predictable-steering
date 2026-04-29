@@ -316,6 +316,50 @@ def plot_steering_acc(layer_df, factors, behavior, out_path):
     plt.close()
 
 
+def plot_steering_and_dprime(layer_df, factors, behavior, out_path):
+    """Steering accuracy for all factors + baseline + d' on one plot with dual y-axes."""
+    layers = layer_df["layer"].values
+    fig, ax1 = plt.subplots(figsize=(13, 5))
+
+    # --- left axis: accuracy ---
+    ax1.plot(layers, layer_df["baseline_acc"].values, "D--", color="gray",
+             linewidth=1.5, markersize=6, label="Baseline (α=0)", alpha=0.85, zorder=3)
+    cmap = plt.get_cmap("plasma")
+    factor_cols = [f for f in factors if f"steered_acc_{f:g}" in layer_df.columns]
+    for i, f in enumerate(factor_cols):
+        color = cmap(i / max(1, len(factor_cols) - 1))
+        ax1.plot(layers, layer_df[f"steered_acc_{f:g}"].values, "o-", color=color,
+                 linewidth=2, markersize=5, label=f"α={f:g}", zorder=3)
+    ax1.set_xlabel("Layer", fontsize=11)
+    ax1.set_ylabel("Greedy accuracy", fontsize=11)
+    ax1.set_ylim(0, 1.05)
+    ax1.set_xticks(layers)
+
+    # --- right axis: d' ---
+    ax2 = ax1.twinx()
+    if "dprime" in layer_df.columns and layer_df["dprime"].notna().any():
+        ax2.fill_between(layers, layer_df["dprime"].values, alpha=0.12, color="steelblue")
+        ax2.plot(layers, layer_df["dprime"].values, "s:", color="steelblue",
+                 linewidth=1.5, markersize=5, label="d'", zorder=2)
+        ax2.set_ylabel("d'  (training discriminability)", fontsize=11, color="steelblue")
+        ax2.tick_params(axis="y", labelcolor="steelblue")
+        ax2.set_ylim(bottom=0)
+
+    # combined legend
+    h1, l1 = ax1.get_legend_handles_labels()
+    h2, l2 = ax2.get_legend_handles_labels()
+    ax1.legend(h1 + h2, l1 + l2, title="Steering factor / metric",
+               fontsize=9, loc="upper left", framealpha=0.85)
+
+    ax1.set_title(
+        f"{behavior}: Steering accuracy & training d' by layer",
+        fontsize=11, fontweight="bold",
+    )
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close()
+
+
 def plot_projection_vs_steering(layer_df, factors, behavior, out_path):
     """
     The key plot: scatter of projection MCC (x) vs steered accuracy (y),
@@ -852,6 +896,7 @@ def main():
     plots = out_dir / "plots"
     plot_projection_quality(layer_df, args.behavior, plots / "projection_quality_by_layer.png")
     plot_steering_acc(layer_df, factors, args.behavior, plots / "steering_acc_by_layer.png")
+    plot_steering_and_dprime(layer_df, factors, args.behavior, plots / "steering_acc_and_dprime.png")
     plot_projection_vs_steering(
         layer_df,
         factors + (["best"] if "best_steered_acc" in layer_df.columns else []),
