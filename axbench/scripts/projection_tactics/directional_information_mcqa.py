@@ -6,28 +6,23 @@ is binary (did the model greedy-decode the matching-behavior letter?), all
 regressions are LOGISTIC instead of linear, and "R^2" means McFadden's
 pseudo-R^2.
 
-Run TWO methods side-by-side and save plots / CSVs for each:
+Single method:
 
-  Method 1 ("test_only"):
+  "test_only":
     v from training prompts; pseudo-R^2(v), pseudo-R^2(h) fit on TEST prompts only.
     Test labels are baseline_correct in {0, 1} (whether unsteered greedy
     decode at the '(' position picks the matching-behavior letter).
 
-  Method 2 ("train_plus_test"):
-    v from training prompts (same v); pseudo-R^2(v), pseudo-R^2(h) fit on
-    TRAIN + TEST prompts combined. Train labels = 1 (matching) / 0 (not
-    matching). Test labels = baseline_correct.
-
-For each layer l (both methods):
+For each layer l:
   1. v^l = (mu_pos^l - mu_neg^l) / ||...||  from training activations only.
      Centroid midpoint m and half-range h come from the training projections.
      Activations are taken at the answer-letter token position (matching
      mcqa_projection_link.py).
-  2. For each prompt, compute
+  2. For each test prompt, compute
         p_v(h_i) = (h_i . v - m) / h.
-  3. Fit on that dataset:
+  3. Fit on test prompts:
         y ~ p_v(h)  (univariate logistic regression)              -> R^2(v)
-        y ~ h       (LogisticRegressionCV, L2 on full activation) -> R^2(h)
+        y ~ h       (LogisticRegression with fixed L2 C=1e-2)     -> R^2(h)
      R^2 = McFadden's pseudo-R^2 = 1 - LL(model) / LL(null).
   4. Ratio = R^2(v) / R^2(h)  (clip negative pseudo-R^2 to 0 before dividing).
   5. Pull steering effectiveness Delta_l from
@@ -39,21 +34,22 @@ Outputs:
     train_activations.pt
     test_activations.pt
     r2_per_layer__test_only.csv
-    r2_per_layer__train_plus_test.csv
     delta_l.csv
     analysis_summary.json
     plots/
       layer_sweep__test_only__{behavior}.png
-      layer_sweep__train_plus_test__{behavior}.png
       ratio_vs_steering__test_only__{behavior}.png
-      ratio_vs_steering__train_plus_test__{behavior}.png
 
-Usage:
+Usage (Modal: 'steering' volume mounted at /vol):
     uv run python axbench/scripts/projection_tactics/directional_information_mcqa.py \\
         --behavior sycophancy \\
         --model_name google/gemma-2-9b-it \\
-        --mcqa_link_dir results/mcqa_projection_link/gemma-2-9b-it/sycophancy \\
+        --mcqa_link_dir /vol/mcqa_projection_link/gemma-2-9b-it/sycophancy \\
         --layers 10-32
+
+Pass an absolute /vol/... path for --mcqa_link_dir (and --output_dir if you
+want results written to the volume); otherwise paths resolve relative to the
+container CWD (/root/axbench), not the mounted volume.
 """
 import re
 import sys
@@ -66,8 +62,7 @@ from pathlib import Path
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from scipy import stats as scipy_stats
-from sklearn.linear_model import LogisticRegression, LogisticRegressionCV
-from sklearn.model_selection import StratifiedKFold
+from sklearn.linear_model import LogisticRegression
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -396,23 +391,6 @@ def stack_layer_train(train_acts, layer):
     return np.stack(H, axis=0), np.array(y, dtype=int)
 
 
-def stack_layer_combined(test_mean_acts, test_metadata, train_acts, layer):
-    """Per-layer (H, y) for TRAIN + TEST. Train rows: y in {0,1}; test rows:
-    y = baseline_correct."""
-    H_test, y_test, _ = stack_layer_test(test_mean_acts, test_metadata, layer)
-    H_train, y_train = stack_layer_train(train_acts, layer)
-    if H_test.size == 0 and H_train.size == 0:
-        return np.zeros((0, 0)), np.zeros(0, dtype=int)
-    if H_test.size == 0:
-        return H_train, y_train
-    if H_train.size == 0:
-        return H_test, y_test
-    return (
-        np.concatenate([H_train, H_test], axis=0),
-        np.concatenate([y_train, y_test]).astype(int),
-    )
-
-
 # ============================================================================
 # Phase 4 / 5 - pseudo-R^2 computations
 # ============================================================================
@@ -432,79 +410,47 @@ def mcfadden_r2(y_true, y_proba):
     return 1.0 - ll_full / ll_null
 
 
-def _fit_logistic_full(H, y, Cs):
-    """Multivariate logistic on full activation. Uses LogisticRegressionCV
-    with stratified CV when both classes have enough samples; else falls
-    back to a single fit at C=1.0."""
-    n_pos = int((y == 1).sum())
-    n_neg = int((y == 0).sum())
-    n_min = min(n_pos, n_neg)
-    if n_min < 2:
-        clf = LogisticRegression(C=1.0, solver="lbfgs", max_iter=1000)
-        clf.fit(H, y)
-        return clf, float("nan")
-    cv_folds = max(2, min(5, n_min))
-    clf = LogisticRegressionCV(
-        Cs=Cs, cv=StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42),
-        scoring="neg_log_loss", solver="lbfgs", max_iter=1000,
-    )
+FIXED_C = 1e-2
+
+
+def _fit_logistic_full(H, y):
+    """Multivariate logistic on full activation, L2 with fixed C=FIXED_C
+    (no CV)."""
+    clf = LogisticRegression(C=FIXED_C, solver="lbfgs", max_iter=5000)
     clf.fit(H, y)
-    C_used = float(clf.C_[0]) if hasattr(clf, "C_") else float("nan")
-    return clf, C_used
+    return clf, FIXED_C
 
 
 def compute_r2_metrics(test_mean_acts, test_metadata, directions,
-                       centroid_norm, target_layers, train_acts,
-                       mode="test_only",
-                       Cs=(1e-4, 1e-3, 1e-2, 1e-1, 1.0, 10.0, 1e2, 1e3, 1e4)):
-    """Per layer, fit pseudo-R^2(v) and pseudo-R^2(h) on the dataset
-    selected by `mode` (logistic regression).
-
-      - "test_only":      fit set = test prompts (y = baseline_correct)
-      - "train_plus_test": fit set = train + test
-                           (train y in {0,1}; test y = baseline_correct)
-
-    v is always the DiffMean direction computed from the training set.
+                       centroid_norm, target_layers, train_acts):
+    """Per layer, fit pseudo-R^2(v) and pseudo-R^2(h) on the TEST set
+    (logistic regression). y = baseline_correct. v is the DiffMean direction
+    computed from the training set.
     """
-    if mode not in ("test_only", "train_plus_test"):
-        raise ValueError(f"Unknown mode: {mode}")
-
-    logger.warning(f"--- compute_r2_metrics (mode = {mode}) ---")
+    logger.warning("--- compute_r2_metrics (mode = test_only) ---")
 
     rows = []
     for layer in target_layers:
         H_test, y_test, _ = stack_layer_test(test_mean_acts, test_metadata, layer)
-        H_train, y_train = stack_layer_train(train_acts, layer)
         n_test = len(y_test)
-        n_train = len(y_train)
         n_train_pos = len(train_acts.get(layer, {}).get("pos", []))
         n_train_neg = len(train_acts.get(layer, {}).get("neg", []))
 
-        if mode == "test_only":
-            H_fit, y_fit = H_test, y_test
-        else:
-            if H_test.size == 0:
-                H_fit, y_fit = H_train, y_train
-            elif H_train.size == 0:
-                H_fit, y_fit = H_test, y_test
-            else:
-                H_fit = np.concatenate([H_train, H_test], axis=0)
-                y_fit = np.concatenate([y_train, y_test]).astype(int)
+        H_fit, y_fit = H_test, y_test
         n_fit = len(y_fit)
         d = H_fit.shape[1] if n_fit else 0
         n_classes = int(len(np.unique(y_fit))) if n_fit else 0
 
         logger.warning(
-            f"  Layer {int(layer):2d} [{mode}]: "
+            f"  Layer {int(layer):2d}: "
             f"v from {n_train_pos} pos / {n_train_neg} neg train  |  "
-            f"regression on n_fit = {n_fit} "
-            f"({'test only' if mode == 'test_only' else f'{n_train} train + {n_test} test'})  "
+            f"regression on n_fit = {n_fit} (test only)  "
             f"d(h) = {d}  classes = {n_classes}"
         )
 
         if n_fit < 4 or n_classes < 2:
             rows.append({
-                "layer": int(layer), "mode": mode,
+                "layer": int(layer), "mode": "test_only",
                 "n_train_pos": int(n_train_pos), "n_train_neg": int(n_train_neg),
                 "n_test": int(n_test), "n_fit": int(n_fit), "d_h": int(d),
                 "r2_v": np.nan, "r2_h": np.nan, "ratio": np.nan,
@@ -528,7 +474,7 @@ def compute_r2_metrics(test_mean_acts, test_metadata, directions,
         sr, _ = scipy_stats.spearmanr(proj, y_fit)
 
         # R^2(h) = in-sample McFadden's pseudo-R^2 of y ~ h with L2 logistic.
-        log_h, C_used = _fit_logistic_full(H_fit.astype(np.float64), y_fit, list(Cs))
+        log_h, C_used = _fit_logistic_full(H_fit.astype(np.float64), y_fit)
         proba_h = log_h.predict_proba(H_fit.astype(np.float64))[:, 1]
         r2_h = mcfadden_r2(y_fit, proba_h)
 
@@ -541,7 +487,7 @@ def compute_r2_metrics(test_mean_acts, test_metadata, directions,
             ratio = np.nan
 
         rows.append({
-            "layer": int(layer), "mode": mode,
+            "layer": int(layer), "mode": "test_only",
             "n_train_pos": int(n_train_pos), "n_train_neg": int(n_train_neg),
             "n_test": int(n_test), "n_fit": int(n_fit), "d_h": int(d),
             "r2_v": float(r2_v), "r2_h": float(r2_h),
@@ -551,7 +497,7 @@ def compute_r2_metrics(test_mean_acts, test_metadata, directions,
             "logistic_C": float(C_used) if not np.isnan(C_used) else np.nan,
         })
         logger.warning(
-            f"  Layer {int(layer):2d} [{mode}]: "
+            f"  Layer {int(layer):2d}: "
             f"R^2(v) = {r2_v:+.3f}  R^2(h) = {r2_h:+.3f}  "
             f"ratio = {ratio if not np.isnan(ratio) else float('nan'):+.3f}  "
             f"(C = {C_used:.2g})"
@@ -643,13 +589,10 @@ def load_baseline_correct(per_prompt_csv_path):
 # ============================================================================
 # Plots
 # ============================================================================
-METHOD_LABELS = {
-    "test_only": "Method 1: v from train; pseudo-R^2 fit on TEST only",
-    "train_plus_test": "Method 2: v from train; pseudo-R^2 fit on TRAIN + TEST",
-}
+METHOD_LABEL = "v from train; pseudo-R^2 fit on TEST only"
 
 
-def plot_layer_sweep(metrics_df, behavior, output_path, method,
+def plot_layer_sweep(metrics_df, behavior, output_path,
                      layer_lo=10, layer_hi=32):
     """Plot 1: 3-panel layer sweep (top R^2(h), middle R^2(v), bottom ratio)."""
     df = metrics_df.sort_values("layer").reset_index(drop=True)
@@ -664,7 +607,7 @@ def plot_layer_sweep(metrics_df, behavior, output_path, method,
     ax.set_ylabel(r"pseudo-$R^2(h)$  (full activation)", fontsize=10)
     ax.set_title(
         f"{behavior} (MCQA) - Layer sweep of directional information\n"
-        f"{METHOD_LABELS.get(method, method)}",
+        f"{METHOD_LABEL}",
         fontsize=12, fontweight="bold",
     )
     ax.legend(loc="best", fontsize=9)
@@ -706,7 +649,7 @@ def plot_layer_sweep(metrics_df, behavior, output_path, method,
     plt.close()
 
 
-def plot_ratio_vs_steering(metrics_df, delta_df, behavior, output_path, method):
+def plot_ratio_vs_steering(metrics_df, delta_df, behavior, output_path):
     """Plot 2: scatter of ratio vs Delta_l, one labeled point per layer."""
     if "delta_l" in metrics_df.columns:
         df = metrics_df.copy()
@@ -714,10 +657,10 @@ def plot_ratio_vs_steering(metrics_df, delta_df, behavior, output_path, method):
         df = metrics_df.merge(delta_df[["layer", "delta_l"]], on="layer", how="inner")
     df = df.dropna(subset=["ratio", "delta_l"]).sort_values("layer").reset_index(drop=True)
     if df.empty:
-        logger.warning(f"plot_ratio_vs_steering [{method}]: empty after merge / dropna")
+        logger.warning("plot_ratio_vs_steering: empty after merge / dropna")
         return
 
-    fig, ax = plt.subplots(figsize=(9, 7))
+    _fig, ax = plt.subplots(figsize=(9, 7))
 
     ax.scatter(df["ratio"], df["delta_l"], s=80,
                color="#2E86AB", edgecolors="black", linewidths=0.6, zorder=3)
@@ -748,7 +691,7 @@ def plot_ratio_vs_steering(metrics_df, delta_df, behavior, output_path, method):
     ax.set_ylabel(r"$\Delta_l$  (best steered acc - baseline acc)", fontsize=11)
     ax.set_title(
         f"{behavior} (MCQA): directional information vs steering effectiveness\n"
-        f"{METHOD_LABELS.get(method, method)}",
+        f"{METHOD_LABEL}",
         fontsize=12, fontweight="bold",
     )
     ax.legend(fontsize=9, loc="lower right")
@@ -970,26 +913,19 @@ def main():
         elif n_train_per_layer.get(target_layers[0], (0, 0))[0] > 0:
             d_h = int(train_acts[target_layers[0]]["pos"][0].shape[0])
 
-    if len(pos_counts) == 1 and len(neg_counts) == 1 and len(test_counts) == 1:
-        n_train = next(iter(pos_counts)) + next(iter(neg_counts))
-        n_test = next(iter(test_counts))
-        n_fit_test_only = n_test
-        n_fit_combined = n_train + n_test
+    if len(test_counts) == 1:
+        n_fit_test_only = next(iter(test_counts))
     else:
         n_fit_test_only = "varies"
-        n_fit_combined = "varies"
 
     logger.warning("=" * 60)
     logger.warning("Sample-size summary (per layer)")
     logger.warning("-" * 60)
     logger.warning(f"  Training pairs:           {n_train_pos_str} pos / {n_train_neg_str} neg")
-    logger.warning(f"  Training activations:     {n_train_pos_str} pos + {n_train_neg_str} neg = "
-                   f"{n_train if isinstance(n_fit_combined, int) else 'varies'} rows")
     logger.warning(f"  Test prompts:             {n_test_str}")
     logger.warning(f"  Layers:                   {len(target_layers)}  [{layer_lo}..{layer_hi}]")
     logger.warning(f"  d(h) (hidden size):       {d_h}")
-    logger.warning(f"  Method 1 (test_only)        n_fit = {n_fit_test_only}")
-    logger.warning(f"  Method 2 (train_plus_test)  n_fit = {n_fit_combined}")
+    logger.warning(f"  test_only n_fit          = {n_fit_test_only}")
     logger.warning("=" * 60)
 
     # ---------- Phase 6: Delta_l from mcqa_projection_link summary ------
@@ -997,37 +933,33 @@ def main():
     delta_df = compute_delta_l(per_layer_summary_csv, target_layers)
     delta_df.to_csv(out_dir / "delta_l.csv", index=False)
 
-    # ---------- Phases 4 / 5: pseudo-R^2 metrics for BOTH methods -------
-    method_results = {}
-    for mode in ("test_only", "train_plus_test"):
-        logger.warning(f"Phases 4/5 [{mode}]: Computing pseudo-R^2(v), pseudo-R^2(h), ratio ...")
-        metrics_df = compute_r2_metrics(
-            test_mean_acts, test_metadata, directions, centroid_norm,
-            target_layers, train_acts, mode=mode,
-        )
-        out_df = metrics_df.merge(delta_df, on="layer", how="left")
-        out_df.to_csv(out_dir / f"r2_per_layer__{mode}.csv", index=False)
+    # ---------- Phases 4 / 5: pseudo-R^2 metrics (test_only) ------------
+    logger.warning("Phases 4/5: Computing pseudo-R^2(v), pseudo-R^2(h), ratio (test_only) ...")
+    metrics_df = compute_r2_metrics(
+        test_mean_acts, test_metadata, directions, centroid_norm,
+        target_layers, train_acts,
+    )
+    out_df = metrics_df.merge(delta_df, on="layer", how="left")
+    out_df.to_csv(out_dir / "r2_per_layer__test_only.csv", index=False)
 
-        logger.warning(f"Per-layer summary [{mode}]:")
-        for _, r in out_df.iterrows():
-            logger.warning(
-                f"  Layer {int(r['layer']):2d}: "
-                f"R^2(v) = {r['r2_v']:+.3f}, R^2(h) = {r['r2_h']:+.3f}, "
-                f"ratio = {r['ratio']:.3f}, "
-                f"Delta_l = {r['delta_l']:+.3f}"
-            )
+    logger.warning("Per-layer summary [test_only]:")
+    for _, r in out_df.iterrows():
+        logger.warning(
+            f"  Layer {int(r['layer']):2d}: "
+            f"R^2(v) = {r['r2_v']:+.3f}, R^2(h) = {r['r2_h']:+.3f}, "
+            f"ratio = {r['ratio']:.3f}, "
+            f"Delta_l = {r['delta_l']:+.3f}"
+        )
 
-        plot_layer_sweep(
-            out_df, args.behavior,
-            plot_dir / f"layer_sweep__{mode}__{args.behavior}.png",
-            method=mode, layer_lo=layer_lo, layer_hi=layer_hi,
-        )
-        plot_ratio_vs_steering(
-            out_df, delta_df, args.behavior,
-            plot_dir / f"ratio_vs_steering__{mode}__{args.behavior}.png",
-            method=mode,
-        )
-        method_results[mode] = out_df
+    plot_layer_sweep(
+        out_df, args.behavior,
+        plot_dir / f"layer_sweep__test_only__{args.behavior}.png",
+        layer_lo=layer_lo, layer_hi=layer_hi,
+    )
+    plot_ratio_vs_steering(
+        out_df, delta_df, args.behavior,
+        plot_dir / f"ratio_vs_steering__test_only__{args.behavior}.png",
+    )
 
     # ---------- Summary -------------------------------------------------
     summary = {
@@ -1039,10 +971,9 @@ def main():
         "train_dataset_path": str(train_dataset_path),
         "test_dataset_path": str(test_dataset_path),
         "layers": target_layers,
-        "fit_strategy": "in_sample (both methods)",
-        "method_descriptions": METHOD_LABELS,
-        "metrics_test_only": method_results["test_only"].to_dict(orient="records"),
-        "metrics_train_plus_test": method_results["train_plus_test"].to_dict(orient="records"),
+        "fit_strategy": "in_sample (test_only)",
+        "method_description": METHOD_LABEL,
+        "metrics_test_only": out_df.to_dict(orient="records"),
     }
     with open(out_dir / "analysis_summary.json", "w") as f:
         json.dump(summary, f, indent=2, default=str)
