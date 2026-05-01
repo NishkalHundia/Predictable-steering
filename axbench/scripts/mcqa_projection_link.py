@@ -453,22 +453,17 @@ def plot_kappa_scatter(prompt_df, layer, behavior, out_path):
     plt.close()
 
 
-def _hist_stacked(ax, k_match, k_nonmatch, k_gibber, bins):
-    """Draw a stacked histogram: grey (bottom), red (middle), blue (top).
-    Returns the maximum y value reached (for consistent ylim if needed).
-    """
-    counts_g, _ = np.histogram(k_gibber,   bins=bins)
-    counts_r, _ = np.histogram(k_nonmatch, bins=bins)
-    counts_b, _ = np.histogram(k_match,    bins=bins)
-    widths = np.diff(bins)
-    lefts  = bins[:-1]
-    ax.bar(lefts, counts_g, width=widths, align="edge", color="#aaaaaa",
-           edgecolor="white", linewidth=0.4, label="Gibberish")
-    ax.bar(lefts, counts_r, width=widths, align="edge", color="#d62728",
-           edgecolor="white", linewidth=0.4, bottom=counts_g, label="Non-matching")
-    ax.bar(lefts, counts_b, width=widths, align="edge", color="#1f77b4",
-           edgecolor="white", linewidth=0.4, bottom=counts_g + counts_r, label="Matching")
-    return int((counts_g + counts_r + counts_b).max())
+def _hist_overlapping(ax, k_match, k_nonmatch, k_gibber, bins):
+    """Overlapping semi-transparent histograms — all three distributions visible at once."""
+    if len(k_gibber):
+        ax.hist(k_gibber,   bins=bins, color="#aaaaaa", alpha=0.55,
+                edgecolor="#888888", linewidth=0.5, label="Gibberish")
+    if len(k_nonmatch):
+        ax.hist(k_nonmatch, bins=bins, color="#d62728", alpha=0.55,
+                edgecolor="#a01010", linewidth=0.5, label="Non-matching")
+    if len(k_match):
+        ax.hist(k_match,    bins=bins, color="#1f77b4", alpha=0.55,
+                edgecolor="#104e8b", linewidth=0.5, label="Matching")
 
 
 def plot_projection_histograms(prompt_df, factors, behavior, layer,
@@ -507,14 +502,12 @@ def plot_projection_histograms(prompt_df, factors, behavior, layer,
                     else (pos_proj if len(pos_proj) else neg_proj)
         pad = max(0.3, (all_train.max() - all_train.min()) * 0.05 + 0.01)
         bins_t = np.linspace(all_train.min() - pad, all_train.max() + pad, 25)
-        counts_pos, _ = np.histogram(pos_proj, bins=bins_t)
-        counts_neg, _ = np.histogram(neg_proj, bins=bins_t)
-        widths_t = np.diff(bins_t)
-        lefts_t  = bins_t[:-1]
-        train_ax.bar(lefts_t, counts_neg, width=widths_t, align="edge", color="#d62728",
-                     edgecolor="white", linewidth=0.4, label="Non-matching")
-        train_ax.bar(lefts_t, counts_pos, width=widths_t, align="edge", color="#1f77b4",
-                     edgecolor="white", linewidth=0.4, bottom=counts_neg, label="Matching")
+        if len(neg_proj):
+            train_ax.hist(neg_proj, bins=bins_t, color="#d62728", alpha=0.55,
+                          edgecolor="#a01010", linewidth=0.5, label="Non-matching")
+        if len(pos_proj):
+            train_ax.hist(pos_proj, bins=bins_t, color="#1f77b4", alpha=0.55,
+                          edgecolor="#104e8b", linewidth=0.5, label="Matching")
         x_lo, x_hi = bins_t[0], bins_t[-1]
         if x_lo <= 0 <= x_hi:
             train_ax.axvline(0, color="black", linestyle="--", linewidth=0.9, alpha=0.5)
@@ -548,7 +541,7 @@ def plot_projection_histograms(prompt_df, factors, behavior, layer,
         x_hi  = kappa_steered.max() + pad
         bins  = np.linspace(x_lo, x_hi, 20)
 
-        _hist_stacked(ax, k_match, k_nonmatch, k_gibber, bins)
+        _hist_overlapping(ax, k_match, k_nonmatch, k_gibber, bins)
 
         ax.set_xlim(x_lo, x_hi)
         if x_lo <= 0 <= x_hi:
