@@ -52,6 +52,7 @@ Usage:
     uv run python axbench/scripts/projection_tactics/directional_information_mcqa.py \\
         --behavior sycophancy \\
         --model_name google/gemma-2-9b-it \\
+        --mcqa_link_dir results/mcqa_projection_link/gemma-2-9b-it/sycophancy \\
         --layers 10-32
 """
 import re
@@ -768,9 +769,9 @@ def main():
     )
     parser.add_argument("--behavior", type=str, required=True, choices=BEHAVIORS)
     parser.add_argument("--model_name", type=str, default="google/gemma-2-9b-it")
-    parser.add_argument("--mcqa_link_dir", type=str, default=None,
+    parser.add_argument("--mcqa_link_dir", type=str, required=True,
                         help="Dir with per_prompt_results.csv + per_layer_summary.csv "
-                             "(default: results/mcqa_projection_link/{model_short}/{behavior})")
+                             "(produced by mcqa_projection_link.py)")
     parser.add_argument("--train_dataset_path", type=str, default=None,
                         help="Path to MCQA train dataset.json "
                              "(default: datasets/raw/{behavior}/dataset.json)")
@@ -792,10 +793,7 @@ def main():
                         help="Skip model inference; reuse cached activations + CSV")
     args = parser.parse_args()
 
-    model_short = args.model_name.split("/")[-1]
-    mcqa_link_dir = Path(
-        args.mcqa_link_dir or f"results/mcqa_projection_link/{model_short}/{args.behavior}"
-    )
+    mcqa_link_dir = Path(args.mcqa_link_dir)
     train_dataset_path = Path(
         args.train_dataset_path or TRAIN_PATH_MAP[args.behavior]
     )
