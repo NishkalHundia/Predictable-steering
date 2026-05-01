@@ -7,11 +7,17 @@ Same numerator as Experiment 1 (directional_information.py):
 Different denominator. Instead of fitting y_b ~ h directly (high-d, overfits),
 we project h onto a k-dimensional PLS subspace W in H that maximally covaries
 with y_b, and fit
-    R^2(h_PLS, k) = held-out R^2 of  y_b ~ W h
-We sweep k = 1..k_max, compute held-out R^2 via K-fold CV at each k, and
-pick k* by the elbow / max held-out R^2. The reported ratio is
+    R^2(h_PLS, k) = in-sample R^2 of  y_b ~ W h
+We sweep k = 1..k_max, fit a single PLS at each k, and pick k* by a
+kneedle-style geometric elbow on the (k, R^2) curve. The reported ratio is
 
     R^2(v) / R^2(h_PLS, k*)
+
+No cross-validation: every R^2 is the in-sample fit on the regression
+dataset (mirrors directional_information.py's design). Note that with no
+held-out evaluation, in-sample R^2(h_PLS, k) is monotonically
+non-decreasing in k and saturates near 1 once k approaches min(n_fit, d).
+The elbow chooses where the R^2 curve flattens.
 
 Run TWO methods side-by-side (same as Exp 1):
   Method 1 ("test_only"):      v from train; R^2 fit on TEST only
@@ -29,7 +35,7 @@ Outputs:
     train_activations.pt              (cached or symlinked from Exp 1)
     test_activations.pt
     delta_l.csv                       (best-factor improvement, same as Exp 1)
-    pls_k_sweep__test_only.csv        (per (layer, k) held-out R^2)
+    pls_k_sweep__test_only.csv        (per (layer, k) in-sample R^2)
     pls_k_sweep__train_plus_test.csv
     r2_per_layer__test_only.csv       (final R^2(v), R^2(h_PLS, k*), ratio)
     r2_per_layer__train_plus_test.csv
@@ -60,7 +66,6 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from scipy import stats as scipy_stats
 from sklearn.cross_decomposition import PLSRegression
-from sklearn.model_selection import KFold
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -408,81 +413,99 @@ def _r2_score(y, y_pred):
     return 1.0 - ss_res / ss_tot
 
 
-def _oof_pls_r2(X, y, k, n_splits=5, seed=0):
-    """Out-of-fold R^2 for PLS regression with k components."""
-    n = len(y)
-    if n < n_splits + 1 or k < 1:
+def _pls_in_sample_r2(X, y, k):
+    """Single PLS fit on (X, y) with k components; return in-sample R^2."""
+    if k < 1 or len(y) < 2 or X.shape[1] == 0:
         return float("nan")
-    kf = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
-    y_pred = np.full(n, np.nan, dtype=float)
-    for tr, te in kf.split(X):
-        # k cannot exceed min(n_train, d).
-        max_k = min(len(tr) - 1, X.shape[1])
-        k_fold = min(k, max_k)
-        if k_fold < 1:
-            return float("nan")
-        try:
-            pls = PLSRegression(n_components=k_fold, scale=True, max_iter=1000)
-            pls.fit(X[tr], y[tr])
-            pred = pls.predict(X[te])
-            y_pred[te] = pred.ravel()
-        except Exception as e:
-            logger.warning(f"PLS fit failed (k={k_fold}): {e}")
-            return float("nan")
-    if np.isnan(y_pred).any():
+    max_k = min(len(y) - 1, X.shape[1])
+    k_eff = min(k, max_k)
+    if k_eff < 1:
         return float("nan")
-    ss_tot = float(((y - y.mean()) ** 2).sum())
-    if ss_tot < 1e-12:
+    try:
+        pls = PLSRegression(n_components=k_eff, scale=True, max_iter=1000)
+        pls.fit(X, y)
+        y_pred = pls.predict(X).ravel()
+    except Exception as e:
+        logger.warning(f"PLS fit failed (k={k_eff}): {e}")
         return float("nan")
-    ss_res = float(((y - y_pred) ** 2).sum())
-    return 1.0 - ss_res / ss_tot
+    return _r2_score(y, y_pred)
 
 
-def sweep_pls_k(X, y, k_min=1, k_max=20, n_splits=5, seed=0):
-    """Per-k held-out R^2. Returns DataFrame with columns layer-agnostic
-    (k, r2_held_out)."""
+def sweep_pls_k(X, y, k_min=1, k_max=20):
+    """Per-k in-sample R^2. Returns DataFrame with columns (k, r2_in_sample)."""
     n = len(y)
     d = X.shape[1] if X.size else 0
-    # Practical cap: PLS components <= min(n_train_per_fold-1, d)
-    if n < n_splits + 1:
-        return pd.DataFrame(columns=["k", "r2_held_out"])
-    n_train_per_fold = n - n // n_splits
-    hard_cap = min(n_train_per_fold - 1, d)
+    if n < 2 or d == 0:
+        return pd.DataFrame(columns=["k", "r2_in_sample"])
+    hard_cap = min(n - 1, d)
     k_top = max(1, min(k_max, hard_cap))
     rows = []
     for k in range(k_min, k_top + 1):
-        r2 = _oof_pls_r2(X, y, k, n_splits=n_splits, seed=seed)
-        rows.append({"k": int(k), "r2_held_out": float(r2)})
+        r2 = _pls_in_sample_r2(X, y, k)
+        rows.append({"k": int(k), "r2_in_sample": float(r2)})
     return pd.DataFrame(rows)
 
 
 def pick_k_elbow(k_sweep_df):
-    """Return k* = smallest k whose held-out R^2 is within `tol` of the max
-    (kneedle-style 'elbow'); fallback to argmax if no clear elbow.
+    """Pick k* via a kneedle-style geometric elbow on the (k, R^2) curve.
 
-    Tol: 5% of (max - min)  capped at 0.02 absolute.
+    R^2 in-sample is monotonically non-decreasing in k, so we treat the
+    curve as a saturating one and pick the point of maximum perpendicular
+    distance from the chord connecting (k_min, R^2_min) to (k_max, R^2_max).
+
+    Returns (k_star, r2_star). Falls back to the smallest k with R^2 within
+    tol of max if the geometric search fails.
     """
-    if k_sweep_df.empty or k_sweep_df["r2_held_out"].isna().all():
+    col = "r2_in_sample"
+    if k_sweep_df.empty or k_sweep_df[col].isna().all():
         return None, np.nan
-    df = k_sweep_df.dropna(subset=["r2_held_out"]).sort_values("k").reset_index(drop=True)
-    r2_max = float(df["r2_held_out"].max())
-    r2_min = float(df["r2_held_out"].min())
-    spread = r2_max - r2_min
-    tol = max(min(0.05 * spread, 0.02), 1e-6)
-    eligible = df[df["r2_held_out"] >= (r2_max - tol)]
-    if eligible.empty:
-        idx = int(df["r2_held_out"].idxmax())
-        return int(df.loc[idx, "k"]), r2_max
-    k_star = int(eligible["k"].min())
-    r2_star = float(df[df["k"] == k_star]["r2_held_out"].iloc[0])
+    df = k_sweep_df.dropna(subset=[col]).sort_values("k").reset_index(drop=True)
+    if len(df) == 1:
+        return int(df.loc[0, "k"]), float(df.loc[0, col])
+
+    ks = df["k"].to_numpy(dtype=float)
+    r2s = df[col].to_numpy(dtype=float)
+
+    # Normalize both axes to [0, 1] before measuring distances.
+    k_span = ks.max() - ks.min()
+    r2_span = r2s.max() - r2s.min()
+    if k_span < 1e-12 or r2_span < 1e-12:
+        # No variation in either axis -- pick smallest k with R^2 near max.
+        r2_max = float(r2s.max())
+        for i, r in enumerate(r2s):
+            if r >= r2_max - 1e-6:
+                return int(ks[i]), float(r)
+        return int(ks[-1]), float(r2s[-1])
+
+    ks_n = (ks - ks.min()) / k_span
+    r2s_n = (r2s - r2s.min()) / r2_span
+
+    # Chord from (0, 0) to (1, 1). For a saturating curve that bows upward
+    # (R^2 rises fast then plateaus), R^2_n >= k_n, and the elbow is the
+    # point where (R^2_n - k_n) is maximized.
+    diff = r2s_n - ks_n
+    elbow_idx = int(np.argmax(diff))
+    k_star = int(ks[elbow_idx])
+    r2_star = float(r2s[elbow_idx])
+
+    # Sanity fallback: if the elbow distance is essentially zero, pick the
+    # smallest k whose R^2 is within tol of the max.
+    if diff[elbow_idx] < 1e-3:
+        r2_max = float(r2s.max())
+        tol = max(min(0.05 * r2_span, 0.02), 1e-6)
+        for i, r in enumerate(r2s):
+            if r >= r2_max - tol:
+                return int(ks[i]), float(r)
     return k_star, r2_star
 
 
 def compute_pls_metrics(test_mean_acts, test_metadata, directions,
                        centroid_norm, target_layers, train_acts, behavior,
-                       mode="test_only", k_max=20, n_splits=5, seed=0):
+                       mode="test_only", k_max=20):
     """Per layer, compute R^2(v), sweep PLS k for R^2(h_PLS), pick k*,
     return one row per layer plus the full per-(layer, k) sweep table.
+
+    All R^2 values are in-sample (no CV).
     """
     if mode not in ("test_only", "train_plus_test"):
         raise ValueError(f"Unknown mode: {mode}")
@@ -520,7 +543,7 @@ def compute_pls_metrics(test_mean_acts, test_metadata, directions,
             f"d(h) = {d}"
         )
 
-        if n_fit < n_splits + 1:
+        if n_fit < 4:
             rows.append({
                 "layer": int(layer), "mode": mode,
                 "n_train_pos": int(n_train_pos), "n_train_neg": int(n_train_neg),
@@ -542,9 +565,9 @@ def compute_pls_metrics(test_mean_acts, test_metadata, directions,
         sr, _ = scipy_stats.spearmanr(proj, y_fit)
         r2_v = float(pr * pr)
 
-        # R^2(h_PLS): sweep k, pick elbow.
+        # R^2(h_PLS): sweep k (in-sample), pick geometric elbow.
         k_sweep_df = sweep_pls_k(H_fit.astype(np.float64), y_fit,
-                                  k_min=1, k_max=k_max, n_splits=n_splits, seed=seed)
+                                  k_min=1, k_max=k_max)
         if k_sweep_df.empty:
             r2_h_pls = np.nan
             k_star = np.nan
@@ -557,7 +580,7 @@ def compute_pls_metrics(test_mean_acts, test_metadata, directions,
             sweep_rows.append({
                 "layer": int(layer), "mode": mode,
                 "k": int(kr["k"]),
-                "r2_held_out": float(kr["r2_held_out"]) if not pd.isna(kr["r2_held_out"]) else np.nan,
+                "r2_in_sample": float(kr["r2_in_sample"]) if not pd.isna(kr["r2_in_sample"]) else np.nan,
             })
 
         r2_v_clip = max(r2_v, 0.0) if not np.isnan(r2_v) else np.nan
@@ -601,7 +624,7 @@ def plot_layer_sweep(metrics_df, behavior, output_path, method,
 
     ax = axes[0]
     ax.plot(layers, df["r2_h_pls"].values, "o-", color="#1f77b4", linewidth=2,
-            markersize=6, label=r"$R^2(h_{PLS}, k^\ast)$ (held-out)")
+            markersize=6, label=r"$R^2(h_{PLS}, k^\ast)$ (in-sample)")
     ax.axhline(y=0, color="gray", linestyle=":", alpha=0.6)
     ax.set_ylabel(r"$R^2(h_{PLS})$  (PLS subspace)", fontsize=10)
     ax.set_title(
@@ -717,7 +740,7 @@ def plot_pls_k_elbow(sweep_df, metrics_df, behavior, output_path, method):
         r, c = idx // cols, idx % cols
         ax = axes[r][c]
         ldf = sweep_df[sweep_df["layer"] == layer].sort_values("k")
-        ax.plot(ldf["k"].values, ldf["r2_held_out"].values, "o-",
+        ax.plot(ldf["k"].values, ldf["r2_in_sample"].values, "o-",
                 color="#1f77b4", markersize=4, linewidth=1.5)
         k_star = metrics_lookup.get(layer, np.nan)
         if not (isinstance(k_star, float) and np.isnan(k_star)):
@@ -731,7 +754,7 @@ def plot_pls_k_elbow(sweep_df, metrics_df, behavior, output_path, method):
         ax.set_title(f"Layer {int(layer)}", fontsize=10)
         ax.grid(True, alpha=0.4)
         ax.set_xlabel("k", fontsize=9)
-        ax.set_ylabel(r"OOF $R^2$", fontsize=9)
+        ax.set_ylabel(r"in-sample $R^2$", fontsize=9)
 
     # Hide unused axes.
     for idx in range(n, rows * cols):
@@ -739,7 +762,7 @@ def plot_pls_k_elbow(sweep_df, metrics_df, behavior, output_path, method):
         axes[r][c].set_visible(False)
 
     fig.suptitle(
-        f"{behavior}: PLS k vs held-out $R^2$ (per layer)\n{METHOD_LABELS.get(method, method)}",
+        f"{behavior}: PLS k vs in-sample $R^2$ (per layer)\n{METHOD_LABELS.get(method, method)}",
         fontsize=11, fontweight="bold",
     )
     plt.tight_layout(rect=(0, 0, 1, 0.96))
@@ -763,8 +786,6 @@ def main():
     parser.add_argument("--use_bf16", action="store_true", default=True)
     parser.add_argument("--k_max", type=int, default=20,
                         help="Max PLS components to sweep")
-    parser.add_argument("--n_splits", type=int, default=5,
-                        help="K-fold CV splits for held-out R^2 in PLS k sweep")
     parser.add_argument("--no_normalize_delta", action="store_true")
     parser.add_argument("--replot_only", action="store_true")
     args = parser.parse_args()
@@ -973,7 +994,7 @@ def main():
         metrics_df, sweep_df = compute_pls_metrics(
             test_mean_acts, test_metadata, directions, centroid_norm,
             target_layers, train_acts, args.behavior, mode=mode,
-            k_max=args.k_max, n_splits=args.n_splits,
+            k_max=args.k_max,
         )
         out_df = metrics_df.merge(delta_df, on="layer", how="left")
         out_df.to_csv(out_dir / f"r2_per_layer__{mode}.csv", index=False)
@@ -1012,7 +1033,7 @@ def main():
         "train_dataset_path": args.train_dataset_path,
         "layers": target_layers,
         "k_max": args.k_max,
-        "n_splits": args.n_splits,
+        "fit_strategy": "in_sample (no CV)",
         "method_descriptions": METHOD_LABELS,
         "delta_l_normalized": not args.no_normalize_delta,
         "metrics_test_only": method_results["test_only"][0].to_dict(orient="records"),
