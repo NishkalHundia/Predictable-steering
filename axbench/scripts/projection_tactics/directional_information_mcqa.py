@@ -31,8 +31,6 @@ For each layer l:
 
 Outputs:
   {output_dir}/
-    train_activations.pt
-    test_activations.pt
     r2_per_layer__test_only.csv
     delta_l.csv
     analysis_summary.json
@@ -732,8 +730,6 @@ def main():
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--use_bf16", action="store_true", default=True)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--replot_only", action="store_true",
-                        help="Skip model inference; reuse cached activations + CSV")
     args = parser.parse_args()
 
     mcqa_link_dir = Path(args.mcqa_link_dir)
@@ -784,101 +780,36 @@ def main():
         f"from {per_prompt_csv}"
     )
 
-    train_acts_path = out_dir / "train_activations.pt"
-    test_acts_path = out_dir / "test_activations.pt"
+    # ---------- Phase 1: load model + extract train/test activations ----
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.warning(f"Device: {device}")
+    logger.warning(f"Loading model {args.model_name} ...")
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model_name, model_max_length=1024, padding_side="right",
+    )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_name,
+        torch_dtype=torch.bfloat16 if args.use_bf16 else None,
+        device_map=device,
+    )
+    model.eval()
 
-    # ---------- Phase 1: training activations ---------------------------
-    if args.replot_only:
-        if not train_acts_path.exists() or not test_acts_path.exists():
-            logger.error("--replot_only requires cached train_activations.pt and "
-                         "test_activations.pt. Run without --replot_only first.")
-            sys.exit(1)
-        cached = torch.load(train_acts_path, map_location="cpu", weights_only=False)
-        train_acts = cached["train_acts"]
-        cached_test = torch.load(test_acts_path, map_location="cpu", weights_only=False)
-        test_mean_acts = cached_test["test_mean_acts"]
-        test_metadata = cached_test["test_metadata"]
-    else:
-        model = None
-        tokenizer = None
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    train_acts, _train_meta = extract_train_activations(
+        model, tokenizer, train_dataset_path, target_layers, device,
+        batch_size=args.batch_size, max_examples=args.max_examples,
+        seed=args.seed,
+    )
+    test_mean_acts, test_metadata = extract_test_activations(
+        model, tokenizer, test_dataset_path, baseline_correct_map,
+        target_layers, device,
+        batch_size=args.batch_size, max_test=args.max_test,
+    )
 
-        def _ensure_model_loaded():
-            nonlocal model, tokenizer
-            if model is not None:
-                return
-            logger.warning(f"Device: {device}")
-            logger.warning(f"Loading model {args.model_name} ...")
-            tokenizer = AutoTokenizer.from_pretrained(
-                args.model_name, model_max_length=1024, padding_side="right",
-            )
-            if tokenizer.pad_token is None:
-                tokenizer.pad_token = tokenizer.eos_token
-            model = AutoModelForCausalLM.from_pretrained(
-                args.model_name,
-                torch_dtype=torch.bfloat16 if args.use_bf16 else None,
-                device_map=device,
-            )
-            model.eval()
-
-        if train_acts_path.exists():
-            logger.warning(f"Loading cached training activations from {train_acts_path}")
-            cached = torch.load(train_acts_path, map_location="cpu", weights_only=False)
-            train_acts = cached["train_acts"]
-            train_meta = cached["train_meta"]
-            cached_layers = set(train_acts.keys())
-            if not set(target_layers).issubset(cached_layers):
-                logger.warning("Cached train activations missing some target layers; "
-                               "re-extracting.")
-                _ensure_model_loaded()
-                train_acts, train_meta = extract_train_activations(
-                    model, tokenizer, train_dataset_path, target_layers, device,
-                    batch_size=args.batch_size, max_examples=args.max_examples,
-                    seed=args.seed,
-                )
-                torch.save({"train_acts": train_acts, "train_meta": train_meta},
-                           train_acts_path)
-        else:
-            _ensure_model_loaded()
-            train_acts, train_meta = extract_train_activations(
-                model, tokenizer, train_dataset_path, target_layers, device,
-                batch_size=args.batch_size, max_examples=args.max_examples,
-                seed=args.seed,
-            )
-            torch.save({"train_acts": train_acts, "train_meta": train_meta},
-                       train_acts_path)
-
-        if test_acts_path.exists():
-            logger.warning(f"Loading cached test activations from {test_acts_path}")
-            cached_test = torch.load(test_acts_path, map_location="cpu", weights_only=False)
-            test_mean_acts = cached_test["test_mean_acts"]
-            test_metadata = cached_test["test_metadata"]
-            cached_layers = set(int(e["layer"]) for e in test_metadata)
-            if not set(target_layers).issubset(cached_layers):
-                logger.warning("Cached test activations missing some target layers; "
-                               "re-extracting.")
-                _ensure_model_loaded()
-                test_mean_acts, test_metadata = extract_test_activations(
-                    model, tokenizer, test_dataset_path, baseline_correct_map,
-                    target_layers, device,
-                    batch_size=args.batch_size, max_test=args.max_test,
-                )
-                torch.save({"test_mean_acts": test_mean_acts,
-                            "test_metadata": test_metadata}, test_acts_path)
-        else:
-            _ensure_model_loaded()
-            test_mean_acts, test_metadata = extract_test_activations(
-                model, tokenizer, test_dataset_path, baseline_correct_map,
-                target_layers, device,
-                batch_size=args.batch_size, max_test=args.max_test,
-            )
-            torch.save({"test_mean_acts": test_mean_acts,
-                        "test_metadata": test_metadata}, test_acts_path)
-
-        if model is not None:
-            del model
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+    del model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     # ---------- Phase 2: DiffMean direction + centroid normalization ----
     logger.warning("Phase 2: Computing DiffMean directions ...")
