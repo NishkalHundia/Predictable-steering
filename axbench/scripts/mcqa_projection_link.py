@@ -453,69 +453,108 @@ def plot_kappa_scatter(prompt_df, layer, behavior, out_path):
     plt.close()
 
 
-def plot_projection_histograms(prompt_df, factors, behavior, layer, out_path):
+def _hist_overlapping(ax, k_match, k_nonmatch, k_gibber, bins):
+    """Overlapping semi-transparent histograms — all three distributions visible at once."""
+    if len(k_gibber):
+        ax.hist(k_gibber,   bins=bins, color="#aaaaaa", alpha=0.55,
+                edgecolor="#888888", linewidth=0.5, label="Gibberish")
+    if len(k_nonmatch):
+        ax.hist(k_nonmatch, bins=bins, color="#d62728", alpha=0.55,
+                edgecolor="#a01010", linewidth=0.5, label="Non-matching")
+    if len(k_match):
+        ax.hist(k_match,    bins=bins, color="#1f77b4", alpha=0.55,
+                edgecolor="#104e8b", linewidth=0.5, label="Matching")
+
+
+def plot_projection_histograms(prompt_df, factors, behavior, layer,
+                               train_projections, out_path):
     """
-    For one layer: one subplot per factor (including baseline α=0).
-    X-axis = κ_a_steered = κ_a_baseline + 2α (points shift right as α grows).
-    Bars stacked by model output at that factor:
-      blue  = output matched behavior letter
-      red   = output matched non-behavior letter (on-format, wrong)
-      grey  = gibberish / off-format
+    2×4 grid (7 panels used, 1 empty):
+      [Train] [α=0] [α=1] [α=2]
+      [α=3 ] [α=5] [α=10] [ - ]
+
+    Train panel: blue=matching, red=non-matching training examples.
+    Test panels: blue=correct output, red=non-matching output, grey=gibberish.
+    X = κ_a_steered = κ_a_baseline + 2α.  X-range is data-driven; κ=0 line
+    only shown when it falls within the visible range.
     """
     ldf = prompt_df[prompt_df["layer"] == layer].dropna(subset=["kappa_a"]).copy()
     if len(ldf) < 4:
         return
 
-    all_factors = [0] + [f for f in factors if f != 0]
-    n_cols = len(all_factors)
-    fig, axes = plt.subplots(1, n_cols, figsize=(4 * n_cols, 4), sharey=False)
-    if n_cols == 1:
-        axes = [axes]
+    kappa_base   = ldf["kappa_a"].values
+    all_factors  = [0] + [f for f in factors if f != 0]
 
-    kappa_base = ldf["kappa_a"].values
+    # 2×4 layout — train panel first, then factor panels.
+    fig, axes = plt.subplots(2, 4, figsize=(16, 7))
+    axes_flat  = axes.flatten()  # [0..7]
+    train_ax   = axes_flat[0]
+    factor_axes = axes_flat[1:1 + len(all_factors)]
+    for ax in axes_flat[1 + len(all_factors):]:
+        ax.set_visible(False)
 
-    # Determine shared x-range for context (baseline range).
-    x_min_base = kappa_base.min()
-    x_max_base = kappa_base.max()
+    # ---- Train panel -------------------------------------------------------
+    tp = train_projections.get(layer, {})
+    pos_proj = np.array(tp.get("pos", []), dtype=float)
+    neg_proj = np.array(tp.get("neg", []), dtype=float)
+    if len(pos_proj) > 0 or len(neg_proj) > 0:
+        all_train = np.concatenate([pos_proj, neg_proj]) if len(pos_proj) and len(neg_proj) \
+                    else (pos_proj if len(pos_proj) else neg_proj)
+        pad = max(0.3, (all_train.max() - all_train.min()) * 0.05 + 0.01)
+        bins_t = np.linspace(all_train.min() - pad, all_train.max() + pad, 25)
+        if len(neg_proj):
+            train_ax.hist(neg_proj, bins=bins_t, color="#d62728", alpha=0.55,
+                          edgecolor="#a01010", linewidth=0.5, label="Non-matching")
+        if len(pos_proj):
+            train_ax.hist(pos_proj, bins=bins_t, color="#1f77b4", alpha=0.55,
+                          edgecolor="#104e8b", linewidth=0.5, label="Matching")
+        x_lo, x_hi = bins_t[0], bins_t[-1]
+        if x_lo <= 0 <= x_hi:
+            train_ax.axvline(0, color="black", linestyle="--", linewidth=0.9, alpha=0.5)
+    train_ax.set_title("Train", fontsize=10, fontweight="bold")
+    train_ax.set_xlabel("κ_a", fontsize=9)
+    train_ax.set_ylabel("# examples", fontsize=9)
+    train_ax.legend(fontsize=7, loc="upper left")
 
-    for ax, f in zip(axes, all_factors):
+    # ---- Test factor panels ------------------------------------------------
+    for ax, f in zip(factor_axes, all_factors):
         kappa_steered = kappa_base + 2.0 * f
 
         if f == 0:
-            matching    = ldf["baseline_correct"].astype(bool).values
-            on_format   = ldf["baseline_on_format"].astype(bool).values
+            matching  = ldf["baseline_correct"].astype(bool).values
+            on_format = ldf["baseline_on_format"].astype(bool).values
         else:
-            col_correct   = f"steered_correct_{f:g}"
-            col_on_format = f"steered_on_format_{f:g}"
-            if col_correct not in ldf.columns:
+            col_c = f"steered_correct_{f:g}"
+            col_f = f"steered_on_format_{f:g}"
+            if col_c not in ldf.columns:
                 ax.set_visible(False)
                 continue
-            matching  = ldf[col_correct].astype(bool).values
-            on_format = ldf[col_on_format].astype(bool).values
+            matching  = ldf[col_c].astype(bool).values
+            on_format = ldf[col_f].astype(bool).values
 
-        # Three groups.
-        k_match    = kappa_steered[matching]
+        k_match    = kappa_steered[ matching]
         k_nonmatch = kappa_steered[~matching &  on_format]
         k_gibber   = kappa_steered[~matching & ~on_format]
 
-        x_min = kappa_steered.min() - 0.2
-        x_max = kappa_steered.max() + 0.2
-        bins  = np.linspace(x_min, x_max, 20)
+        pad   = max(0.3, (kappa_steered.max() - kappa_steered.min()) * 0.05 + 0.01)
+        x_lo  = kappa_steered.min() - pad
+        x_hi  = kappa_steered.max() + pad
+        bins  = np.linspace(x_lo, x_hi, 20)
 
-        ax.hist(k_gibber,   bins=bins, color="#aaaaaa", alpha=0.85, label="Gibberish", stacked=True)
-        ax.hist(k_nonmatch, bins=bins, color="#d62728", alpha=0.85, label="Non-matching", stacked=True)
-        ax.hist(k_match,    bins=bins, color="#1f77b4", alpha=0.85, label="Matching", stacked=True)
+        _hist_overlapping(ax, k_match, k_nonmatch, k_gibber, bins)
 
-        ax.axvline(0, color="black", linestyle="--", linewidth=1.0, alpha=0.6)
+        ax.set_xlim(x_lo, x_hi)
+        if x_lo <= 0 <= x_hi:
+            ax.axvline(0, color="black", linestyle="--", linewidth=0.9, alpha=0.5)
         ax.set_xlabel("κ_a steered", fontsize=9)
         ax.set_title(f"α={f:g}", fontsize=10, fontweight="bold")
-        if ax is axes[0]:
+        if ax is factor_axes[0]:
             ax.set_ylabel("# prompts", fontsize=9)
             ax.legend(fontsize=7, loc="upper left")
 
     fig.suptitle(
-        f"{behavior} — Layer {layer}: projection distribution by steering factor",
-        fontsize=11, fontweight="bold",
+        f"{behavior} — Layer {layer}: DiffMean projection distribution",
+        fontsize=12, fontweight="bold",
     )
     plt.tight_layout()
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
@@ -588,10 +627,12 @@ def main():
     # Check if we can skip forward passes (reuse saved CSV).
     # d' is stored separately in dprime.json so it survives CSV reuse.
     # ------------------------------------------------------------------
-    per_prompt_csv = out_dir / "per_prompt_results.csv"
-    dprime_json    = out_dir / "dprime.json"
-    per_prompt_df  = None
-    dprimes        = {}  # populated either from file or Phase 0
+    per_prompt_csv    = out_dir / "per_prompt_results.csv"
+    dprime_json       = out_dir / "dprime.json"
+    train_proj_json   = out_dir / "train_projections.json"
+    per_prompt_df     = None
+    dprimes           = {}   # populated either from file or Phase 0
+    train_projections = {}   # {layer: {"pos": [...], "neg": [...]}} — from file or Phase 0
 
     if (not args.force_recompute) and per_prompt_csv.exists():
         try:
@@ -619,7 +660,7 @@ def main():
         except Exception as e:
             logger.warning(f"Could not reuse CSV: {e}")
 
-    # Load d' from file if available (may exist even when CSV does too).
+    # Load d' and train projections from files if available.
     if dprime_json.exists():
         try:
             with open(dprime_json) as f:
@@ -628,8 +669,17 @@ def main():
         except Exception as e:
             logger.warning(f"Could not load {dprime_json}: {e}")
 
-    # If CSV is reusable but d' is still missing, run Phase 0 only (no Phase A/B).
-    need_dprime = not dprimes and per_prompt_df is not None
+    if train_proj_json.exists():
+        try:
+            with open(train_proj_json) as f:
+                raw = json.load(f)
+            train_projections = {int(k): {"pos": v["pos"], "neg": v["neg"]} for k, v in raw.items()}
+            logger.warning(f"Loaded train projections for {len(train_projections)} layers from {train_proj_json}")
+        except Exception as e:
+            logger.warning(f"Could not load {train_proj_json}: {e}")
+
+    # If CSV is reusable but Phase 0 data is missing, run Phase 0 only (no Phase A/B).
+    need_dprime = (not dprimes or not train_projections) and per_prompt_df is not None
     need_full   = per_prompt_df is None
 
     if need_dprime or need_full:
@@ -689,6 +739,7 @@ def main():
             del hiddens, ids, mask
 
         steering_vecs, mu_poss, mu_negs, dprimes = {}, {}, {}, {}
+        train_projections = {}
         for l in layers:
             if not pos_acts[l] or not neg_acts[l]:
                 continue
@@ -705,16 +756,23 @@ def main():
                 np_ = np.array([float(2.0*(a-mu_mid).dot(v)/v_norm_sq) for a in neg_acts[l]])
                 dprimes[l] = compute_dprime(pp, np_)
             else:
+                pp  = np.zeros(len(pos_acts[l]))
+                np_ = np.zeros(len(neg_acts[l]))
                 dprimes[l] = 0.0
+            train_projections[l] = {"pos": pp.tolist(), "neg": np_.tolist()}
             logger.warning(f"  L{l:2d}: d'={dprimes[l]:.3f}  ||v||={float(v.norm()):.3f}")
 
         layers = [l for l in layers if l in steering_vecs]
         del pos_acts, neg_acts
 
-        # Save d' so it survives future CSV-reuse runs.
+        # Save d' and train projections so they survive future CSV-reuse runs.
         with open(dprime_json, "w") as f:
             json.dump({str(l): float(v) for l, v in dprimes.items()}, f, indent=2)
         logger.warning(f"Saved d' to {dprime_json}")
+
+        with open(train_proj_json, "w") as f:
+            json.dump({str(l): v for l, v in train_projections.items()}, f)
+        logger.warning(f"Saved train projections to {train_proj_json}")
 
         if not need_full:
             logger.warning("Phase 0 complete (d' only). Skipping Phase A/B — CSV reused.")
@@ -976,6 +1034,7 @@ def main():
         plot_kappa_scatter(per_prompt_df, int(l), args.behavior,
                            plots / f"kappa_scatter_layer_{int(l)}.png")
         plot_projection_histograms(per_prompt_df, factors, args.behavior, int(l),
+                                   train_projections,
                                    plots / f"projection_hist_layer_{int(l)}.png")
 
     # Summary JSON.
