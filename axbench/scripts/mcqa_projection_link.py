@@ -158,6 +158,16 @@ def pad_batch(token_lists, pad_id, device):
     return ids, mask, lens
 
 
+def seq_through_paren_plus_token(full_ids, open_paren_pos: int, next_token_id: int):
+    """Token ids through '(' inclusive plus model-chosen letter; handles list or 1-D tensor."""
+    prefix = full_ids[: open_paren_pos + 1]
+    if torch.is_tensor(prefix):
+        pref = prefix.detach().cpu().tolist()
+    else:
+        pref = list(prefix)
+    return pref + [int(next_token_id)]
+
+
 def compute_dprime(pos: np.ndarray, neg: np.ndarray) -> float:
     gap = abs(pos.mean() - neg.mean())
     pooled = np.sqrt(0.5 * (pos.var() + neg.var()))
@@ -928,7 +938,7 @@ def main():
                 for b in batch:
                     j = b["prompt_idx"]
                     op = b["open_paren_pos"]
-                    seq = b["full_ids"][:op + 1].tolist() + [baseline_tok[j]]
+                    seq = seq_through_paren_plus_token(b["full_ids"], op, baseline_tok[j])
                     seqs.append(seq)
                     pos_idx.append(len(seq) - 1)
                     js.append(j)
@@ -966,7 +976,9 @@ def main():
                             j = b["prompt_idx"]
                             tid = toks[i]
                             steered_tok[(factor, l, j)] = tid
-                            seq = b["full_ids"][:b["open_paren_pos"] + 1].tolist() + [tid]
+                            seq = seq_through_paren_plus_token(
+                                b["full_ids"], b["open_paren_pos"], tid,
+                            )
                             seqs.append(seq)
                             pos_idx.append(len(seq) - 1)
                             js.append(j)
