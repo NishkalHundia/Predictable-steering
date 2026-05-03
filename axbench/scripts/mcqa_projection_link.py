@@ -958,6 +958,9 @@ def main():
             logger.warning(f"\n=== Phase B: Steered ({len(layers)} layers × {len(factors)} factors) ===")
 
             steered_tok = {}  # (factor, l, j) -> int
+            # κ_postgen for row "layer=L" must come from embedding after steering **at**
+            # layer L — token tid = steered_tok[(α,L,j)] — then 2nd forward, projection
+            # using µ± and hidden at chosen token **at layer L** (same indexing as κ_a row).
             kappa_postgen_steered = {}  # (l, factor, j) -> float
 
             for l in tqdm(layers, desc="Phase B layers"):
@@ -988,10 +991,11 @@ def main():
                             model, ids2, mask2, layers, pos_idx,
                         )
                         del ids2, mask2
-                        for lm in layers:
-                            kbatch = batch_kappa_cpu(h_at[lm], mu_poss[lm], mu_negs[lm])
-                            for ii, pj in enumerate(js):
-                                kappa_postgen_steered[(lm, factor, pj)] = float(kbatch[ii])
+                        # Only store κ at the steering/read layer `l`
+                        # (embedding is from α-steered choice at this layer).
+                        kbatch = batch_kappa_cpu(h_at[l], mu_poss[l], mu_negs[l])
+                        for ii, pj in enumerate(js):
+                            kappa_postgen_steered[(l, factor, pj)] = float(kbatch[ii])
 
             # ----------------------------------------------------------------
             # Assemble per-prompt DataFrame.
