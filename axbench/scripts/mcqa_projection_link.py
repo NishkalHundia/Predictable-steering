@@ -12,7 +12,11 @@ Pipeline (single self-contained script):
   Phase A  — Baseline greedy decode + activation capture for all test prompts.
              Evaluation: argmax of lm_head at the '(' position (same approach
              as mcqa_adaptive_steer.py; off-format / gibberish → counted wrong).
-  Phase B  — Fixed-factor steered greedy decode per (layer, factor).
+             κ_a uses hidden state at the teacher-forced answer letter.
+  Phase A2 — Unsteered forward on prefix + [baseline-chosen token]; κ_a_postgen
+             from hidden at that token (per layer).
+  Phase B  — Steered decode at '(' per (layer, factor), then unsteered forward on
+             prefix + [steered token]; kappa_a_postgen_{α} per layer.
   Analysis — Per layer:
                • sign(κ_a) vs baseline_correct  → MCC  (binary predictor)
                • κ_a vs baseline_correct         → Spearman ρ (continuous)
@@ -23,7 +27,7 @@ Pipeline (single self-contained script):
                • Same for d' vs steered accuracy
 
 Outputs (under --output_dir):
-  per_prompt_results.csv   — one row per (layer, prompt)
+  per_prompt_results.csv   — κ_a, κ_a_postgen*, steered columns per (layer, prompt)
   per_layer_summary.csv    — one row per layer
   cross_layer_corr.csv     — predictor vs target correlations across layers
   plots/
@@ -31,6 +35,8 @@ Outputs (under --output_dir):
     steering_acc_by_layer.png         — steered greedy acc, one line per factor
     projection_vs_steering.png        — scatter: projection MCC vs steered acc
     kappa_scatter_layer_{N}.png       — κ_a vs baseline_correct per prompt
+    projection_hist_layer_{N}.png     — train + α (letter-pos κ; steered κ = κ+2α)
+    projection_hist_postgen_layer_{N}.png — same grid, κ at chosen-token forward
 
 Usage:
     uv run python axbench/scripts/mcqa_projection_link.py \\
@@ -221,6 +227,39 @@ def forward_capture(model, input_ids, attention_mask, layers, open_paren_positio
         next_toks.append(int(logit.argmax().item()))
     del hs
     return next_toks, {l: storage[l].float().cpu() for l in layers}
+
+
+@torch.no_grad()
+def forward_capture_hiddens_at_positions(model, input_ids, attention_mask, layers, positions):
+    """Unsteered forward; for each batch row i, return hidden state at token index positions[i]."""
+    storage = {}
+    handles = [
+        model.model.layers[l].register_forward_hook(
+            make_capture_hook(storage, l), always_call=True
+        )
+        for l in layers
+    ]
+    try:
+        _ = model.model(input_ids=input_ids, attention_mask=attention_mask)
+    finally:
+        for h in handles:
+            h.remove()
+    B = input_ids.shape[0]
+    out = {}
+    for l in layers:
+        h = storage[l].float().cpu()
+        out[l] = torch.stack([h[i, int(positions[i]), :] for i in range(B)])
+    return out
+
+
+def batch_kappa_cpu(acts: torch.Tensor, mu_pos: torch.Tensor, mu_neg: torch.Tensor) -> np.ndarray:
+    """Project row-wise activations onto DiffMean line (Braun κ_a). acts, μ: float CPU tensors."""
+    mu = 0.5 * (mu_pos + mu_neg)
+    v = mu_pos - mu_neg
+    vns = float(v.dot(v).item())
+    if vns < 1e-12:
+        return np.full(acts.shape[0], np.nan)
+    return ((acts - mu) @ v * (2.0 / vns)).numpy()
 
 
 @torch.no_grad()
@@ -467,7 +506,7 @@ def _hist_overlapping(ax, k_match, k_nonmatch, k_gibber, bins):
 
 
 def plot_projection_histograms(prompt_df, factors, behavior, layer,
-                               train_projections, out_path):
+                               train_projections, out_path, postgen: bool = False):
     """
     2×4 grid (7 panels used, 1 empty):
       [Train] [α=0] [α=1] [α=2]
@@ -475,14 +514,16 @@ def plot_projection_histograms(prompt_df, factors, behavior, layer,
 
     Train panel: blue=matching, red=non-matching training examples.
     Test panels: blue=correct output, red=non-matching output, grey=gibberish.
-    X = κ_a_steered = κ_a_baseline + 2α.  X-range is data-driven; κ=0 line
-    only shown when it falls within the visible range.
+
+    postgen=False (default): κ at teacher-forced letter token; steered κ = κ_base + 2α.
+    postgen=True: κ after a second unsteered forward on prefix + [model's chosen token]
+    at that token; per-factor columns kappa_a_postgen_{f}.
     """
-    ldf = prompt_df[prompt_df["layer"] == layer].dropna(subset=["kappa_a"]).copy()
+    base_col = "kappa_a_postgen" if postgen else "kappa_a"
+    ldf = prompt_df[prompt_df["layer"] == layer].dropna(subset=[base_col]).copy()
     if len(ldf) < 4:
         return
 
-    kappa_base   = ldf["kappa_a"].values
     all_factors  = [0] + [f for f in factors if f != 0]
 
     # 2×4 layout — train panel first, then factor panels.
@@ -518,7 +559,16 @@ def plot_projection_histograms(prompt_df, factors, behavior, layer,
 
     # ---- Test factor panels ------------------------------------------------
     for ax, f in zip(factor_axes, all_factors):
-        kappa_steered = kappa_base + 2.0 * f
+        if f == 0:
+            kappa_vals = ldf[base_col].values
+        elif postgen:
+            col_k = f"kappa_a_postgen_{f:g}"
+            if col_k not in ldf.columns:
+                ax.set_visible(False)
+                continue
+            kappa_vals = ldf[col_k].values
+        else:
+            kappa_vals = ldf[base_col].values + 2.0 * f
 
         if f == 0:
             matching  = ldf["baseline_correct"].astype(bool).values
@@ -532,13 +582,13 @@ def plot_projection_histograms(prompt_df, factors, behavior, layer,
             matching  = ldf[col_c].astype(bool).values
             on_format = ldf[col_f].astype(bool).values
 
-        k_match    = kappa_steered[ matching]
-        k_nonmatch = kappa_steered[~matching &  on_format]
-        k_gibber   = kappa_steered[~matching & ~on_format]
+        k_match    = kappa_vals[ matching]
+        k_nonmatch = kappa_vals[~matching &  on_format]
+        k_gibber   = kappa_vals[~matching & ~on_format]
 
-        pad   = max(0.3, (kappa_steered.max() - kappa_steered.min()) * 0.05 + 0.01)
-        x_lo  = kappa_steered.min() - pad
-        x_hi  = kappa_steered.max() + pad
+        pad   = max(0.3, (kappa_vals.max() - kappa_vals.min()) * 0.05 + 0.01)
+        x_lo  = kappa_vals.min() - pad
+        x_hi  = kappa_vals.max() + pad
         bins  = np.linspace(x_lo, x_hi, 20)
 
         _hist_overlapping(ax, k_match, k_nonmatch, k_gibber, bins)
@@ -546,14 +596,16 @@ def plot_projection_histograms(prompt_df, factors, behavior, layer,
         ax.set_xlim(x_lo, x_hi)
         if x_lo <= 0 <= x_hi:
             ax.axvline(0, color="black", linestyle="--", linewidth=0.9, alpha=0.5)
-        ax.set_xlabel("κ_a steered", fontsize=9)
+        xlab = "κ_a (post-gen token)" if postgen else "κ_a steered"
+        ax.set_xlabel(xlab, fontsize=9)
         ax.set_title(f"α={f:g}", fontsize=10, fontweight="bold")
         if ax is factor_axes[0]:
             ax.set_ylabel("# prompts", fontsize=9)
             ax.legend(fontsize=7, loc="upper left")
 
+    sub = " (post-gen: 2nd forward at chosen answer token)" if postgen else " (letter-pos κ; steered = κ+2α)"
     fig.suptitle(
-        f"{behavior} — Layer {layer}: DiffMean projection distribution",
+        f"{behavior} — Layer {layer}: DiffMean projection distribution{sub}",
         fontsize=12, fontweight="bold",
     )
     plt.tight_layout()
@@ -642,9 +694,17 @@ def main():
                 float(c.replace("steered_correct_", ""))
                 for c in df.columns if c.startswith("steered_correct_")
             )
+            have_postgen = (
+                ("kappa_a_postgen" in df.columns)
+                and all(f"kappa_a_postgen_{f:g}" in df.columns for f in factors)
+            )
             need_layers  = set(layers)
             need_factors = set(factors)
-            if need_layers <= have_layers and need_factors <= have_factors:
+            if (
+                need_layers <= have_layers
+                and need_factors <= have_factors
+                and have_postgen
+            ):
                 per_prompt_df = df
                 logger.warning(
                     f"Reusing {per_prompt_csv} — covers all requested layers/factors. "
@@ -653,9 +713,10 @@ def main():
             else:
                 missing_l = need_layers - have_layers
                 missing_f = need_factors - have_factors
+                miss_p = [] if have_postgen else ["kappa_a_postgen_*"]
                 logger.warning(
                     f"CSV exists but missing layers={missing_l or 'none'} "
-                    f"factors={missing_f or 'none'}; recomputing."
+                    f"factors={missing_f or 'none'} postgen_cols={miss_p or 'ok'}; recomputing."
                 )
         except Exception as e:
             logger.warning(f"Could not reuse CSV: {e}")
@@ -856,16 +917,42 @@ def main():
             del act_at_letter
 
             # ----------------------------------------------------------------
+            # Phase A2: κ at model's chosen token (2nd unsteered forward).
+            # Sequence = full_ids[:open_paren+1] + [baseline_tok]; read last pos.
+            # ----------------------------------------------------------------
+            logger.warning(f"\n=== Phase A2: Post-gen κ baseline ({n_items} prompts) ===")
+            kappa_postgen_base = {}
+            for start in tqdm(range(0, n_items, B), desc="Phase A2 post-gen κ"):
+                batch = flat_items[start:start + B]
+                seqs, pos_idx, js = [], [], []
+                for b in batch:
+                    j = b["prompt_idx"]
+                    op = b["open_paren_pos"]
+                    seq = b["full_ids"][:op + 1].tolist() + [baseline_tok[j]]
+                    seqs.append(seq)
+                    pos_idx.append(len(seq) - 1)
+                    js.append(j)
+                ids2, mask2, _ = pad_batch(seqs, pad_id, device)
+                h_at = forward_capture_hiddens_at_positions(
+                    model, ids2, mask2, layers, pos_idx,
+                )
+                del ids2, mask2
+                for lm in layers:
+                    kbatch = batch_kappa_cpu(h_at[lm], mu_poss[lm], mu_negs[lm])
+                    for ii, pj in enumerate(js):
+                        kappa_postgen_base[(lm, pj)] = float(kbatch[ii])
+
+            # ----------------------------------------------------------------
             # Phase B: Fixed-factor steered greedy decode per (layer, factor).
             # ----------------------------------------------------------------
             logger.warning(f"\n=== Phase B: Steered ({len(layers)} layers × {len(factors)} factors) ===")
 
             steered_tok = {}  # (factor, l, j) -> int
+            kappa_postgen_steered = {}  # (l, factor, j) -> float
 
             for l in tqdm(layers, desc="Phase B layers"):
                 sv = steering_vecs[l]
                 for factor in factors:
-                    results = []
                     for start in range(0, n_items, B):
                         batch = flat_items[start:start + B]
                         ids, mask, _ = pad_batch([b["full_ids"] for b in batch], pad_id, device)
@@ -874,11 +961,25 @@ def main():
                             [b["open_paren_pos"] for b in batch],
                             l, sv, factor, prefix_length,
                         )
+                        seqs, pos_idx, js = [], [], []
                         for i, b in enumerate(batch):
-                            results.append((b["prompt_idx"], toks[i]))
+                            j = b["prompt_idx"]
+                            tid = toks[i]
+                            steered_tok[(factor, l, j)] = tid
+                            seq = b["full_ids"][:b["open_paren_pos"] + 1].tolist() + [tid]
+                            seqs.append(seq)
+                            pos_idx.append(len(seq) - 1)
+                            js.append(j)
                         del ids, mask
-                    for j, tid in results:
-                        steered_tok[(factor, l, j)] = tid
+                        ids2, mask2, _ = pad_batch(seqs, pad_id, device)
+                        h_at = forward_capture_hiddens_at_positions(
+                            model, ids2, mask2, layers, pos_idx,
+                        )
+                        del ids2, mask2
+                        for lm in layers:
+                            kbatch = batch_kappa_cpu(h_at[lm], mu_poss[lm], mu_negs[lm])
+                            for ii, pj in enumerate(js):
+                                kappa_postgen_steered[(lm, factor, pj)] = float(kbatch[ii])
 
             # ----------------------------------------------------------------
             # Assemble per-prompt DataFrame.
@@ -896,6 +997,7 @@ def main():
                         "matching_letter": rec["matching_letter"],
                         "notmatch_letter": rec["notmatch_letter"],
                         "kappa_a": kappa_map.get((l, j), float("nan")),
+                        "kappa_a_postgen": kappa_postgen_base.get((l, j), float("nan")),
                         "baseline_token": rec["baseline_token"],
                         "baseline_on_format": rec["baseline_on_format"],
                         "baseline_correct": rec["baseline_correct"],
@@ -906,12 +1008,16 @@ def main():
                             row[f"steered_token_{factor:g}"] = ""
                             row[f"steered_on_format_{factor:g}"] = False
                             row[f"steered_correct_{factor:g}"] = False
+                            row[f"kappa_a_postgen_{factor:g}"] = float("nan")
                             row[f"steering_factor"] = factor
                         else:
                             g = decode_letter(tokenizer, tid)
                             row[f"steered_token_{factor:g}"] = g or tokenizer.decode([tid]).strip()
                             row[f"steered_on_format_{factor:g}"] = g is not None
                             row[f"steered_correct_{factor:g}"] = g == b["matching_letter"]
+                            row[f"kappa_a_postgen_{factor:g}"] = kappa_postgen_steered.get(
+                                (l, factor, j), float("nan"),
+                            )
                     rows.append(row)
 
             per_prompt_df = pd.DataFrame(rows)
@@ -1035,7 +1141,12 @@ def main():
                            plots / f"kappa_scatter_layer_{int(l)}.png")
         plot_projection_histograms(per_prompt_df, factors, args.behavior, int(l),
                                    train_projections,
-                                   plots / f"projection_hist_layer_{int(l)}.png")
+                                   plots / f"projection_hist_layer_{int(l)}.png",
+                                   postgen=False)
+        plot_projection_histograms(per_prompt_df, factors, args.behavior, int(l),
+                                   train_projections,
+                                   plots / f"projection_hist_postgen_layer_{int(l)}.png",
+                                   postgen=True)
 
     # Summary JSON.
     summary = {
