@@ -37,6 +37,7 @@ Outputs (under --output_dir):
     kappa_scatter_layer_{N}.png       — κ_a vs baseline_correct per prompt
     projection_hist_layer_{N}.png     — train + α (letter-pos κ; steered κ = κ+2α)
     projection_hist_postgen_layer_{N}.png — same grid, κ at chosen-token forward
+    mcc_best_alpha_vs_dprime.png     — MCC(sign κ vs match @ best α) vs d' per layer
 
 Usage:
     uv run python axbench/scripts/mcqa_projection_link.py \\
@@ -402,6 +403,46 @@ def plot_steering_and_dprime(layer_df, factors, behavior, out_path):
 
     ax1.set_title(
         f"{behavior}: Steering accuracy & training d' by layer",
+        fontsize=11, fontweight="bold",
+    )
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close()
+
+
+def plot_mcc_best_alpha_vs_dprime(layer_df, behavior, out_path):
+    """Dual-axis: MCC(sign κ vs steered correct @ layer's best α) vs training d'."""
+    if "sign_kappa_mcc_best_alpha" not in layer_df.columns:
+        return
+    mcc = layer_df["sign_kappa_mcc_best_alpha"].values.astype(float)
+    if not np.any(np.isfinite(mcc)):
+        return
+    layers = layer_df["layer"].values
+    fig, ax1 = plt.subplots(figsize=(13, 5))
+    ax1.plot(layers, mcc, "o-", color="#C73E1D", linewidth=2, markersize=6,
+             label="MCC(sign κ vs actual match)", zorder=3)
+    ax1.axhline(0, color="gray", linestyle="--", linewidth=0.9, alpha=0.6)
+    ax1.set_xlabel("Layer", fontsize=11)
+    ax1.set_ylabel("Matthews correlation coefficient", fontsize=11)
+    ax1.set_ylim(-1.05, 1.05)
+    ax1.set_xticks(layers)
+    ax1.tick_params(axis="y", labelcolor="#C73E1D")
+
+    ax2 = ax1.twinx()
+    if "dprime" in layer_df.columns and layer_df["dprime"].notna().any():
+        ax2.fill_between(layers, layer_df["dprime"].values, alpha=0.12, color="steelblue")
+        ax2.plot(layers, layer_df["dprime"].values, "s:", color="steelblue",
+                 linewidth=1.5, markersize=5, label="d' (train)", zorder=2)
+        ax2.set_ylabel("d'  (training discriminability)", fontsize=11, color="steelblue")
+        ax2.tick_params(axis="y", labelcolor="steelblue")
+        ax2.set_ylim(bottom=0)
+
+    h1, l1 = ax1.get_legend_handles_labels()
+    h2, l2 = ax2.get_legend_handles_labels()
+    ax1.legend(h1 + h2, l1 + l2, fontsize=9, loc="best", framealpha=0.9)
+    ax1.set_title(
+        f"{behavior}: Projection predictor vs steer correctness @ best α per layer\n"
+        "κ = post-gen at chosen token if available; else κ_baseline + 2α",
         fontsize=11, fontweight="bold",
     )
     plt.tight_layout()
@@ -1081,6 +1122,39 @@ def main():
         layer_df["best_steered_acc"] = layer_df[acc_cols].max(axis=1)
         layer_df["best_factor"] = layer_df[acc_cols].idxmax(axis=1).str.replace("steered_acc_", "")
 
+    # MCC(sign κ vs actual steer correctness) at each layer's best α for steer-at-layer.
+    best_alpha_mccs = []
+    for _, rr in layer_df.iterrows():
+        L = int(rr["layer"])
+        bf = rr.get("best_factor")
+        if bf is None or pd.isna(bf):
+            best_alpha_mccs.append(float("nan"))
+            continue
+        try:
+            alpha_star = float(bf)
+        except (TypeError, ValueError):
+            best_alpha_mccs.append(float("nan"))
+            continue
+        ldf = per_prompt_df[per_prompt_df["layer"] == L]
+        col_c = f"steered_correct_{alpha_star:g}"
+        col_pg = f"kappa_a_postgen_{alpha_star:g}"
+        if col_c not in ldf.columns:
+            best_alpha_mccs.append(float("nan"))
+            continue
+        kappa_an = ldf["kappa_a"].values.astype(float) + 2.0 * alpha_star
+        if col_pg in ldf.columns:
+            kappa_pg = ldf[col_pg].values.astype(float)
+            kappa = np.where(np.isfinite(kappa_pg), kappa_pg, kappa_an)
+        else:
+            kappa = kappa_an
+        sign_pred = (kappa > 0).astype(int)
+        corr = ldf[col_c].astype(int).values
+        mask = np.isfinite(kappa)
+        best_alpha_mccs.append(
+            safe_mcc(sign_pred[mask], corr[mask]) if mask.sum() >= 4 else float("nan"),
+        )
+    layer_df["sign_kappa_mcc_best_alpha"] = best_alpha_mccs
+
     layer_df.to_csv(out_dir / "per_layer_summary.csv", index=False)
 
     logger.warning("\nPer-layer summary:")
@@ -1139,6 +1213,33 @@ def main():
                 f"ρ={r['spearman_rho']:+.3f} (p={r['spearman_p']:.3g})"
             )
 
+    # Pearson: per-layer d' vs MCC(sign κ vs steer success @ best α for that layer).
+    pearson_mcc_best_vs_dprime = None
+    if (
+        "sign_kappa_mcc_best_alpha" in layer_df.columns
+        and "dprime" in layer_df.columns
+    ):
+        mask_p = (
+            layer_df["sign_kappa_mcc_best_alpha"].notna()
+            & layer_df["dprime"].notna()
+        )
+        if mask_p.sum() >= 3:
+            xv = layer_df.loc[mask_p, "sign_kappa_mcc_best_alpha"].values.astype(float)
+            yv = layer_df.loc[mask_p, "dprime"].values.astype(float)
+            if np.nanstd(xv) > 1e-12 and np.nanstd(yv) > 1e-12:
+                r_dp, p_dp = scipy_stats.pearsonr(xv, yv)
+                pearson_mcc_best_vs_dprime = {
+                    "pearson_r": float(r_dp),
+                    "pearson_p": float(p_dp),
+                    "n_layers": int(mask_p.sum()),
+                }
+                sig = "*" if p_dp < 0.05 else " "
+                logger.warning(
+                    f"\n{args.behavior}: Pearson across layers — "
+                    f"d' vs MCC(sign κ vs match @ best α per layer): "
+                    f"r={r_dp:+.4f} (p={p_dp:.4g}){sig}  (n={mask_p.sum()} layers)"
+                )
+
     # ------------------------------------------------------------------
     # Plots
     # ------------------------------------------------------------------
@@ -1146,6 +1247,8 @@ def main():
     plot_projection_quality(layer_df, args.behavior, plots / "projection_quality_by_layer.png")
     plot_steering_acc(layer_df, factors, args.behavior, plots / "steering_acc_by_layer.png")
     plot_steering_and_dprime(layer_df, factors, args.behavior, plots / "steering_acc_and_dprime.png")
+    plot_mcc_best_alpha_vs_dprime(layer_df, args.behavior,
+                                  plots / "mcc_best_alpha_vs_dprime.png")
     plot_projection_vs_steering(
         layer_df,
         factors + (["best"] if "best_steered_acc" in layer_df.columns else []),
@@ -1173,6 +1276,7 @@ def main():
         "n_test_prompts": int(len(per_prompt_df["prompt_idx"].unique())),
         "per_layer": layer_df.to_dict(orient="records"),
         "cross_layer_corr": cross_df.to_dict(orient="records"),
+        "pearson_dprime_vs_sign_kappa_mcc_best_alpha": pearson_mcc_best_vs_dprime,
     }
     with open(out_dir / "summary.json", "w") as f:
         json.dump(summary, f, indent=2, default=str)
