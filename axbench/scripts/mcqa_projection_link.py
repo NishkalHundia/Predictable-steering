@@ -17,6 +17,10 @@ Pipeline (single self-contained script):
              from hidden at that token (per layer).
   Phase B  — Steered decode at '(' per (layer, factor), then unsteered forward on
              prefix + [steered token]; kappa_a_postgen_{α} per layer.
+  Validation — Additional prompts sampled from raw \\ train (see train_selection.json);
+               same Phase A/B sweep → val_prompt_results.csv and plots/val/.
+               Best α per layer is chosen on val; sign-MCC vs steer success on **test**
+               at that α is compared to d' (see plots/mcc_best_val_alpha_on_test_vs_dprime.png).
   Analysis — Per layer:
                • sign(κ_a) vs baseline_correct  → MCC  (binary predictor)
                • κ_a vs baseline_correct         → Spearman ρ (continuous)
@@ -27,17 +31,15 @@ Pipeline (single self-contained script):
                • Same for d' vs steered accuracy
 
 Outputs (under --output_dir):
-  per_prompt_results.csv   — κ_a, κ_a_postgen*, steered columns per (layer, prompt)
-  per_layer_summary.csv    — one row per layer
-  cross_layer_corr.csv     — predictor vs target correlations across layers
-  plots/
-    projection_quality_by_layer.png   — MCC + Spearman ρ across layers
-    steering_acc_by_layer.png         — steered greedy acc, one line per factor
-    projection_vs_steering.png        — scatter: projection MCC vs steered acc
-    kappa_scatter_layer_{N}.png       — κ_a vs baseline_correct per prompt
-    projection_hist_layer_{N}.png     — train + α (letter-pos κ; steered κ = κ+2α)
-    projection_hist_postgen_layer_{N}.png — same grid, κ at chosen-token forward
-    mcc_best_alpha_vs_dprime.png     — MCC(sign κ vs match @ best α) vs d' per layer
+  train_selection.json      — raw indices for train + val caps (seed / paths for audit)
+  steering_state.pt         — µ± and steering vectors (enables val sweep without redoing test)
+  per_prompt_results.csv    — test split: κ_a, κ_a_postgen*, steered columns per (layer, prompt)
+  val_prompt_results.csv    — validation split (same schema)
+  per_layer_summary.csv     — one row per layer (includes val-best-α columns when val exists)
+  cross_layer_corr.csv      — predictor vs target correlations across layers
+  plots/test/               — test-split plots (projection, steering, histograms, …)
+  plots/val/                — val steering-accuracy plots
+  plots/mcc_best_val_alpha_on_test_vs_dprime.png — d' vs sign-MCC @ val-chosen α evaluated on test
 
 Usage:
     uv run python axbench/scripts/mcqa_projection_link.py \\
@@ -52,6 +54,7 @@ Usage:
     done
 """
 import json
+import random
 import re
 import sys
 from pathlib import Path
@@ -299,6 +302,317 @@ def decode_letter(tokenizer, token_id):
     return s if (len(s) == 1 and s.isupper() and s.isalpha()) else None
 
 
+def canonical_train_val_indices(
+    n_raw: int, seed: int, max_train: int, max_val: int,
+) -> tuple[list[int], list[int]]:
+    rng = random.Random(seed)
+    train_idxs = sorted(rng.sample(range(n_raw), min(max_train, n_raw)))
+    remaining = [i for i in range(n_raw) if i not in set(train_idxs)]
+    nv = min(max_val, len(remaining))
+    val_idxs = sorted(rng.sample(remaining, nv)) if nv > 0 else []
+    return train_idxs, val_idxs
+
+
+def resolve_train_val_selection(
+    selection_path: Path,
+    train_path: Path,
+    n_raw: int,
+    seed: int,
+    max_train: int,
+    max_val: int,
+) -> tuple[list[int], list[int]]:
+    """Persist deterministic raw indices; rewrite file if metadata or indices diverge."""
+    meta = {
+        "train_path": str(train_path.resolve()),
+        "n_raw": int(n_raw),
+        "seed": int(seed),
+        "max_train_examples": int(max_train),
+        "max_val_examples": int(max_val),
+    }
+    train_idxs, val_idxs = canonical_train_val_indices(n_raw, seed, max_train, max_val)
+    if selection_path.exists():
+        try:
+            with open(selection_path) as f:
+                blob = json.load(f)
+        except Exception:
+            blob = {}
+        meta_ok = all(blob.get(k) == v for k, v in meta.items())
+        same_train = blob.get("train_indices") == train_idxs
+        same_val = blob.get("val_indices") == val_idxs
+        if meta_ok and same_train and same_val:
+            return train_idxs, val_idxs
+        if not meta_ok:
+            logger.warning(
+                f"{selection_path}: metadata mismatch vs current run; rewriting canonical indices.",
+            )
+        elif not same_train:
+            logger.warning(
+                f"{selection_path}: train_indices differ from canonical RNG(seed); rewriting.",
+            )
+        elif not same_val:
+            logger.warning(
+                f"{selection_path}: val_indices differ from canonical; rewriting.",
+            )
+    out = dict(meta)
+    out["train_indices"] = train_idxs
+    out["val_indices"] = val_idxs
+    selection_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(selection_path, "w") as f:
+        json.dump(out, f, indent=2)
+    logger.warning(
+        f"Wrote {selection_path}: raw train n={len(train_idxs)}  val n={len(val_idxs)} "
+        f"(seed={seed})",
+    )
+    return train_idxs, val_idxs
+
+
+def prompt_csv_covers(df: pd.DataFrame, layers: list, factors: list[float]) -> bool:
+    """Baseline κ forward + post-gen κ per factor + steered correctness."""
+    try:
+        have_layers = set(int(l) for l in df["layer"].unique())
+        if not set(int(l) for l in layers) <= have_layers:
+            return False
+        need_factors = {float(f) for f in factors}
+        have_factors = {
+            float(c.replace("steered_correct_", ""))
+            for c in df.columns if c.startswith("steered_correct_")
+        }
+        if not need_factors <= have_factors:
+            return False
+        if "kappa_a_postgen" not in df.columns:
+            return False
+        return all(f"kappa_a_postgen_{f:g}" in df.columns for f in factors)
+    except Exception:
+        return False
+
+
+def save_steering_state(path: Path, steering_vecs, mu_poss, mu_negs, layers: list):
+    blob = {
+        "layers": [int(l) for l in layers],
+        "steering_vecs": {str(l): steering_vecs[l].detach().float().cpu() for l in layers},
+        "mu_poss": {str(l): mu_poss[l].detach().float().cpu() for l in layers},
+        "mu_negs": {str(l): mu_negs[l].detach().float().cpu() for l in layers},
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(blob, path)
+    logger.warning(f"Saved steering tensors to {path}")
+
+
+def load_steering_state(path: Path, device):
+    blob = torch.load(path, map_location=device)
+    layers = [int(l) for l in blob["layers"]]
+    steering_vecs = {int(l): blob["steering_vecs"][str(l)].to(device) for l in layers}
+    mu_poss = {int(l): blob["mu_poss"][str(l)].to(device) for l in layers}
+    mu_negs = {int(l): blob["mu_negs"][str(l)].to(device) for l in layers}
+    return layers, steering_vecs, mu_poss, mu_negs
+
+
+def sign_kappa_mcc_at_steered_alpha(ldf: pd.DataFrame, alpha_star: float) -> float:
+    """MCC(sign(κ), steered_correct_{α}) for one layer's rows."""
+    col_c = f"steered_correct_{alpha_star:g}"
+    col_pg = f"kappa_a_postgen_{alpha_star:g}"
+    if col_c not in ldf.columns:
+        return float("nan")
+    kappa_an = ldf["kappa_a"].values.astype(float) + 2.0 * alpha_star
+    if col_pg in ldf.columns:
+        kappa_pg = ldf[col_pg].values.astype(float)
+        kappa = np.where(np.isfinite(kappa_pg), kappa_pg, kappa_an)
+    else:
+        kappa = kappa_an
+    sign_pred = (kappa > 0).astype(int)
+    corr = ldf[col_c].astype(int).values
+    mask = np.isfinite(kappa)
+    if mask.sum() < 4:
+        return float("nan")
+    return safe_mcc(sign_pred[mask], corr[mask])
+
+
+@torch.no_grad()
+def run_phase_ab_mcqa(
+    model,
+    tokenizer,
+    layers,
+    factors,
+    device,
+    pad_id,
+    batch_size,
+    prefix_length,
+    mu_poss,
+    mu_negs,
+    steering_vecs,
+    source_items: list,
+    phase_label: str,
+) -> pd.DataFrame:
+    """Phase A + A2 + B for test or val MCQA items (same schema as per_prompt_results.csv)."""
+    B = batch_size
+    flat_items = []
+    for j, item in enumerate(source_items):
+        try:
+            ml = extract_letter(item["answer_matching_behavior"])
+            nl = extract_letter(item["answer_not_matching_behavior"])
+        except Exception:
+            continue
+        if ml == nl:
+            continue
+        try:
+            _, full_ids, letter_pos, open_paren_pos = build_full_ids(tokenizer, item["question"], ml)
+        except Exception:
+            continue
+        flat_items.append({
+            "prompt_idx": j,
+            "matching_letter": ml,
+            "notmatch_letter": nl,
+            "full_ids": full_ids,
+            "letter_pos": letter_pos,
+            "open_paren_pos": open_paren_pos,
+        })
+    n_items = len(flat_items)
+    logger.warning(f"\n=== [{phase_label}] Phase A: Baseline ({n_items} prompts) ===")
+
+    baseline_tok = {}
+    act_at_letter = {}
+
+    for start in tqdm(range(0, n_items, B), desc=f"[{phase_label}] Phase A"):
+        batch = flat_items[start:start + B]
+        ids, mask, _ = pad_batch([b["full_ids"] for b in batch], pad_id, device)
+        toks, hiddens = forward_capture(
+            model, ids, mask, layers,
+            [b["open_paren_pos"] for b in batch],
+        )
+        for i, b in enumerate(batch):
+            j = b["prompt_idx"]
+            baseline_tok[j] = toks[i]
+            for l in layers:
+                act_at_letter[(j, l)] = hiddens[l][i, b["letter_pos"], :]
+        del hiddens, ids, mask
+
+    baseline_records = {}
+    for b in flat_items:
+        j = b["prompt_idx"]
+        g = decode_letter(tokenizer, baseline_tok[j])
+        src = source_items[j]
+        baseline_records[j] = {
+            "question": src["question"],
+            "answer_matching_behavior": src["answer_matching_behavior"],
+            "matching_letter": b["matching_letter"],
+            "notmatch_letter": b["notmatch_letter"],
+            "baseline_token": g if g else tokenizer.decode([baseline_tok[j]]).strip(),
+            "baseline_on_format": g is not None,
+            "baseline_correct": g == b["matching_letter"],
+        }
+
+    kappa_map = {}
+    for l in layers:
+        mu_pos, mu_neg = mu_poss[l], mu_negs[l]
+        v = mu_pos - mu_neg
+        v_norm_sq = float(v.dot(v))
+        mu = 0.5 * (mu_pos + mu_neg)
+        for b in flat_items:
+            j = b["prompt_idx"]
+            act = act_at_letter[(j, l)]
+            kappa_map[(l, j)] = float(2.0 * (act - mu).dot(v) / v_norm_sq) \
+                if v_norm_sq > 1e-12 else float("nan")
+    del act_at_letter
+
+    logger.warning(f"\n=== [{phase_label}] Phase A2: Post-gen κ baseline ({n_items} prompts) ===")
+    kappa_postgen_base = {}
+    for start in tqdm(range(0, n_items, B), desc=f"[{phase_label}] Phase A2 post-gen κ"):
+        batch = flat_items[start:start + B]
+        seqs, pos_idx, js = [], [], []
+        for b in batch:
+            j = b["prompt_idx"]
+            op = b["open_paren_pos"]
+            seq = seq_through_paren_plus_token(b["full_ids"], op, baseline_tok[j])
+            seqs.append(seq)
+            pos_idx.append(len(seq) - 1)
+            js.append(j)
+        ids2, mask2, _ = pad_batch(seqs, pad_id, device)
+        h_at = forward_capture_hiddens_at_positions(
+            model, ids2, mask2, layers, pos_idx,
+        )
+        del ids2, mask2
+        for lm in layers:
+            kbatch = batch_kappa_cpu(h_at[lm], mu_poss[lm], mu_negs[lm])
+            for ii, pj in enumerate(js):
+                kappa_postgen_base[(lm, pj)] = float(kbatch[ii])
+
+    logger.warning(
+        f"\n=== [{phase_label}] Phase B: Steered ({len(layers)} layers × {len(factors)} factors) ===",
+    )
+
+    steered_tok = {}
+    kappa_postgen_steered = {}
+
+    for l in tqdm(layers, desc=f"[{phase_label}] Phase B layers"):
+        sv = steering_vecs[l]
+        for factor in factors:
+            for start in range(0, n_items, B):
+                batch = flat_items[start:start + B]
+                ids, mask, _ = pad_batch([b["full_ids"] for b in batch], pad_id, device)
+                toks = forward_steered(
+                    model, ids, mask,
+                    [b["open_paren_pos"] for b in batch],
+                    l, sv, factor, prefix_length,
+                )
+                seqs, pos_idx, js = [], [], []
+                for i, b in enumerate(batch):
+                    j = b["prompt_idx"]
+                    tid = toks[i]
+                    steered_tok[(factor, l, j)] = tid
+                    seq = seq_through_paren_plus_token(
+                        b["full_ids"], b["open_paren_pos"], tid,
+                    )
+                    seqs.append(seq)
+                    pos_idx.append(len(seq) - 1)
+                    js.append(j)
+                del ids, mask
+                ids2, mask2, _ = pad_batch(seqs, pad_id, device)
+                h_at = forward_capture_hiddens_at_positions(
+                    model, ids2, mask2, layers, pos_idx,
+                )
+                del ids2, mask2
+                kbatch = batch_kappa_cpu(h_at[l], mu_poss[l], mu_negs[l])
+                for ii, pj in enumerate(js):
+                    kappa_postgen_steered[(l, factor, pj)] = float(kbatch[ii])
+
+    rows = []
+    for l in layers:
+        for b in flat_items:
+            j = b["prompt_idx"]
+            rec = baseline_records[j]
+            row = {
+                "layer": l,
+                "prompt_idx": j,
+                "question": rec["question"],
+                "answer_matching_behavior": rec["answer_matching_behavior"],
+                "matching_letter": rec["matching_letter"],
+                "notmatch_letter": rec["notmatch_letter"],
+                "kappa_a": kappa_map.get((l, j), float("nan")),
+                "kappa_a_postgen": kappa_postgen_base.get((l, j), float("nan")),
+                "baseline_token": rec["baseline_token"],
+                "baseline_on_format": rec["baseline_on_format"],
+                "baseline_correct": rec["baseline_correct"],
+            }
+            for factor in factors:
+                tid = steered_tok.get((factor, l, j))
+                if tid is None:
+                    row[f"steered_token_{factor:g}"] = ""
+                    row[f"steered_on_format_{factor:g}"] = False
+                    row[f"steered_correct_{factor:g}"] = False
+                    row[f"kappa_a_postgen_{factor:g}"] = float("nan")
+                else:
+                    g = decode_letter(tokenizer, tid)
+                    row[f"steered_token_{factor:g}"] = g or tokenizer.decode([tid]).strip()
+                    row[f"steered_on_format_{factor:g}"] = g is not None
+                    row[f"steered_correct_{factor:g}"] = g == b["matching_letter"]
+                    row[f"kappa_a_postgen_{factor:g}"] = kappa_postgen_steered.get(
+                        (l, factor, j), float("nan"),
+                    )
+            rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
 # ---------------------------------------------------------------------------
 # Plots
 # ---------------------------------------------------------------------------
@@ -410,17 +724,24 @@ def plot_steering_and_dprime(layer_df, factors, behavior, out_path):
     plt.close()
 
 
-def plot_mcc_best_alpha_vs_dprime(layer_df, behavior, out_path):
-    """Dual-axis: MCC(sign κ vs steered correct @ layer's best α) vs training d'."""
-    if "sign_kappa_mcc_best_alpha" not in layer_df.columns:
+def plot_mcc_vs_dprime_for_column(
+    layer_df,
+    behavior,
+    out_path,
+    mcc_col: str,
+    title_line1: str,
+    mcc_label: str = "MCC(sign κ vs actual match)",
+):
+    """Dual-axis: arbitrary per-layer MCC column vs training d'."""
+    if mcc_col not in layer_df.columns:
         return
-    mcc = layer_df["sign_kappa_mcc_best_alpha"].values.astype(float)
+    mcc = layer_df[mcc_col].values.astype(float)
     if not np.any(np.isfinite(mcc)):
         return
     layers = layer_df["layer"].values
     fig, ax1 = plt.subplots(figsize=(13, 5))
     ax1.plot(layers, mcc, "o-", color="#C73E1D", linewidth=2, markersize=6,
-             label="MCC(sign κ vs actual match)", zorder=3)
+             label=mcc_label, zorder=3)
     ax1.axhline(0, color="gray", linestyle="--", linewidth=0.9, alpha=0.6)
     ax1.set_xlabel("Layer", fontsize=11)
     ax1.set_ylabel("Matthews correlation coefficient", fontsize=11)
@@ -441,8 +762,86 @@ def plot_mcc_best_alpha_vs_dprime(layer_df, behavior, out_path):
     h2, l2 = ax2.get_legend_handles_labels()
     ax1.legend(h1 + h2, l1 + l2, fontsize=9, loc="best", framealpha=0.9)
     ax1.set_title(
-        f"{behavior}: Projection predictor vs steer correctness @ best α per layer\n"
-        "κ = post-gen at chosen token if available; else κ_baseline + 2α",
+        title_line1 + "\nκ = post-gen at chosen token if available; else κ_baseline + 2α",
+        fontsize=11, fontweight="bold",
+    )
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close()
+
+
+def plot_mcc_best_alpha_vs_dprime(layer_df, behavior, out_path):
+    """Best α chosen by **test** steered accuracy (circular if test is final eval)."""
+    plot_mcc_vs_dprime_for_column(
+        layer_df,
+        behavior,
+        out_path,
+        mcc_col="sign_kappa_mcc_best_alpha",
+        title_line1=f"{behavior}: MCC @ best α per layer (chosen on **test** accuracy)",
+        mcc_label="MCC(sign κ vs steer match @ test-best α)",
+    )
+
+
+def plot_mcc_val_best_alpha_on_test_vs_dprime(layer_df, behavior, out_path):
+    """Best α from validation; MCC evaluated on held-out **test** prompts."""
+    plot_mcc_vs_dprime_for_column(
+        layer_df,
+        behavior,
+        out_path,
+        mcc_col="sign_kappa_mcc_val_best_on_test",
+        title_line1=f"{behavior}: MCC on **test** @ best α per layer (α chosen on **val**)",
+        mcc_label="MCC(sign κ vs steer match | val-chosen α, test prompts)",
+    )
+
+
+def plot_best_alpha_val_vs_test(layer_df, behavior, out_path):
+    """Chosen steering factor α* from val vs from test (per layer)."""
+    if "best_factor_val" not in layer_df.columns or "best_factor" not in layer_df.columns:
+        return
+    layers = layer_df["layer"].values
+    bt = pd.to_numeric(layer_df["best_factor"], errors="coerce").values
+    bv = pd.to_numeric(layer_df["best_factor_val"], errors="coerce").values
+    if np.all(np.isnan(bt)) and np.all(np.isnan(bv)):
+        return
+    fig, ax = plt.subplots(figsize=(13, 5))
+    ax.plot(layers, bt, "o-", color="#1f77b4", linewidth=2, markersize=6, label="α* (max test acc)")
+    ax.plot(layers, bv, "s--", color="#ff7f0e", linewidth=2, markersize=6, label="α* (max val acc)")
+    ax.set_xlabel("Layer", fontsize=11)
+    ax.set_ylabel("Steering factor α", fontsize=11)
+    ax.set_xticks(layers)
+    ax.legend(fontsize=9, loc="best")
+    ax.set_title(
+        f"{behavior}: Best steering factor per layer — validation vs test split",
+        fontsize=11, fontweight="bold",
+    )
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close()
+
+
+def plot_steering_acc_val_vs_test_extended(layer_df, behavior, out_path):
+    """
+    Mean accuracy on **test** at test-best α, mean on **val** at val-best α,
+    and mean on **test** when using val-best α (generalization of α choice).
+    """
+    cols_need = ("best_steered_acc", "best_steered_acc_val", "test_steered_acc_at_val_best_alpha")
+    if any(c not in layer_df.columns for c in cols_need):
+        return
+    layers = layer_df["layer"].values
+    fig, ax = plt.subplots(figsize=(13, 5))
+    ax.plot(layers, layer_df["best_steered_acc"].values, "o-",
+            color="#1f77b4", linewidth=2, markersize=5, label="Test acc @ test-best α*")
+    ax.plot(layers, layer_df["best_steered_acc_val"].values, "s--",
+            color="#ff7f0e", linewidth=2, markersize=5, label="Val acc @ val-best α*")
+    ax.plot(layers, layer_df["test_steered_acc_at_val_best_alpha"].values, "^:",
+            color="#2ca02c", linewidth=2, markersize=5, label="Test acc @ val-best α*")
+    ax.set_xlabel("Layer", fontsize=11)
+    ax.set_ylabel("Greedy steering accuracy", fontsize=11)
+    ax.set_ylim(0, 1.05)
+    ax.set_xticks(layers)
+    ax.legend(fontsize=9, loc="best")
+    ax.set_title(
+        f"{behavior}: Steering accuracy — val vs test choice of α*",
         fontsize=11, fontweight="bold",
     )
     plt.tight_layout()
@@ -668,34 +1067,38 @@ def plot_projection_histograms(prompt_df, factors, behavior, layer,
 # Main
 # ---------------------------------------------------------------------------
 def main():
-    import argparse, random
+    import argparse
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--behavior", required=True, choices=BEHAVIORS)
     parser.add_argument("--model_name", default="google/gemma-2-9b-it")
     parser.add_argument("--train_path", default=None)
-    parser.add_argument("--test_path",  default=None)
+    parser.add_argument("--test_path", default=None)
     parser.add_argument("--output_dir", default=None)
     parser.add_argument("--layers", default="10-32",
                         help="'10-32' or '10,15,20,32'")
     parser.add_argument("--max_examples", type=int, default=300,
-                        help="Max training pairs for DiffMean (random sample). Default 300.")
+                        help="Max training pairs for DiffMean from raw. Default 300.")
+    parser.add_argument("--max_val_examples", type=int, default=50,
+                        help="Validation prompts sampled from raw minus train. Default 50.")
     parser.add_argument("--factors", "--steering-factors", "--steering_factors",
                         dest="factors", default="1,2,3,5,10",
                         help="Comma-separated fixed steering factors. Default 1,2,3,5,10.")
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--max_test", type=int, default=None)
     parser.add_argument("--use_bf16", action="store_true", default=True)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=42,
+                        help="RNG seed (stored in train_selection.json). Change ⇒ recompute splits.")
     parser.add_argument("--force_recompute", action="store_true",
-                        help="Ignore saved per_prompt_results.csv and rerun forward passes.")
+                        help="Ignore saved test per_prompt_results.csv and rerun Phase A/B on test.")
+    parser.add_argument("--force_recompute_val", action="store_true",
+                        help="Ignore saved val_prompt_results.csv and rerun val Phase A/B.")
     args = parser.parse_args()
 
-    random.seed(args.seed)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    layers = parse_layer_range(args.layers)
+    layers_req = parse_layer_range(args.layers)
     factors = sorted({float(x.strip()) for x in args.factors.split(",") if x.strip()})
     if not factors:
         logger.error("No steering factors given.")
@@ -706,73 +1109,78 @@ def main():
         Path(args.output_dir) if args.output_dir
         else Path("results") / "mcqa_projection_link" / model_short / args.behavior
     )
-    (out_dir / "plots").mkdir(parents=True, exist_ok=True)
+    plots_root = out_dir / "plots"
+    plots_test = plots_root / "test"
+    plots_val = plots_root / "val"
+    for p in (plots_root, plots_test, plots_val):
+        p.mkdir(parents=True, exist_ok=True)
 
     train_path = Path(args.train_path or TRAIN_PATH_MAP[args.behavior])
-    test_path  = Path(args.test_path  or TEST_PATH_MAP[args.behavior])
+    test_path = Path(args.test_path or TEST_PATH_MAP[args.behavior])
+    selection_path = out_dir / "train_selection.json"
+    per_prompt_csv = out_dir / "per_prompt_results.csv"
+    val_prompt_csv = out_dir / "val_prompt_results.csv"
+    dprime_json = out_dir / "dprime.json"
+    train_proj_json = out_dir / "train_projections.json"
+    steering_pt = out_dir / "steering_state.pt"
 
     with open(train_path) as f:
-        train_data = json.load(f)
-    if args.max_examples and args.max_examples < len(train_data):
-        idxs = random.sample(range(len(train_data)), args.max_examples)
-        train_data = [train_data[i] for i in sorted(idxs)]
-    logger.warning(f"Training pairs: {len(train_data)}")
+        full_raw = json.load(f)
+    n_raw = len(full_raw)
+    train_idxs, val_idxs = resolve_train_val_selection(
+        selection_path,
+        train_path,
+        n_raw,
+        args.seed,
+        args.max_examples,
+        args.max_val_examples,
+    )
+    train_data = [full_raw[i] for i in train_idxs]
+    val_data = [full_raw[i] for i in val_idxs] if args.max_val_examples > 0 else []
+    logger.warning(f"Training pairs (raw subset): {len(train_data)}")
+    logger.warning(f"Validation prompts (raw subset): {len(val_data)}")
 
     with open(test_path) as f:
         test_data = json.load(f)
     if args.max_test:
-        test_data = test_data[:args.max_test]
-    logger.warning(f"Test prompts: {len(test_data)}")
+        test_data = test_data[: args.max_test]
+    logger.warning(f"Test prompts (test split file): {len(test_data)}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # ------------------------------------------------------------------
-    # Check if we can skip forward passes (reuse saved CSV).
-    # d' is stored separately in dprime.json so it survives CSV reuse.
-    # ------------------------------------------------------------------
-    per_prompt_csv    = out_dir / "per_prompt_results.csv"
-    dprime_json       = out_dir / "dprime.json"
-    train_proj_json   = out_dir / "train_projections.json"
-    per_prompt_df     = None
-    dprimes           = {}   # populated either from file or Phase 0
-    train_projections = {}   # {layer: {"pos": [...], "neg": [...]}} — from file or Phase 0
-
+    per_prompt_df = None
     if (not args.force_recompute) and per_prompt_csv.exists():
         try:
             df = pd.read_csv(per_prompt_csv)
-            have_layers  = set(int(l) for l in df["layer"].unique())
-            have_factors = set(
-                float(c.replace("steered_correct_", ""))
-                for c in df.columns if c.startswith("steered_correct_")
-            )
-            have_postgen = (
-                ("kappa_a_postgen" in df.columns)
-                and all(f"kappa_a_postgen_{f:g}" in df.columns for f in factors)
-            )
-            need_layers  = set(layers)
-            need_factors = set(factors)
-            if (
-                need_layers <= have_layers
-                and need_factors <= have_factors
-                and have_postgen
-            ):
+            if prompt_csv_covers(df, layers_req, factors):
                 per_prompt_df = df
                 logger.warning(
-                    f"Reusing {per_prompt_csv} — covers all requested layers/factors. "
-                    f"Pass --force_recompute to redo."
+                    f"Reusing {per_prompt_csv} — covers layers/factors. "
+                    "Pass --force_recompute to redo.",
                 )
             else:
-                missing_l = need_layers - have_layers
-                missing_f = need_factors - have_factors
-                miss_p = [] if have_postgen else ["kappa_a_postgen_*"]
-                logger.warning(
-                    f"CSV exists but missing layers={missing_l or 'none'} "
-                    f"factors={missing_f or 'none'} postgen_cols={miss_p or 'ok'}; recomputing."
-                )
+                logger.warning(f"{per_prompt_csv} missing layers/factors/postgen; recomputing test.")
         except Exception as e:
-            logger.warning(f"Could not reuse CSV: {e}")
+            logger.warning(f"Could not reuse test CSV: {e}")
 
-    # Load d' and train projections from files if available.
+    val_prompt_df = None
+    if val_data and (not args.force_recompute_val) and val_prompt_csv.exists():
+        try:
+            dfv = pd.read_csv(val_prompt_csv)
+            if prompt_csv_covers(dfv, layers_req, factors):
+                val_prompt_df = dfv
+                logger.warning(
+                    f"Reusing {val_prompt_csv} — covers layers/factors. "
+                    "Pass --force_recompute_val to redo.",
+                )
+            else:
+                logger.warning(f"{val_prompt_csv} incomplete; recomputing val.")
+        except Exception as e:
+            logger.warning(f"Could not reuse val CSV: {e}")
+
+    dprimes = {}
+    train_projections = {}
+
     if dprime_json.exists():
         try:
             with open(dprime_json) as f:
@@ -785,19 +1193,35 @@ def main():
         try:
             with open(train_proj_json) as f:
                 raw = json.load(f)
-            train_projections = {int(k): {"pos": v["pos"], "neg": v["neg"]} for k, v in raw.items()}
-            logger.warning(f"Loaded train projections for {len(train_projections)} layers from {train_proj_json}")
+            train_projections = {
+                int(k): {"pos": v["pos"], "neg": v["neg"]}
+                for k, v in raw.items()
+            }
+            logger.warning(
+                f"Loaded train projections for {len(train_projections)} layers from {train_proj_json}",
+            )
         except Exception as e:
             logger.warning(f"Could not load {train_proj_json}: {e}")
 
-    # If CSV is reusable but Phase 0 data is missing, run Phase 0 only (no Phase A/B).
-    need_dprime = (not dprimes or not train_projections) and per_prompt_df is not None
-    need_full   = per_prompt_df is None
+    need_test_forward = args.force_recompute or per_prompt_df is None
+    need_val_forward = bool(val_data) and (
+        args.force_recompute_val or val_prompt_df is None
+    )
 
-    if need_dprime or need_full:
-        # ------------------------------------------------------------------
-        # Load tokenizer + model.
-        # ------------------------------------------------------------------
+    need_phase0_stats = (not dprimes) or (not train_projections)
+    steering_ok = steering_pt.exists()
+    need_phase0_compute = need_phase0_stats or (
+        (need_test_forward or need_val_forward) and not steering_ok
+    )
+
+    need_load_model = need_phase0_compute or need_test_forward or need_val_forward
+
+    steering_vecs = {}
+    mu_poss = {}
+    mu_negs = {}
+    layers = list(layers_req)
+
+    if need_load_model:
         tokenizer = AutoTokenizer.from_pretrained(args.model_name, model_max_length=512)
         tokenizer.padding_side = "right"
         if tokenizer.pad_token is None:
@@ -816,277 +1240,142 @@ def main():
         pad_id = tokenizer.pad_token_id
         B = args.batch_size
 
-        # ------------------------------------------------------------------
-        # Phase 0: DiffMean vectors from training data.
-        # Activation captured at the answer-letter token position.
-        # ------------------------------------------------------------------
-        logger.warning(f"\n=== Phase 0: DiffMean ({len(train_data)} pairs, {len(layers)} layers) ===")
+        if need_phase0_compute:
+            logger.warning(f"\n=== Phase 0: DiffMean ({len(train_data)} pairs, {len(layers)} layers) ===")
 
-        train_flat = []
-        for item in train_data:
-            q = item["question"]
-            for answer, label in [
-                (item["answer_matching_behavior"], 1),
-                (item["answer_not_matching_behavior"], 0),
-            ]:
-                try:
-                    letter = extract_letter(answer)
-                    _, full_ids, letter_pos, open_paren_pos = build_full_ids(tokenizer, q, letter)
-                    train_flat.append({"full_ids": full_ids, "letter_pos": letter_pos, "label": label})
-                except Exception:
-                    pass
+            train_flat = []
+            for item in train_data:
+                q = item["question"]
+                for answer, label in [
+                    (item["answer_matching_behavior"], 1),
+                    (item["answer_not_matching_behavior"], 0),
+                ]:
+                    try:
+                        letter = extract_letter(answer)
+                        _, full_ids, letter_pos, open_paren_pos = build_full_ids(tokenizer, q, letter)
+                        train_flat.append({"full_ids": full_ids, "letter_pos": letter_pos, "label": label})
+                    except Exception:
+                        pass
 
-        pos_acts = {l: [] for l in layers}
-        neg_acts = {l: [] for l in layers}
+            pos_acts = {l: [] for l in layers}
+            neg_acts = {l: [] for l in layers}
 
-        for start in tqdm(range(0, len(train_flat), B), desc="Phase 0"):
-            batch = train_flat[start:start + B]
-            ids, mask, _ = pad_batch([b["full_ids"] for b in batch], pad_id, device)
-            dummy_pos = [0] * len(batch)
-            _, hiddens = forward_capture(model, ids, mask, layers, dummy_pos)
-            for i, b in enumerate(batch):
-                for l in layers:
-                    act = hiddens[l][i, b["letter_pos"], :]
-                    (pos_acts[l] if b["label"] == 1 else neg_acts[l]).append(act)
-            del hiddens, ids, mask
-
-        steering_vecs, mu_poss, mu_negs, dprimes = {}, {}, {}, {}
-        train_projections = {}
-        for l in layers:
-            if not pos_acts[l] or not neg_acts[l]:
-                continue
-            mu_pos = torch.stack(pos_acts[l]).mean(0)
-            mu_neg = torch.stack(neg_acts[l]).mean(0)
-            v = mu_pos - mu_neg
-            v_norm_sq = float(v.dot(v))
-            mu_poss[l] = mu_pos
-            mu_negs[l] = mu_neg
-            steering_vecs[l] = v.to(device)
-            mu_mid = 0.5 * (mu_pos + mu_neg)
-            if v_norm_sq > 1e-12:
-                pp = np.array([float(2.0*(a-mu_mid).dot(v)/v_norm_sq) for a in pos_acts[l]])
-                np_ = np.array([float(2.0*(a-mu_mid).dot(v)/v_norm_sq) for a in neg_acts[l]])
-                dprimes[l] = compute_dprime(pp, np_)
-            else:
-                pp  = np.zeros(len(pos_acts[l]))
-                np_ = np.zeros(len(neg_acts[l]))
-                dprimes[l] = 0.0
-            train_projections[l] = {"pos": pp.tolist(), "neg": np_.tolist()}
-            logger.warning(f"  L{l:2d}: d'={dprimes[l]:.3f}  ||v||={float(v.norm()):.3f}")
-
-        layers = [l for l in layers if l in steering_vecs]
-        del pos_acts, neg_acts
-
-        # Save d' and train projections so they survive future CSV-reuse runs.
-        with open(dprime_json, "w") as f:
-            json.dump({str(l): float(v) for l, v in dprimes.items()}, f, indent=2)
-        logger.warning(f"Saved d' to {dprime_json}")
-
-        with open(train_proj_json, "w") as f:
-            json.dump({str(l): v for l, v in train_projections.items()}, f)
-        logger.warning(f"Saved train projections to {train_proj_json}")
-
-        if not need_full:
-            logger.warning("Phase 0 complete (d' only). Skipping Phase A/B — CSV reused.")
-        else:
-            # ----------------------------------------------------------------
-            # Tokenize test prompts.
-            # ----------------------------------------------------------------
-            flat_items = []
-            for j, item in enumerate(test_data):
-                try:
-                    ml = extract_letter(item["answer_matching_behavior"])
-                    nl = extract_letter(item["answer_not_matching_behavior"])
-                except Exception:
-                    continue
-                if ml == nl:
-                    continue
-                try:
-                    _, full_ids, letter_pos, open_paren_pos = build_full_ids(tokenizer, item["question"], ml)
-                except Exception:
-                    continue
-                flat_items.append({
-                    "prompt_idx": j,
-                    "matching_letter": ml,
-                    "notmatch_letter": nl,
-                    "full_ids": full_ids,
-                    "letter_pos": letter_pos,
-                    "open_paren_pos": open_paren_pos,
-                })
-            n_items = len(flat_items)
-            logger.warning(f"Valid test items: {n_items}")
-
-            # ----------------------------------------------------------------
-            # Phase A: Baseline greedy decode + activation capture.
-            # ----------------------------------------------------------------
-            logger.warning(f"\n=== Phase A: Baseline ({n_items} prompts) ===")
-
-            baseline_tok = {}    # j -> int (token id)
-            act_at_letter = {}   # (j, l) -> tensor [H]
-
-            for start in tqdm(range(0, n_items, B), desc="Phase A"):
-                batch = flat_items[start:start + B]
+            for start in tqdm(range(0, len(train_flat), B), desc="Phase 0"):
+                batch = train_flat[start:start + B]
                 ids, mask, _ = pad_batch([b["full_ids"] for b in batch], pad_id, device)
-                toks, hiddens = forward_capture(
-                    model, ids, mask, layers,
-                    [b["open_paren_pos"] for b in batch],
-                )
+                dummy_pos = [0] * len(batch)
+                _, hiddens = forward_capture(model, ids, mask, layers, dummy_pos)
                 for i, b in enumerate(batch):
-                    j = b["prompt_idx"]
-                    baseline_tok[j] = toks[i]
-                    for l in layers:
-                        act_at_letter[(j, l)] = hiddens[l][i, b["letter_pos"], :]
+                    for ly in layers:
+                        act = hiddens[ly][i, b["letter_pos"], :]
+                        (pos_acts[ly] if b["label"] == 1 else neg_acts[ly]).append(act)
                 del hiddens, ids, mask
 
-            # Build baseline records.
-            baseline_records = {}
-            for b in flat_items:
-                j = b["prompt_idx"]
-                g = decode_letter(tokenizer, baseline_tok[j])
-                baseline_records[j] = {
-                    "question": test_data[j]["question"],
-                    "answer_matching_behavior": test_data[j]["answer_matching_behavior"],
-                    "matching_letter": b["matching_letter"],
-                    "notmatch_letter": b["notmatch_letter"],
-                    "baseline_token": g if g else tokenizer.decode([baseline_tok[j]]).strip(),
-                    "baseline_on_format": g is not None,
-                    "baseline_correct": g == b["matching_letter"],
-                }
-
-            # Compute κ_a per (layer, prompt).
-            kappa_map = {}
-            for l in layers:
-                mu_pos, mu_neg = mu_poss[l], mu_negs[l]
+            steering_vecs, mu_poss, mu_negs, dprimes = {}, {}, {}, {}
+            train_projections = {}
+            for ly in layers:
+                if not pos_acts[ly] or not neg_acts[ly]:
+                    continue
+                mu_pos = torch.stack(pos_acts[ly]).mean(0)
+                mu_neg = torch.stack(neg_acts[ly]).mean(0)
                 v = mu_pos - mu_neg
                 v_norm_sq = float(v.dot(v))
-                mu = 0.5 * (mu_pos + mu_neg)
-                for b in flat_items:
-                    j = b["prompt_idx"]
-                    act = act_at_letter[(j, l)]
-                    kappa_map[(l, j)] = float(2.0 * (act - mu).dot(v) / v_norm_sq) \
-                        if v_norm_sq > 1e-12 else float("nan")
-            del act_at_letter
+                mu_poss[ly] = mu_pos
+                mu_negs[ly] = mu_neg
+                steering_vecs[ly] = v.to(device)
+                mu_mid = 0.5 * (mu_pos + mu_neg)
+                if v_norm_sq > 1e-12:
+                    pp = np.array([float(2.0 * (a - mu_mid).dot(v) / v_norm_sq) for a in pos_acts[ly]])
+                    np_ = np.array([float(2.0 * (a - mu_mid).dot(v) / v_norm_sq) for a in neg_acts[ly]])
+                    dprimes[ly] = compute_dprime(pp, np_)
+                else:
+                    pp = np.zeros(len(pos_acts[ly]))
+                    np_ = np.zeros(len(neg_acts[ly]))
+                    dprimes[ly] = 0.0
+                train_projections[ly] = {"pos": pp.tolist(), "neg": np_.tolist()}
+                logger.warning(f"  L{ly:2d}: d'={dprimes[ly]:.3f}  ||v||={float(v.norm()):.3f}")
 
-            # ----------------------------------------------------------------
-            # Phase A2: κ at model's chosen token (2nd unsteered forward).
-            # Sequence = full_ids[:open_paren+1] + [baseline_tok]; read last pos.
-            # ----------------------------------------------------------------
-            logger.warning(f"\n=== Phase A2: Post-gen κ baseline ({n_items} prompts) ===")
-            kappa_postgen_base = {}
-            for start in tqdm(range(0, n_items, B), desc="Phase A2 post-gen κ"):
-                batch = flat_items[start:start + B]
-                seqs, pos_idx, js = [], [], []
-                for b in batch:
-                    j = b["prompt_idx"]
-                    op = b["open_paren_pos"]
-                    seq = seq_through_paren_plus_token(b["full_ids"], op, baseline_tok[j])
-                    seqs.append(seq)
-                    pos_idx.append(len(seq) - 1)
-                    js.append(j)
-                ids2, mask2, _ = pad_batch(seqs, pad_id, device)
-                h_at = forward_capture_hiddens_at_positions(
-                    model, ids2, mask2, layers, pos_idx,
-                )
-                del ids2, mask2
-                for lm in layers:
-                    kbatch = batch_kappa_cpu(h_at[lm], mu_poss[lm], mu_negs[lm])
-                    for ii, pj in enumerate(js):
-                        kappa_postgen_base[(lm, pj)] = float(kbatch[ii])
+            layers = [ly for ly in layers if ly in steering_vecs]
+            del pos_acts, neg_acts
 
-            # ----------------------------------------------------------------
-            # Phase B: Fixed-factor steered greedy decode per (layer, factor).
-            # ----------------------------------------------------------------
-            logger.warning(f"\n=== Phase B: Steered ({len(layers)} layers × {len(factors)} factors) ===")
+            with open(dprime_json, "w") as f:
+                json.dump({str(ly): float(v) for ly, v in dprimes.items()}, f, indent=2)
+            logger.warning(f"Saved d' to {dprime_json}")
 
-            steered_tok = {}  # (factor, l, j) -> int
-            # κ_postgen for row "layer=L" must come from embedding after steering **at**
-            # layer L — token tid = steered_tok[(α,L,j)] — then 2nd forward, projection
-            # using µ± and hidden at chosen token **at layer L** (same indexing as κ_a row).
-            kappa_postgen_steered = {}  # (l, factor, j) -> float
+            with open(train_proj_json, "w") as f:
+                json.dump({str(ly): v for ly, v in train_projections.items()}, f)
+            logger.warning(f"Saved train projections to {train_proj_json}")
 
-            for l in tqdm(layers, desc="Phase B layers"):
-                sv = steering_vecs[l]
-                for factor in factors:
-                    for start in range(0, n_items, B):
-                        batch = flat_items[start:start + B]
-                        ids, mask, _ = pad_batch([b["full_ids"] for b in batch], pad_id, device)
-                        toks = forward_steered(
-                            model, ids, mask,
-                            [b["open_paren_pos"] for b in batch],
-                            l, sv, factor, prefix_length,
-                        )
-                        seqs, pos_idx, js = [], [], []
-                        for i, b in enumerate(batch):
-                            j = b["prompt_idx"]
-                            tid = toks[i]
-                            steered_tok[(factor, l, j)] = tid
-                            seq = seq_through_paren_plus_token(
-                                b["full_ids"], b["open_paren_pos"], tid,
-                            )
-                            seqs.append(seq)
-                            pos_idx.append(len(seq) - 1)
-                            js.append(j)
-                        del ids, mask
-                        ids2, mask2, _ = pad_batch(seqs, pad_id, device)
-                        h_at = forward_capture_hiddens_at_positions(
-                            model, ids2, mask2, layers, pos_idx,
-                        )
-                        del ids2, mask2
-                        # Only store κ at the steering/read layer `l`
-                        # (embedding is from α-steered choice at this layer).
-                        kbatch = batch_kappa_cpu(h_at[l], mu_poss[l], mu_negs[l])
-                        for ii, pj in enumerate(js):
-                            kappa_postgen_steered[(l, factor, pj)] = float(kbatch[ii])
+            save_steering_state(steering_pt, steering_vecs, mu_poss, mu_negs, layers)
+        else:
+            layers_sv, steering_vecs, mu_poss, mu_negs = load_steering_state(steering_pt, device)
+            layers = [ly for ly in layers_req if ly in layers_sv]
+            steering_vecs = {ly: steering_vecs[ly] for ly in layers}
+            mu_poss = {ly: mu_poss[ly] for ly in layers}
+            mu_negs = {ly: mu_negs[ly] for ly in layers}
+            logger.warning(
+                f"Loaded steering tensors for layers {layers} from {steering_pt}",
+            )
 
-            # ----------------------------------------------------------------
-            # Assemble per-prompt DataFrame.
-            # ----------------------------------------------------------------
-            rows = []
-            for l in layers:
-                for b in flat_items:
-                    j = b["prompt_idx"]
-                    rec = baseline_records[j]
-                    row = {
-                        "layer": l,
-                        "prompt_idx": j,
-                        "question": rec["question"],
-                        "answer_matching_behavior": rec["answer_matching_behavior"],
-                        "matching_letter": rec["matching_letter"],
-                        "notmatch_letter": rec["notmatch_letter"],
-                        "kappa_a": kappa_map.get((l, j), float("nan")),
-                        "kappa_a_postgen": kappa_postgen_base.get((l, j), float("nan")),
-                        "baseline_token": rec["baseline_token"],
-                        "baseline_on_format": rec["baseline_on_format"],
-                        "baseline_correct": rec["baseline_correct"],
-                    }
-                    for factor in factors:
-                        tid = steered_tok.get((factor, l, j))
-                        if tid is None:
-                            row[f"steered_token_{factor:g}"] = ""
-                            row[f"steered_on_format_{factor:g}"] = False
-                            row[f"steered_correct_{factor:g}"] = False
-                            row[f"kappa_a_postgen_{factor:g}"] = float("nan")
-                            row[f"steering_factor"] = factor
-                        else:
-                            g = decode_letter(tokenizer, tid)
-                            row[f"steered_token_{factor:g}"] = g or tokenizer.decode([tid]).strip()
-                            row[f"steered_on_format_{factor:g}"] = g is not None
-                            row[f"steered_correct_{factor:g}"] = g == b["matching_letter"]
-                            row[f"kappa_a_postgen_{factor:g}"] = kappa_postgen_steered.get(
-                                (l, factor, j), float("nan"),
-                            )
-                    rows.append(row)
-
-            per_prompt_df = pd.DataFrame(rows)
+        if need_test_forward:
+            per_prompt_df = run_phase_ab_mcqa(
+                model,
+                tokenizer,
+                layers,
+                factors,
+                device,
+                pad_id,
+                B,
+                prefix_length,
+                mu_poss,
+                mu_negs,
+                steering_vecs,
+                test_data,
+                "test",
+            )
             per_prompt_df.to_csv(per_prompt_csv, index=False)
             logger.warning(f"Saved {len(per_prompt_df)} rows to {per_prompt_csv}")
+
+        if need_val_forward:
+            val_prompt_df = run_phase_ab_mcqa(
+                model,
+                tokenizer,
+                layers,
+                factors,
+                device,
+                pad_id,
+                B,
+                prefix_length,
+                mu_poss,
+                mu_negs,
+                steering_vecs,
+                val_data,
+                "val",
+            )
+            val_prompt_df.to_csv(val_prompt_csv, index=False)
+            logger.warning(f"Saved {len(val_prompt_df)} rows to {val_prompt_csv}")
+
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    if per_prompt_df is None:
+        logger.error("No test per-prompt results available.")
+        sys.exit(1)
+
+    per_prompt_df = per_prompt_df[per_prompt_df["layer"].isin(layers_req)].copy()
+    ly_present = sorted(per_prompt_df["layer"].unique())
+    layers = [ly for ly in layers_req if ly in ly_present]
+    if not layers:
+        logger.error("Requested layers not present in test CSV.")
+        sys.exit(1)
 
     # ------------------------------------------------------------------
     # Analysis: per-layer summary.
     # ------------------------------------------------------------------
 
     layer_rows = []
-    for l in sorted(per_prompt_df["layer"].unique()):
+    for l in layers:
         ldf = per_prompt_df[per_prompt_df["layer"] == l]
         kappa = ldf["kappa_a"].values
         correct = ldf["baseline_correct"].astype(int).values
@@ -1122,10 +1411,9 @@ def main():
         layer_df["best_steered_acc"] = layer_df[acc_cols].max(axis=1)
         layer_df["best_factor"] = layer_df[acc_cols].idxmax(axis=1).str.replace("steered_acc_", "")
 
-    # MCC(sign κ vs actual steer correctness) at each layer's best α for steer-at-layer.
+    # MCC(sign κ vs steer correctness) @ best α chosen on **test** (leaks test if used as primary).
     best_alpha_mccs = []
     for _, rr in layer_df.iterrows():
-        L = int(rr["layer"])
         bf = rr.get("best_factor")
         if bf is None or pd.isna(bf):
             best_alpha_mccs.append(float("nan"))
@@ -1135,25 +1423,102 @@ def main():
         except (TypeError, ValueError):
             best_alpha_mccs.append(float("nan"))
             continue
+        L = int(rr["layer"])
         ldf = per_prompt_df[per_prompt_df["layer"] == L]
-        col_c = f"steered_correct_{alpha_star:g}"
-        col_pg = f"kappa_a_postgen_{alpha_star:g}"
-        if col_c not in ldf.columns:
-            best_alpha_mccs.append(float("nan"))
-            continue
-        kappa_an = ldf["kappa_a"].values.astype(float) + 2.0 * alpha_star
-        if col_pg in ldf.columns:
-            kappa_pg = ldf[col_pg].values.astype(float)
-            kappa = np.where(np.isfinite(kappa_pg), kappa_pg, kappa_an)
-        else:
-            kappa = kappa_an
-        sign_pred = (kappa > 0).astype(int)
-        corr = ldf[col_c].astype(int).values
-        mask = np.isfinite(kappa)
-        best_alpha_mccs.append(
-            safe_mcc(sign_pred[mask], corr[mask]) if mask.sum() >= 4 else float("nan"),
-        )
+        best_alpha_mccs.append(sign_kappa_mcc_at_steered_alpha(ldf, alpha_star))
     layer_df["sign_kappa_mcc_best_alpha"] = best_alpha_mccs
+
+    # Defaults for val-merge columns.
+    layer_df["sign_kappa_mcc_val_best_on_test"] = float("nan")
+    layer_df["best_steered_acc_val"] = float("nan")
+    layer_df["best_factor_val"] = np.nan
+    layer_df["test_steered_acc_at_val_best_alpha"] = float("nan")
+    layer_df["val_steered_acc_at_test_best_alpha"] = float("nan")
+
+    acc_cols_v: list[str] = []
+    layer_df_val = None
+    if val_prompt_df is not None:
+        val_prompt_df = val_prompt_df[val_prompt_df["layer"].isin(layers)].copy()
+        layer_rows_v = []
+        for l in layers:
+            ldfv = val_prompt_df[val_prompt_df["layer"] == l]
+            if len(ldfv) == 0:
+                continue
+            rowv = {
+                "layer": int(l),
+                "dprime": dprimes.get(int(l), float("nan")),
+                "n_prompts_val": int(len(ldfv)),
+                "baseline_acc_val": float(ldfv["baseline_correct"].mean()),
+            }
+            for factor in factors:
+                col_c = f"steered_correct_{factor:g}"
+                col_f = f"steered_on_format_{factor:g}"
+                if col_c in ldfv.columns:
+                    rowv[f"steered_acc_val_{factor:g}"] = float(ldfv[col_c].mean())
+                    rowv[f"steered_off_format_val_{factor:g}"] = float((~ldfv[col_f]).mean())
+            layer_rows_v.append(rowv)
+        layer_df_val = pd.DataFrame(layer_rows_v).sort_values("layer").reset_index(drop=True)
+
+        layer_df_val["baseline_acc"] = layer_df_val["baseline_acc_val"]
+        for f in factors:
+            vcol = f"steered_acc_val_{f:g}"
+            if vcol in layer_df_val.columns:
+                layer_df_val[f"steered_acc_{f:g}"] = layer_df_val[vcol]
+
+        acc_cols_v = [
+            f"steered_acc_val_{f:g}" for f in factors if f"steered_acc_val_{f:g}" in layer_df_val.columns
+        ]
+        if acc_cols_v:
+            layer_df_val["best_steered_acc_val"] = layer_df_val[acc_cols_v].max(axis=1)
+            layer_df_val["best_factor_val"] = layer_df_val[acc_cols_v].idxmax(axis=1).str.replace(
+                "steered_acc_val_", "",
+            )
+
+            bf_val_map = layer_df_val.set_index("layer")["best_factor_val"]
+            ba_val_map = layer_df_val.set_index("layer")["best_steered_acc_val"]
+            layer_df["best_factor_val"] = layer_df["layer"].map(bf_val_map)
+            layer_df["best_steered_acc_val"] = layer_df["layer"].map(ba_val_map)
+
+            mcc_val_on_test = []
+            test_at_val_a = []
+            val_at_test_a = []
+            for _, rr in layer_df.iterrows():
+                L = int(rr["layer"])
+                ldf_test = per_prompt_df[per_prompt_df["layer"] == L]
+                ldf_val = val_prompt_df[val_prompt_df["layer"] == L]
+                bf_v = rr.get("best_factor_val")
+                bf_t = rr.get("best_factor")
+                if bf_v is None or pd.isna(bf_v):
+                    mcc_val_on_test.append(float("nan"))
+                    test_at_val_a.append(float("nan"))
+                else:
+                    try:
+                        av = float(bf_v)
+                        mcc_val_on_test.append(sign_kappa_mcc_at_steered_alpha(ldf_test, av))
+                        col_v = f"steered_correct_{av:g}"
+                        test_at_val_a.append(
+                            float(ldf_test[col_v].mean()) if col_v in ldf_test.columns else float("nan"),
+                        )
+                    except (TypeError, ValueError):
+                        mcc_val_on_test.append(float("nan"))
+                        test_at_val_a.append(float("nan"))
+                if bf_t is None or pd.isna(bf_t):
+                    val_at_test_a.append(float("nan"))
+                else:
+                    try:
+                        at = float(bf_t)
+                        col_t = f"steered_correct_{at:g}"
+                        val_at_test_a.append(
+                            float(ldf_val[col_t].mean()) if len(ldf_val) and col_t in ldf_val.columns
+                            else float("nan"),
+                        )
+                    except (TypeError, ValueError):
+                        val_at_test_a.append(float("nan"))
+
+            layer_df["sign_kappa_mcc_val_best_on_test"] = mcc_val_on_test
+            layer_df["test_steered_acc_at_val_best_alpha"] = test_at_val_a
+            layer_df["val_steered_acc_at_test_best_alpha"] = val_at_test_a
+            layer_df_val.to_csv(out_dir / "val_per_layer_summary.csv", index=False)
 
     layer_df.to_csv(out_dir / "per_layer_summary.csv", index=False)
 
@@ -1240,43 +1605,92 @@ def main():
                     f"r={r_dp:+.4f} (p={p_dp:.4g}){sig}  (n={mask_p.sum()} layers)"
                 )
 
+    pearson_mcc_val_best_on_test_vs_dprime = None
+    if (
+        val_prompt_df is not None
+        and "sign_kappa_mcc_val_best_on_test" in layer_df.columns
+        and "dprime" in layer_df.columns
+    ):
+        mask_v = (
+            layer_df["sign_kappa_mcc_val_best_on_test"].notna()
+            & layer_df["dprime"].notna()
+        )
+        if mask_v.sum() >= 3:
+            xv = layer_df.loc[mask_v, "sign_kappa_mcc_val_best_on_test"].values.astype(float)
+            yv = layer_df.loc[mask_v, "dprime"].values.astype(float)
+            if np.nanstd(xv) > 1e-12 and np.nanstd(yv) > 1e-12:
+                r_v, p_v = scipy_stats.pearsonr(xv, yv)
+                pearson_mcc_val_best_on_test_vs_dprime = {
+                    "pearson_r": float(r_v),
+                    "pearson_p": float(p_v),
+                    "n_layers": int(mask_v.sum()),
+                }
+                sig = "*" if p_v < 0.05 else " "
+                logger.warning(
+                    f"\n{args.behavior}: Pearson across layers — "
+                    f"d' vs MCC(sign κ vs match @ **val**-best α, evaluated on **test**): "
+                    f"r={r_v:+.4f} (p={p_v:.4g}){sig}  (n={mask_v.sum()} layers)",
+                )
+
     # ------------------------------------------------------------------
     # Plots
     # ------------------------------------------------------------------
-    plots = out_dir / "plots"
-    plot_projection_quality(layer_df, args.behavior, plots / "projection_quality_by_layer.png")
-    plot_steering_acc(layer_df, factors, args.behavior, plots / "steering_acc_by_layer.png")
-    plot_steering_and_dprime(layer_df, factors, args.behavior, plots / "steering_acc_and_dprime.png")
-    plot_mcc_best_alpha_vs_dprime(layer_df, args.behavior,
-                                  plots / "mcc_best_alpha_vs_dprime.png")
+    plot_projection_quality(layer_df, args.behavior, plots_test / "projection_quality_by_layer.png")
+    plot_steering_acc(layer_df, factors, args.behavior, plots_test / "steering_acc_by_layer.png")
+    plot_steering_and_dprime(layer_df, factors, args.behavior, plots_test / "steering_acc_and_dprime.png")
+    plot_mcc_best_alpha_vs_dprime(layer_df, args.behavior, plots_test / "mcc_best_alpha_vs_dprime.png")
     plot_projection_vs_steering(
         layer_df,
         factors + (["best"] if "best_steered_acc" in layer_df.columns else []),
         args.behavior,
-        plots / "projection_vs_steering.png",
+        plots_test / "projection_vs_steering.png",
     )
-    for l in sorted(per_prompt_df["layer"].unique()):
+    for l in layers:
         plot_kappa_scatter(per_prompt_df, int(l), args.behavior,
-                           plots / f"kappa_scatter_layer_{int(l)}.png")
+                           plots_test / f"kappa_scatter_layer_{int(l)}.png")
         plot_projection_histograms(per_prompt_df, factors, args.behavior, int(l),
-                                   train_projections,
-                                   plots / f"projection_hist_layer_{int(l)}.png",
-                                   postgen=False)
+                                     train_projections,
+                                     plots_test / f"projection_hist_layer_{int(l)}.png",
+                                     postgen=False)
         plot_projection_histograms(per_prompt_df, factors, args.behavior, int(l),
-                                   train_projections,
-                                   plots / f"projection_hist_postgen_layer_{int(l)}.png",
-                                   postgen=True)
+                                     train_projections,
+                                     plots_test / f"projection_hist_postgen_layer_{int(l)}.png",
+                                     postgen=True)
+
+    if val_prompt_df is not None and acc_cols_v:
+        plot_steering_acc(layer_df_val, factors, args.behavior, plots_val / "steering_acc_by_layer.png")
+        plot_steering_and_dprime(layer_df_val, factors, args.behavior, plots_val / "steering_acc_and_dprime.png")
+
+    if val_prompt_df is not None:
+        plot_mcc_val_best_alpha_on_test_vs_dprime(
+            layer_df,
+            args.behavior,
+            plots_root / "mcc_best_val_alpha_on_test_vs_dprime.png",
+        )
+        plot_best_alpha_val_vs_test(layer_df, args.behavior, plots_root / "best_alpha_val_vs_test.png")
+        plot_steering_acc_val_vs_test_extended(
+            layer_df,
+            args.behavior,
+            plots_root / "steering_acc_val_vs_test_cross_split.png",
+        )
 
     # Summary JSON.
+    with open(selection_path) as f:
+        train_sel_blob = json.load(f)
+
     summary = {
         "behavior": args.behavior,
         "model_name": args.model_name,
         "layers": list(map(int, layer_df["layer"].values)),
         "factors": factors,
+        "seed": args.seed,
+        "train_val_selection": train_sel_blob,
         "n_test_prompts": int(len(per_prompt_df["prompt_idx"].unique())),
+        "n_val_prompts": int(len(val_prompt_df["prompt_idx"].unique())) if val_prompt_df is not None else 0,
         "per_layer": layer_df.to_dict(orient="records"),
         "cross_layer_corr": cross_df.to_dict(orient="records"),
         "pearson_dprime_vs_sign_kappa_mcc_best_alpha": pearson_mcc_best_vs_dprime,
+        "pearson_dprime_vs_sign_kappa_mcc_val_best_on_test": pearson_mcc_val_best_on_test_vs_dprime,
     }
     with open(out_dir / "summary.json", "w") as f:
         json.dump(summary, f, indent=2, default=str)
