@@ -1539,13 +1539,20 @@ def main():
 
     # Cross-layer correlations: predictor vs each factor AND vs best-across-factors.
     cross_rows = []
-    predictors = [("sign_kappa_mcc", "sign(κ_a) MCC"), ("kappa_spearman_rho", "κ_a Spearman ρ"),
-                  ("dprime", "d'")]
+    predictors = [
+        ("sign_kappa_mcc", "sign(κ_a) MCC"),
+        ("sign_kappa_mcc_best_alpha", "sign κ MCC @ test-best α"),
+        ("sign_kappa_mcc_val_best_on_test", "sign κ MCC @ val-best α (test)"),
+        ("kappa_spearman_rho", "κ_a Spearman ρ"),
+        ("dprime", "d'"),
+    ]
 
     targets = [(f"steered_acc_{f:g}", f"α={f:g}") for f in factors
                if f"steered_acc_{f:g}" in layer_df.columns]
     if "best_steered_acc" in layer_df.columns:
-        targets.append(("best_steered_acc", "best α per layer"))
+        targets.append(("best_steered_acc", "best α per layer (test)"))
+    if val_prompt_df is not None and "test_steered_acc_at_val_best_alpha" in layer_df.columns:
+        targets.append(("test_steered_acc_at_val_best_alpha", "test acc @ val-best α"))
 
     for pred_col, pred_label in predictors:
         if pred_col not in layer_df.columns:
@@ -1573,7 +1580,7 @@ def main():
         for _, r in cross_df.iterrows():
             sig = "*" if r["pearson_p"] < 0.05 else " "
             logger.warning(
-                f"  {r['predictor']:20s} → {r['target']:20s}: "
+                f"  {r['predictor']:42s} → {r['target']:28s}: "
                 f"r={r['pearson_r']:+.3f} (p={r['pearson_p']:.3g}){sig}  "
                 f"ρ={r['spearman_rho']:+.3f} (p={r['spearman_p']:.3g})"
             )
@@ -1630,6 +1637,33 @@ def main():
                     f"\n{args.behavior}: Pearson across layers — "
                     f"d' vs MCC(sign κ vs match @ **val**-best α, evaluated on **test**): "
                     f"r={r_v:+.4f} (p={p_v:.4g}){sig}  (n={mask_v.sum()} layers)",
+                )
+
+    pearson_dprime_vs_test_acc_val_best_alpha = None
+    if (
+        val_prompt_df is not None
+        and "test_steered_acc_at_val_best_alpha" in layer_df.columns
+        and "dprime" in layer_df.columns
+    ):
+        mask_a = (
+            layer_df["test_steered_acc_at_val_best_alpha"].notna()
+            & layer_df["dprime"].notna()
+        )
+        if mask_a.sum() >= 3:
+            xv = layer_df.loc[mask_a, "test_steered_acc_at_val_best_alpha"].values.astype(float)
+            yv = layer_df.loc[mask_a, "dprime"].values.astype(float)
+            if np.nanstd(xv) > 1e-12 and np.nanstd(yv) > 1e-12:
+                r_a, p_a = scipy_stats.pearsonr(xv, yv)
+                pearson_dprime_vs_test_acc_val_best_alpha = {
+                    "pearson_r": float(r_a),
+                    "pearson_p": float(p_a),
+                    "n_layers": int(mask_a.sum()),
+                }
+                sig = "*" if p_a < 0.05 else " "
+                logger.warning(
+                    f"\n{args.behavior}: Pearson across layers — "
+                    f"d' vs **test** steering accuracy @ **val**-best α per layer: "
+                    f"r={r_a:+.4f} (p={p_a:.4g}){sig}  (n={mask_a.sum()} layers)",
                 )
 
     # ------------------------------------------------------------------
@@ -1691,6 +1725,7 @@ def main():
         "cross_layer_corr": cross_df.to_dict(orient="records"),
         "pearson_dprime_vs_sign_kappa_mcc_best_alpha": pearson_mcc_best_vs_dprime,
         "pearson_dprime_vs_sign_kappa_mcc_val_best_on_test": pearson_mcc_val_best_on_test_vs_dprime,
+        "pearson_dprime_vs_test_steered_acc_at_val_best_alpha": pearson_dprime_vs_test_acc_val_best_alpha,
     }
     with open(out_dir / "summary.json", "w") as f:
         json.dump(summary, f, indent=2, default=str)
