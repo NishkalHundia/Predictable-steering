@@ -2,10 +2,12 @@
 
 Reproduction code for **_Predictable Steering: Leveraging Geometric Proxies for Layer Selection and Per-Instance Success_** (ICML submission).
 
-We extend the discriminability index `d'` (Braun et al., 2025) — a geometric, training-time proxy for steering reliability — with two new uses:
+We extend the discriminability index `d'` (Braun et al., 2025), a geometric, training-time proxy for steering reliability. We demonstrate two further uses of $d'$:
 
-1. **Layer selection.** Per-layer `d'` predicts the optimal CAA steering layer for a behavior (Pearson r = 0.55 – 0.88 on five MCQA behaviors).
-2. **Per-instance success.** For high-`d'` behaviors, the post-generation projection `κ_a` of a generated token onto the difference-of-means line predicts whether steering succeeded on that example (Pearson r = 0.90 – 0.95 between per-layer `d'` and per-layer MCC of `sign(κ_a)`).
+\begin{itemize}[noitemsep, topsep=0pt]
+    \item \textbf{Layer selection:} For a fixed dataset, $d'$ predicts the optimal steering layer, enabling principled layer selection without exhaustive sweeps.
+    \item \textbf{Individual test point success:} For datasets with high $d'$, the position of a test point along the steering vector direction predicts whether steering will succeed on that example.
+\end{itemize}
 
 The end-to-end pipeline is implemented in a single self-contained script: [`scripts/mcqa_projection_link.py`](scripts/mcqa_projection_link.py).
 
