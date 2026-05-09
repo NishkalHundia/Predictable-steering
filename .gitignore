@@ -33,3 +33,5 @@ uv.lock
 *.pkl
 *.pdf
 wandb/
+
+smoke_test.py
