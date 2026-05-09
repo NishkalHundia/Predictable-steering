@@ -20,8 +20,8 @@ predictable-steering/
 ├── run_all.sh                      # end-to-end driver (5 behaviors → CSVs → paper figs + tables)
 ├── scripts/
 │   ├── mcqa_projection_link.py     # the experiment: trains DiffMean vectors, runs phase A/B/val,
-│   │                               # writes CSVs + JSON + plots/test/, plots/val/.
-│   ├── make_paper_plots.py         # renders paper-style PNGs from those CSVs (no Modal needed)
+│   │                               # writes CSVs + JSON (plots are deferred to make_paper_plots.py).
+│   ├── make_paper_plots.py         # renders paper-style PNGs from those CSVs
 │   └── make_paper_tables.py        # rebuilds Tables 1 & 2 (Pearson correlations) from CSVs
 └── datasets/
     ├── raw/<behavior>/dataset.json            # contrastive A/B training pairs (Rimsky et al. 2024)
@@ -50,11 +50,16 @@ pip install -r requirements.txt
 uv pip install -r requirements.txt
 ```
 
-Authenticate with Hugging Face once so the model weights can be downloaded:
+Gemma-2-9B-IT is a gated repo. Before running, (a) accept the license at
+[huggingface.co/google/gemma-2-9b-it](https://huggingface.co/google/gemma-2-9b-it),
+and (b) authenticate with a token that has gated-repo read access:
 
 ```bash
-huggingface-cli login
+huggingface-cli login    # or: export HF_TOKEN=hf_xxx
 ```
+
+If you use a fine-grained token, make sure "Read access to contents of all
+public gated repos you can access" is enabled.
 
 ---
 
@@ -74,14 +79,18 @@ This loops over all five behaviors, calling `scripts/mcqa_projection_link.py` on
 results/mcqa_projection_link/gemma-2-9b-it/<behavior>/
     train_selection.json          # canonical seed → train/val raw indices
     steering_state.pt             # per-layer μ⁺, μ⁻, v
-    dprime.json                   # per-layer d' on training projections
     train_projections.json        # per-layer scalar coords (κ) for train ±
-    per_prompt_results.csv        # test split: κ_a, κ_a_postgen*, steered_correct_α  per (layer, prompt)
+                                  #   (d' is recomputed from this on read)
+    per_prompt_results.csv        # post-gen κ + steered correctness per (layer, prompt)
+                                  #   columns: kappa_a_postgen, kappa_a_postgen_α,
+                                  #   baseline_correct, steered_correct_α, …
     val_prompt_results.csv        # validation split (same schema)
-    per_layer_summary.csv         # one row per layer (incl. val-best-α columns)
-    cross_layer_corr.csv          # predictor × target Pearson / Spearman
-    summary.json                  # everything bundled
-    plots/test/   plots/val/      # exploratory plots produced inline by the main script
+    per_layer_summary.csv         # one row per layer:
+                                  #   layer, dprime, n_prompts, baseline_acc,
+                                  #   steered_acc_α, sign_kappa_mcc_val_best_on_test,
+                                  #   test_steered_acc_at_val_best_alpha
+    summary.json                  # behavior, model, layers, factors, seed,
+                                  #   train/val selection, prompt counts
 
 paper_plots/<behavior>/
     <short>_steer_new.png         # per-layer accuracy + d'           (Figs 1, 4)
@@ -130,7 +139,7 @@ python scripts/make_paper_tables.py
 | Table 1 (per-layer d' vs per-layer test acc @ val-α*)        | `paper_plots/tables.md` (rebuilt from `per_layer_summary.csv`) |
 | Table 2 (per-layer d' vs per-layer MCC of sign κ @ val-α*)   | `paper_plots/tables.md` (same) |
 
-The Pearson correlations underlying Tables 1 and 2 are also stored in each behavior's `summary.json` (`pearson_dprime_vs_test_steered_acc_at_val_best_alpha`, `pearson_dprime_vs_sign_kappa_mcc_val_best_on_test`) and in `cross_layer_corr.csv`.
+The two columns underlying Tables 1 and 2 — `test_steered_acc_at_val_best_alpha` and `sign_kappa_mcc_val_best_on_test` — live in each behavior's `per_layer_summary.csv`. `make_paper_tables.py` recomputes the cross-layer Pearson correlations from those columns.
 
 ---
 
@@ -139,9 +148,9 @@ The Pearson correlations underlying Tables 1 and 2 are also stored in each behav
 For each behavior `b` and each contrastive pair `(prompt, r⁺, r⁻)`:
 
 1. **Phase 0** — extract residual-stream activations at the answer-letter position for both `r⁺` and `r⁻` at every layer ℓ ∈ {10, …, 32}; the steering vector is `v⁽ℓ⁾ = μ⁺ − μ⁻`. Compute `d'⁽ℓ⁾` from the scalar projections of training pairs onto the difference-of-means line.
-2. **Phase A** — unsteered greedy decode at the `(` position for every test prompt (and validation prompt). Record `κ_a` from the residual stream at the teacher-forced answer letter.
-3. **Phase A2** — second forward on `prefix + [chosen-letter token]`; record `κ_a_postgen` per layer.
-4. **Phase B** — at every (layer, α ∈ {1, 2, 3, 5, 10}), steered greedy decode + a second unsteered forward to record `κ_a_postgen_α`.
+2. **Phase A** — unsteered greedy decode at the `(` position for every test (and validation) prompt; record the chosen letter and whether it matches the behavior-aligned answer.
+3. **Phase A2** — second forward on `prefix + [chosen-letter token]`; record `κ_a_postgen` per layer (the projection at the model's actual answer token).
+4. **Phase B** — at every (layer, α ∈ {1, 2, 3, 5, 10}), steered greedy decode + a second unsteered forward to record `κ_a_postgen_α` at the steered chosen token.
 5. **Validation** — best α* per layer is chosen on validation prompts (sampled from `raw \ train`).
 6. **Cross-layer** — Pearson(`d'`, test-acc @ val-α*) gives Table 1; Pearson(`d'`, MCC(sign `κ_a_postgen_α*`, steered_correct)) gives Table 2.
 

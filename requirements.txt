@@ -1,8 +1,11 @@
-torch>=2.5.0
-transformers>=4.45.1
-numpy>=1.26
+torch>=2.4.0
+transformers>=4.45,<5
+accelerate>=0.34
+huggingface_hub>=0.24,<1
+numpy>=1.26,<2
 pandas>=2.0
 scipy>=1.10
 scikit-learn>=1.5
 matplotlib>=3.9
 tqdm>=4.65
+sentencepiece
