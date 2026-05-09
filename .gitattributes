@@ -1,2 +1,2 @@
-axbench/examples/* linguist-vendored
-axbench/scripts/*.ipynb linguist-vendored
+datasets/raw/*/dataset.json linguist-generated=true
+datasets/test/*/test_dataset_ab.json linguist-generated=true

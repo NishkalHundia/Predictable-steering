@@ -264,11 +264,14 @@ def replot_one(results_root: Path, model_short: str, behavior: str,
         mcc_col="sign_kappa_mcc_val_best_on_test",
     )
     if target_layer is not None:
-        plot_projection_histograms_paper(
-            per_prompt, factors, behavior, target_layer,
-            train_projections,
-            out_dir / f"projection_hist_postgen_layer_{target_layer}.png",
-        )
+        try:
+            plot_projection_histograms_paper(
+                per_prompt, factors, behavior, target_layer,
+                train_projections,
+                out_dir / f"projection_hist_postgen_layer_{target_layer}.png",
+            )
+        except (KeyError, ValueError) as e:
+            print(f"[warn] {behavior}: skipping histogram ({e})")
     print(f"[ok] {behavior}: wrote → {out_dir}")
 
 
