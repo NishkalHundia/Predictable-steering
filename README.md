@@ -1,4 +1,4 @@
-# Predictable Steering
+# ICML Workshop Submission
 
 Reproduction code for **_Predictable Steering: Leveraging Geometric Proxies for Layer Selection and Per-Instance Success_** (ICML submission).
 
