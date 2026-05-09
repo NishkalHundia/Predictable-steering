@@ -1,6 +1,5 @@
 # Predictable Steering
 
-[TESTING]
 Reproduction code for **_Predictable Steering: Leveraging Geometric Proxies for Layer Selection and Per-Instance Success_** (ICML submission).
 
 We extend the discriminability index `d'` (Braun et al., 2025), a geometric, training-time proxy for steering reliability. We demonstrate two further uses of `d'`:
