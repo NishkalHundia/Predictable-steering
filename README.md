@@ -160,9 +160,7 @@ The contrastive pairs and held-out MCQA prompts come from [Rimsky et al., 2024 â
 
 ---
 
-## Citation
-
-If you use this code, please cite the paper (BibTeX to be filled in upon ICML acceptance) and the underlying behavior datasets:
+## References
 
 ```bibtex
 @inproceedings{rimsky2024steering,
@@ -177,5 +175,15 @@ If you use this code, please cite the paper (BibTeX to be filled in upon ICML ac
   author={Braun, Joschka and Eickhoff, Carsten and Krueger, David and Bahrainian, Seyed Ali and Krasheninnikov, Dmitrii},
   booktitle={ICLR 2025 Workshop on Building Trust in Language Models and Applications},
   year={2025}
+}
+
+@misc{wu2025axbenchsteeringllmssimple,
+      title={AxBench: Steering LLMs? Even Simple Baselines Outperform Sparse Autoencoders}, 
+      author={Zhengxuan Wu and Aryaman Arora and Atticus Geiger and Zheng Wang and Jing Huang and Dan Jurafsky and Christopher D. Manning and Christopher Potts},
+      year={2025},
+      eprint={2501.17148},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL},
+      url={https://arxiv.org/abs/2501.17148}, 
 }
 ```
