@@ -221,3 +221,5 @@ axbench/scripts/paper/
 
 results/gemma-2-9b-it/correlation_summaries
 paper_plots/
+
+plot_data/
