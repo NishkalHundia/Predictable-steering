@@ -805,9 +805,12 @@ def phase_b_gpu(
 # ---------------------------------------------------------------------------
 # Re-judge: fill missing scores in an existing per_prompt_results.csv
 # ---------------------------------------------------------------------------
-async def fill_missing_scores(df: pd.DataFrame, behavior: str, judge: AsyncJudge) -> int:
+async def fill_missing_scores(
+    df: pd.DataFrame, behavior: str, judge: AsyncJudge, force: bool = False,
+) -> int:
     """
-    Score any row where behavior_score or fluency_score is NaN.
+    Score rows where behavior_score or fluency_score is NaN (or all rows when
+    force=True, which overwrites existing scores).
     Modifies df in-place. Returns total number of unique generations judged.
     """
     n_judged = 0
@@ -817,8 +820,8 @@ async def fill_missing_scores(df: pd.DataFrame, behavior: str, judge: AsyncJudge
     unsteered_todo = []
     for j, grp in df.groupby("prompt_idx"):
         row0 = grp.iloc[0]
-        need_b = pd.isna(row0.get("behavior_score_0"))
-        need_f = pd.isna(row0.get("fluency_score_0"))
+        need_b = force or pd.isna(row0.get("behavior_score_0"))
+        need_f = force or pd.isna(row0.get("fluency_score_0"))
         if need_b or need_f:
             gen = str(row0.get("generation_0", ""))
             unsteered_todo.append((int(j), str(row0["question"]), gen, need_b, need_f))
@@ -848,7 +851,7 @@ async def fill_missing_scores(df: pd.DataFrame, behavior: str, judge: AsyncJudge
         if scr_col not in df.columns or gen_col not in df.columns:
             continue
 
-        missing = df[pd.isna(df[scr_col]) | pd.isna(df[flu_col])]
+        missing = df if force else df[pd.isna(df[scr_col]) | pd.isna(df[flu_col])]
         if missing.empty:
             continue
 
@@ -861,9 +864,9 @@ async def fill_missing_scores(df: pd.DataFrame, behavior: str, judge: AsyncJudge
         )
         for (idx, row), sc in zip(missing.iterrows(), scores):
             sel = (df["layer"] == row["layer"]) & (df["prompt_idx"] == row["prompt_idx"])
-            if pd.isna(row[scr_col]):
+            if force or pd.isna(row[scr_col]):
                 df.loc[sel, scr_col] = sc["behavior_score"]
-            if pd.isna(row[flu_col]):
+            if force or pd.isna(row[flu_col]):
                 df.loc[sel, flu_col] = sc["fluency_score"]
         n_judged += len(missing)
 
@@ -1366,9 +1369,13 @@ def main():
     parser.add_argument("--skip_judge", action="store_true",
                         help="Skip LM judge calls (use cached if available)")
     parser.add_argument("--rejudge_only", action="store_true",
-                        help="Load existing per_prompt_results.csv, score any missing "
-                             "rows, overwrite the CSV, then re-run analysis/plots. "
-                             "No GPU required. Set OPENAI_API_KEY first.")
+                        help="Load existing per_prompt_results.csv, re-run the LM judge "
+                             "on ALL rows (overwriting previous scores), save the CSV, "
+                             "then re-run analysis/plots. No GPU required. "
+                             "Set OPENAI_API_KEY first.")
+    parser.add_argument("--replot_only", action="store_true",
+                        help="Load existing per_prompt_results.csv and re-run "
+                             "analysis/plots only — no GPU, no judge calls.")
     parser.add_argument("--hist_layers", default=None,
                         help="Comma-separated layers for projection histograms "
                              "(default: first, middle, last)")
@@ -1434,8 +1441,16 @@ def main():
         train_projs = {int(k): v for k, v in raw.items()}
         logger.warning(f"Loaded train projections for {len(train_projs)} layers")
 
+    # ── Replot only path (no GPU, no judge) ──────────────────────────────
+    if args.replot_only:
+        if per_prompt_df is None:
+            logger.error(f"--replot_only requires an existing {per_prompt_csv}")
+            sys.exit(1)
+        logger.warning("--replot_only: skipping GPU and judge phases.")
+        # Fall through to analysis section below.
+
     # ── Re-judge only path ────────────────────────────────────────────────
-    if args.rejudge_only:
+    elif args.rejudge_only:
         if per_prompt_df is None:
             logger.error(f"--rejudge_only requires an existing {per_prompt_csv}")
             sys.exit(1)
@@ -1446,14 +1461,15 @@ def main():
 
         async def _rejudge():
             try:
-                n = await fill_missing_scores(per_prompt_df, args.behavior, judge)
+                # force=True overwrites all scores, not just NaN ones
+                n = await fill_missing_scores(per_prompt_df, args.behavior, judge, force=True)
                 logger.warning(f"Judged {n} generations total.")
             finally:
                 await judge.close()
 
         asyncio.run(_rejudge())
         per_prompt_df.to_csv(per_prompt_csv, index=False)
-        logger.warning(f"Overwrote {per_prompt_csv} with filled scores.")
+        logger.warning(f"Overwrote {per_prompt_csv} with fresh scores.")
         # Fall through to analysis section below.
 
     elif per_prompt_df is None:
