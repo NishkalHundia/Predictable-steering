@@ -396,20 +396,27 @@ class AsyncJudge:
             kwargs = {
                 "model": self.model,
                 "messages": [{"role": "user", "content": prompt}],
-                "max_completion_tokens": 400,
+                "max_tokens": 400,
             }
-            for attempt in range(2):
+            last_exc: Exception | None = None
+            for attempt in range(3):
                 try:
-                    kw = {**kwargs, "reasoning": {"effort": "low"}} if attempt == 0 else kwargs
-                    resp = await self.client.chat.completions.create(**kw)
+                    resp = await self.client.chat.completions.create(**kwargs)
                     out = resp.choices[0].message.content
                     if out and out.strip():
                         return out.strip()
+                    # Empty content — log and retry
+                    logger.warning(
+                        f"Judge call returned empty content on attempt {attempt}; retrying …"
+                    )
                 except Exception as exc:
-                    if attempt == 0:
-                        err = str(exc).lower()
-                        if "reasoning" not in err and "unsupported" not in err:
-                            break
+                    last_exc = exc
+                    wait = 2 ** attempt
+                    logger.warning(
+                        f"Judge call failed (attempt {attempt}): {exc}; retrying in {wait}s …"
+                    )
+                    await asyncio.sleep(wait)
+            logger.error(f"Judge call failed after 3 attempts: {last_exc}")
             return "Score: [[0]]"
 
     async def behavior_score(self, question: str, response: str, behavior: str) -> dict:
