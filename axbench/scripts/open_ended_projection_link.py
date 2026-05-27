@@ -796,6 +796,74 @@ def phase_b_gpu(
 
 
 # ---------------------------------------------------------------------------
+# Re-judge: fill missing scores in an existing per_prompt_results.csv
+# ---------------------------------------------------------------------------
+async def fill_missing_scores(df: pd.DataFrame, behavior: str, judge: AsyncJudge) -> int:
+    """
+    Score any row where behavior_score or fluency_score is NaN.
+    Modifies df in-place. Returns total number of unique generations judged.
+    """
+    n_judged = 0
+
+    # ── Unsteered (behavior_score_0 / fluency_score_0) ──────────────────
+    # Same generation per prompt across all layers — judge once, fill all rows.
+    unsteered_todo = []
+    for j, grp in df.groupby("prompt_idx"):
+        row0 = grp.iloc[0]
+        need_b = pd.isna(row0.get("behavior_score_0"))
+        need_f = pd.isna(row0.get("fluency_score_0"))
+        if need_b or need_f:
+            gen = str(row0.get("generation_0", ""))
+            unsteered_todo.append((int(j), str(row0["question"]), gen, need_b, need_f))
+
+    if unsteered_todo:
+        logger.warning(f"Re-judging {len(unsteered_todo)} unsteered generations …")
+        scores = await asyncio.gather(
+            *[judge.score_all(q, gen, behavior) for _, q, gen, _, _ in unsteered_todo]
+        )
+        for (j, _, _, nb, nf), sc in zip(unsteered_todo, scores):
+            mask = df["prompt_idx"] == j
+            if nb:
+                df.loc[mask, "behavior_score_0"] = sc["behavior_score"]
+            if nf:
+                df.loc[mask, "fluency_score_0"] = sc["fluency_score"]
+        n_judged += len(unsteered_todo)
+
+    # ── Steered (one unique generation per layer × factor × prompt) ──────
+    nzero_alphas = sorted(
+        float(c.replace("steered_kappa_", ""))
+        for c in df.columns if c.startswith("steered_kappa_")
+    )
+    for alpha in nzero_alphas:
+        scr_col = f"steered_behavior_score_{alpha:g}"
+        flu_col = f"steered_fluency_score_{alpha:g}"
+        gen_col = f"steered_generation_{alpha:g}"
+        if scr_col not in df.columns or gen_col not in df.columns:
+            continue
+
+        missing = df[pd.isna(df[scr_col]) | pd.isna(df[flu_col])]
+        if missing.empty:
+            continue
+
+        logger.warning(
+            f"Re-judging {len(missing)} steered generations (α={alpha:g}) …"
+        )
+        scores = await asyncio.gather(
+            *[judge.score_all(str(r["question"]), str(r[gen_col]), behavior)
+              for _, r in missing.iterrows()]
+        )
+        for (idx, row), sc in zip(missing.iterrows(), scores):
+            sel = (df["layer"] == row["layer"]) & (df["prompt_idx"] == row["prompt_idx"])
+            if pd.isna(row[scr_col]):
+                df.loc[sel, scr_col] = sc["behavior_score"]
+            if pd.isna(row[flu_col]):
+                df.loc[sel, flu_col] = sc["fluency_score"]
+        n_judged += len(missing)
+
+    return n_judged
+
+
+# ---------------------------------------------------------------------------
 # Async judge phase (score all collected generations)
 # ---------------------------------------------------------------------------
 async def run_judges(
@@ -1290,6 +1358,10 @@ def main():
                         help="Ignore cached per_prompt_results.csv")
     parser.add_argument("--skip_judge", action="store_true",
                         help="Skip LM judge calls (use cached if available)")
+    parser.add_argument("--rejudge_only", action="store_true",
+                        help="Load existing per_prompt_results.csv, score any missing "
+                             "rows, overwrite the CSV, then re-run analysis/plots. "
+                             "No GPU required. Set OPENAI_API_KEY first.")
     parser.add_argument("--hist_layers", default=None,
                         help="Comma-separated layers for projection histograms "
                              "(default: first, middle, last)")
@@ -1355,7 +1427,29 @@ def main():
         train_projs = {int(k): v for k, v in raw.items()}
         logger.warning(f"Loaded train projections for {len(train_projs)} layers")
 
-    if per_prompt_df is None:
+    # ── Re-judge only path ────────────────────────────────────────────────
+    if args.rejudge_only:
+        if per_prompt_df is None:
+            logger.error(f"--rejudge_only requires an existing {per_prompt_csv}")
+            sys.exit(1)
+        if not __import__("os").environ.get("OPENAI_API_KEY"):
+            logger.error("OPENAI_API_KEY not set.")
+            sys.exit(1)
+        judge = AsyncJudge(model=args.judge_model, max_concurrent=args.max_concurrent)
+
+        async def _rejudge():
+            try:
+                n = await fill_missing_scores(per_prompt_df, args.behavior, judge)
+                logger.warning(f"Judged {n} generations total.")
+            finally:
+                await judge.close()
+
+        asyncio.run(_rejudge())
+        per_prompt_df.to_csv(per_prompt_csv, index=False)
+        logger.warning(f"Overwrote {per_prompt_csv} with filled scores.")
+        # Fall through to analysis section below.
+
+    elif per_prompt_df is None:
         # Need model — load once
         logger.warning(f"Loading tokenizer + model: {args.model_name}")
         tokenizer = AutoTokenizer.from_pretrained(args.model_name, model_max_length=1024)
@@ -1442,10 +1536,21 @@ def main():
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+        # ── Build DataFrame and save immediately (scores still None) ───
+        # Save before judging so generations are never lost if the judge
+        # phase fails (e.g. missing API key). --rejudge_only fills scores later.
+        per_prompt_df = build_per_prompt_df(phase_a, phase_b, layers, nzero_factors)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        per_prompt_df.to_csv(per_prompt_csv, index=False)
+        logger.warning(f"Saved {len(per_prompt_df)} rows (no scores yet) → {per_prompt_csv}")
+
         # ── Judge phase (async) ────────────────────────────────────────
         if not args.skip_judge:
             if not __import__("os").environ.get("OPENAI_API_KEY"):
-                logger.error("OPENAI_API_KEY not set. Use --skip_judge to skip.")
+                logger.error(
+                    "OPENAI_API_KEY not set. Generations are saved to "
+                    f"{per_prompt_csv}. Re-run with --rejudge_only once the key is set."
+                )
                 sys.exit(1)
 
             judge = AsyncJudge(model=args.judge_model, max_concurrent=args.max_concurrent)
@@ -1457,14 +1562,15 @@ def main():
                     await judge.close()
 
             asyncio.run(_judge_all())
+            # Overwrite with filled scores
+            per_prompt_df = build_per_prompt_df(phase_a, phase_b, layers, nzero_factors)
+            per_prompt_df.to_csv(per_prompt_csv, index=False)
+            logger.warning(f"Saved {len(per_prompt_df)} rows (with scores) → {per_prompt_csv}")
         else:
-            logger.warning("Skipping judge calls (--skip_judge). Scores will be None.")
-
-        # ── Build DataFrame ────────────────────────────────────────────
-        per_prompt_df = build_per_prompt_df(phase_a, phase_b, layers, nzero_factors)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        per_prompt_df.to_csv(per_prompt_csv, index=False)
-        logger.warning(f"Saved {len(per_prompt_df)} rows → {per_prompt_csv}")
+            logger.warning(
+                "Skipping judge calls (--skip_judge). "
+                "Re-run with --rejudge_only to fill scores."
+            )
 
     # ── Analysis ──────────────────────────────────────────────────────────
     layers_present = sorted(per_prompt_df["layer"].unique().astype(int))
