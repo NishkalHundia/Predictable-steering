@@ -11,7 +11,8 @@ steering d'?
 
 Pipeline:
   Phase 0  — DiffMean from teacher-forced train responses.
-             Activation site: last token of the response in the full Q+A.
+             Activation site: last content token of the response (pre-EOS /
+             <end_of_turn>) — same site as the post-gen κ (EOS−1).
   Phase A  — Unsteered generation on test prompts. Post-gen forward to get κ
              at the last content token (EOS−1, or last if no EOS). LM judge
              for behavior score + standalone fluency score.
@@ -446,11 +447,22 @@ class AsyncJudge:
 def train_diffmean(model, tokenizer, train_data: list, layers: list, device, batch_size: int):
     """
     For each training example (pos + neg), run a teacher-forced forward on
-    the full Q+A sequence and extract the hidden state at the last token.
+    the full Q+A sequence and extract the hidden state at the last *content*
+    token of the response (the token before any trailing EOS / <end_of_turn>).
+    This matches the post-gen κ site (find_last_content_pos → EOS−1) so the
+    DiffMean line is fit at the same position κ is later projected onto.
     Returns (steering_vecs, mu_poss, mu_negs, dprimes, train_projections).
     """
     use_chat = supports_chat_template(tokenizer)
     pad_id   = tokenizer.pad_token_id
+    eos_ids  = get_eos_ids(tokenizer)
+
+    def last_content_index(ids) -> int:
+        """Index of the last non-EOS token (mirror of find_last_content_pos)."""
+        j = len(ids) - 1
+        while j > 0 and ids[j] in eos_ids:
+            j -= 1
+        return j
 
     # Build list of (full_ids, label) pairs
     train_flat = []
@@ -477,9 +489,10 @@ def train_diffmean(model, tokenizer, train_data: list, layers: list, device, bat
     tokenizer.padding_side = "right"
     for start in tqdm(range(0, len(train_flat), batch_size), desc="Phase 0: DiffMean"):
         batch = train_flat[start:start + batch_size]
-        ids, mask, lens = pad_batch([b["full_ids"] for b in batch], pad_id, device)
-        # Extract hidden at last token of each sequence (last real token, not pad)
-        positions = [l - 1 for l in lens]  # last real token index
+        ids, mask, _ = pad_batch([b["full_ids"] for b in batch], pad_id, device)
+        # Extract hidden at the last *content* token (skip trailing EOS / <end_of_turn>),
+        # matching the post-gen κ site so train/test projections share a position.
+        positions = [last_content_index(b["full_ids"]) for b in batch]
 
         h_at = forward_capture_hiddens_at_positions(model, ids, mask, layers, positions)
         del ids, mask
@@ -964,14 +977,61 @@ def behavior_label(score, threshold: float) -> int | None:
     return int(float(score) > threshold)
 
 
+def sign_mcc_with_diag(
+    kappas: np.ndarray, labels: np.ndarray, min_examples: int = 8,
+) -> dict:
+    """
+    Sign-MCC of predictor sign(κ)>0 against binary behavior labels, plus a full
+    diagnostic breakdown so every NaN (i.e. every gap in the plots) is explainable.
+
+    Returns a dict:
+      mcc      — the MCC, or nan
+      n_used   — rows entering the MCC (finite κ AND valid 0/1 label)
+      n_pos    — # label==1 (behavior present)
+      n_neg    — # label==0 (behavior absent)
+      tp/tn/fp/fn — confusion-matrix cells (pred = sign(κ)>0)
+      reason   — 'ok' | 'too_few_examples' | 'constant_label' | 'constant_predictor'
+    """
+    kappas = np.asarray(kappas, float)
+    labels = np.asarray(labels, int)
+    mask = np.isfinite(kappas) & (labels >= 0)
+    n_used = int(mask.sum())
+    out = {
+        "mcc": float("nan"), "n_used": n_used,
+        "n_pos": 0, "n_neg": 0,
+        "tp": 0, "tn": 0, "fp": 0, "fn": 0,
+        "reason": "too_few_examples",
+    }
+    if n_used < min_examples:
+        return out
+
+    k = kappas[mask]
+    a = labels[mask]
+    p = (k > 0).astype(int)                 # predictor: which side of the line
+    out["n_pos"] = int((a == 1).sum())
+    out["n_neg"] = int((a == 0).sum())
+    out["tp"] = int(((p == 1) & (a == 1)).sum())
+    out["tn"] = int(((p == 0) & (a == 0)).sum())
+    out["fp"] = int(((p == 1) & (a == 0)).sum())
+    out["fn"] = int(((p == 0) & (a == 1)).sum())
+
+    if a.std() < 1e-9:                       # every row on the same side of threshold
+        out["reason"] = "constant_label"
+        return out
+    if p.std() < 1e-9:                       # every κ on the same side of 0
+        out["reason"] = "constant_predictor"
+        return out
+
+    out["mcc"] = safe_mcc(p, a)
+    out["reason"] = "ok"
+    return out
+
+
 def compute_sign_mcc_for_row(
     kappas: np.ndarray, labels: np.ndarray, min_examples: int = 8,
 ) -> float:
-    mask = np.isfinite(kappas) & (labels >= 0)
-    if mask.sum() < min_examples:
-        return float("nan")
-    sign_pred = (kappas[mask] > 0).astype(int)
-    return safe_mcc(sign_pred, labels[mask])
+    """Backward-compatible thin wrapper — returns just the MCC scalar."""
+    return sign_mcc_with_diag(kappas, labels, min_examples)["mcc"]
 
 
 def compute_per_layer_summary(
@@ -986,15 +1046,20 @@ def compute_per_layer_summary(
     threshold   = BEHAVIOR_THRESHOLDS[behavior]
     layer_rows  = []
 
-    for l in layers:
-        ldf = df[df["layer"] == l].copy()
-
-        # ---- unsteered metrics (after fluency filter) ----
-        mask_flu0 = ldf["fluency_score_0"].apply(
+    def _fluent(series) -> pd.Series:
+        return series.apply(
             lambda x: x is not None and not (isinstance(x, float) and np.isnan(x))
             and float(x) >= fluency_threshold
         )
+
+    for l in layers:
+        ldf = df[df["layer"] == l].copy()
+        n_raw = int(len(ldf))
+
+        # ---- unsteered metrics (after fluency filter) ----
+        mask_flu0 = _fluent(ldf["fluency_score_0"])
         ldf_f0 = ldf[mask_flu0]
+        n_kept0 = int(mask_flu0.sum())
 
         kappa0 = ldf_f0["kappa_postgen"].astype(float).values
         scores0 = ldf_f0["behavior_score_0"].apply(
@@ -1005,10 +1070,8 @@ def compute_per_layer_summary(
             for s in scores0
         ])
 
+        diag0 = sign_mcc_with_diag(kappa0, labels0, min_examples)
         valid0 = labels0 >= 0
-        mcc0 = compute_sign_mcc_for_row(
-            kappa0[valid0], labels0[valid0], min_examples,
-        ) if valid0.sum() >= min_examples else float("nan")
 
         rho0, rho0_p = safe_spearman(
             kappa0[valid0 & np.isfinite(kappa0)],
@@ -1018,9 +1081,21 @@ def compute_per_layer_summary(
         row: dict = {
             "layer":              int(l),
             "dprime":             dprimes.get(int(l), float("nan")),
-            "n_unsteered_raw":    int(len(ldf)),
-            "n_unsteered_filt":   int(mask_flu0.sum()),
-            "sign_kappa_mcc":     mcc0,
+            # row accounting (fluency filter)
+            "n_unsteered_raw":      n_raw,
+            "n_unsteered_filt":     n_kept0,                  # rows kept after fluency
+            "n_unsteered_removed":  n_raw - n_kept0,          # rows dropped by fluency
+            "n_unsteered_nolabel":  n_kept0 - diag0["n_used"],# kept but no usable κ/score
+            # MCC confusion-matrix breakdown
+            "mcc_n_used_0": diag0["n_used"],
+            "mcc_n_pos_0":  diag0["n_pos"],
+            "mcc_n_neg_0":  diag0["n_neg"],
+            "mcc_tp_0":     diag0["tp"],
+            "mcc_tn_0":     diag0["tn"],
+            "mcc_fp_0":     diag0["fp"],
+            "mcc_fn_0":     diag0["fn"],
+            "mcc_reason_0": diag0["reason"],                  # why NaN (gap) if not 'ok'
+            "sign_kappa_mcc":     diag0["mcc"],
             "kappa_spearman_rho": rho0,
             "kappa_spearman_p":   rho0_p,
             "avg_behavior_score_0": float(scores0[valid0].mean()) if valid0.sum() else float("nan"),
@@ -1029,16 +1104,15 @@ def compute_per_layer_summary(
         # ---- steered metrics ----
         best_mcc  = float("nan")
         best_alpha = float("nan")
+        factor_reasons: list[str] = []
         for alpha in non_zero_factors:
             flu_col  = f"steered_fluency_score_{alpha:g}"
             kap_col  = f"steered_kappa_{alpha:g}"
             scr_col  = f"steered_behavior_score_{alpha:g}"
 
-            mask_flu = ldf[flu_col].apply(
-                lambda x: x is not None and not (isinstance(x, float) and np.isnan(x))
-                and float(x) >= fluency_threshold
-            )
+            mask_flu = _fluent(ldf[flu_col])
             ldf_fa = ldf[mask_flu]
+            n_kept_a = int(mask_flu.sum())
 
             kap = ldf_fa[kap_col].astype(float).values
             scr = ldf_fa[scr_col].apply(
@@ -1050,21 +1124,39 @@ def compute_per_layer_summary(
             ])
             valid = labs >= 0
 
-            mcc_a = compute_sign_mcc_for_row(
-                kap[valid], labs[valid], min_examples,
-            ) if valid.sum() >= min_examples else float("nan")
+            diag_a = sign_mcc_with_diag(kap, labs, min_examples)
             avg_scr = float(scr[valid].mean()) if valid.sum() else float("nan")
+            factor_reasons.append(diag_a["reason"])
 
-            row[f"steered_sign_mcc_{alpha:g}"]   = mcc_a
+            row[f"steered_sign_mcc_{alpha:g}"]    = diag_a["mcc"]
             row[f"avg_steered_behavior_{alpha:g}"] = avg_scr
-            row[f"n_steered_filt_{alpha:g}"]       = int(mask_flu.sum())
+            # row accounting (fluency filter) per factor
+            row[f"n_steered_raw_{alpha:g}"]       = n_raw
+            row[f"n_steered_filt_{alpha:g}"]      = n_kept_a
+            row[f"n_steered_removed_{alpha:g}"]   = n_raw - n_kept_a
+            row[f"n_steered_nolabel_{alpha:g}"]   = n_kept_a - diag_a["n_used"]
+            # MCC confusion-matrix breakdown per factor
+            row[f"mcc_n_used_{alpha:g}"] = diag_a["n_used"]
+            row[f"mcc_n_pos_{alpha:g}"]  = diag_a["n_pos"]
+            row[f"mcc_n_neg_{alpha:g}"]  = diag_a["n_neg"]
+            row[f"mcc_tp_{alpha:g}"]     = diag_a["tp"]
+            row[f"mcc_tn_{alpha:g}"]     = diag_a["tn"]
+            row[f"mcc_fp_{alpha:g}"]     = diag_a["fp"]
+            row[f"mcc_fn_{alpha:g}"]     = diag_a["fn"]
+            row[f"mcc_reason_{alpha:g}"] = diag_a["reason"]
 
-            if np.isfinite(mcc_a) and (np.isnan(best_mcc) or mcc_a > best_mcc):
-                best_mcc   = mcc_a
+            if np.isfinite(diag_a["mcc"]) and (np.isnan(best_mcc) or diag_a["mcc"] > best_mcc):
+                best_mcc   = diag_a["mcc"]
                 best_alpha = alpha
 
         row["best_steered_sign_mcc"] = best_mcc
         row["best_factor"]           = best_alpha
+        # Why is the best-α MCC a gap? 'ok' if any factor produced a finite MCC,
+        # else the set of per-factor reasons that blocked it.
+        if np.isfinite(best_mcc):
+            row["best_mcc_reason"] = "ok"
+        else:
+            row["best_mcc_reason"] = ";".join(sorted(set(factor_reasons))) or "no_factors"
         layer_rows.append(row)
 
     return pd.DataFrame(layer_rows).sort_values("layer").reset_index(drop=True)
@@ -1617,13 +1709,27 @@ def main():
         args.behavior, args.fluency_threshold, args.min_examples,
     )
     layer_df.to_csv(out_dir / "per_layer_summary.csv", index=False)
-    logger.warning("\nPer-layer summary:")
+    logger.warning("\nPer-layer summary (unsteered row accounting + confusion matrix):")
     for _, r in layer_df.iterrows():
-        logger.warning(
-            f"  L{int(r['layer']):2d}: d'={r['dprime']:.3f}  "
-            f"MCC_unst={r['sign_kappa_mcc']:+.3f}  ρ={r['kappa_spearman_rho']:+.3f}  "
-            f"best_MCC={r['best_steered_sign_mcc']:+.3f}@α={r['best_factor']:g}"
+        mcc_unst = r["sign_kappa_mcc"]
+        mcc_str  = f"{mcc_unst:+.3f}" if np.isfinite(mcc_unst) else f"NaN[{r.get('mcc_reason_0','?')}]"
+        best_mcc = r["best_steered_sign_mcc"]
+        best_str = (
+            f"{best_mcc:+.3f}@α={r['best_factor']:g}" if np.isfinite(best_mcc)
+            else f"NaN[{r.get('best_mcc_reason','?')}]"
         )
+        logger.warning(
+            f"  L{int(r['layer']):2d}: d'={r['dprime']:.3f}  ρ={r['kappa_spearman_rho']:+.3f}  "
+            f"| fluency-filter: kept {int(r['n_unsteered_filt'])}/{int(r['n_unsteered_raw'])} "
+            f"(removed {int(r['n_unsteered_removed'])}, no-label {int(r['n_unsteered_nolabel'])})  "
+            f"| MCC pos/neg={int(r['mcc_n_pos_0'])}/{int(r['mcc_n_neg_0'])} "
+            f"TP/TN/FP/FN={int(r['mcc_tp_0'])}/{int(r['mcc_tn_0'])}/{int(r['mcc_fp_0'])}/{int(r['mcc_fn_0'])}  "
+            f"MCC_unst={mcc_str}  best_MCC={best_str}"
+        )
+        if not np.isfinite(mcc_unst):
+            logger.warning(
+                f"       ↳ L{int(r['layer'])} unsteered MCC is a GAP — reason: {r.get('mcc_reason_0','?')}"
+            )
 
     # ── Cross-layer correlations ───────────────────────────────────────────
     cross_rows = []
