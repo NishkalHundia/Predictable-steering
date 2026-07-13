@@ -29,6 +29,8 @@ Outputs, under {sweep_dir}/open_ended_projection_plots/:
   plots/
     histogram_layer_{L}.png
     match_rate_and_dprime.png
+    best_match_rate_by_layer.png (best match rate across steered factors per
+                                   layer, i.e. which α is best at each layer)
     avg_score_and_dprime.png
     mcc_test_best_alpha_vs_dprime.png (best α chosen on the same test prompts
                                         the MCC is evaluated on — there's no
@@ -411,6 +413,17 @@ def compute_layer_summary(
         row["sign_mcc_test_best_alpha"] = best_test_mcc
         row["best_factor_test"] = best_test_alpha
 
+        # best match rate across steered factors (which α gets the most prompts
+        # judged as exhibiting the behavior, at this layer)
+        best_match_rate, best_match_rate_alpha = float("nan"), float("nan")
+        for f in non_zero:
+            tag = f"{f:g}"
+            mr = row.get(f"match_rate_{tag}", float("nan"))
+            if np.isfinite(mr) and (np.isnan(best_match_rate) or mr > best_match_rate):
+                best_match_rate, best_match_rate_alpha = mr, f
+        row["best_match_rate"] = best_match_rate
+        row["best_match_rate_factor"] = best_match_rate_alpha
+
         rows.append(row)
 
     return pd.DataFrame(rows).sort_values("layer").reset_index(drop=True)
@@ -541,6 +554,49 @@ def plot_match_rate_and_dprime(layer_df: pd.DataFrame, factors: list[float],
     ax1.legend(h1 + h2, l1 + l2, title="Steering factor / metric", fontsize=9,
                loc="best", framealpha=0.85)
     ax1.set_title(f"{behavior}: Behavior match rate & training d' by layer", fontsize=11, fontweight="bold")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close()
+
+
+def plot_best_match_rate_by_layer(layer_df: pd.DataFrame, behavior: str, out_path: Path):
+    """Best match rate across steered factors per layer (which α is best), vs training d'."""
+    if not np.any(np.isfinite(layer_df.get("best_match_rate", pd.Series(dtype=float)).values)):
+        return
+    layers = layer_df["layer"].values
+    fig, ax1 = plt.subplots(figsize=(13, 5))
+
+    ax1.plot(layers, layer_df.get("match_rate_0", pd.Series(dtype=float)).values,
+             "D--", color="gray", linewidth=1.5, markersize=6,
+             label="Baseline (α=0)", alpha=0.8, zorder=3)
+    ax1.plot(layers, layer_df["best_match_rate"].values, "o-", color="#2E86AB",
+             linewidth=2.5, markersize=7, label="Best match rate (best α per layer)", zorder=3)
+
+    for x, y, f in zip(layers, layer_df["best_match_rate"].values,
+                       layer_df["best_match_rate_factor"].values):
+        if np.isfinite(y) and np.isfinite(f):
+            ax1.annotate(f"α={f:g}", (x, y), textcoords="offset points",
+                        xytext=(0, 7), ha="center", fontsize=7, color="#2E86AB")
+
+    ax1.set_xlabel("Layer", fontsize=11)
+    ax1.set_ylabel("Behavior match rate (fraction of prompts)", fontsize=11)
+    ax1.set_ylim(0, 1.1)
+    ax1.set_xticks(layers)
+
+    ax2 = ax1.twinx()
+    if layer_df["dprime"].notna().any():
+        ax2.fill_between(layers, layer_df["dprime"].values, alpha=0.12, color="steelblue")
+        ax2.plot(layers, layer_df["dprime"].values, "s:", color="steelblue",
+                 linewidth=1.5, markersize=5, label="d' (train)", zorder=2)
+        ax2.set_ylabel("d' (training discriminability)", fontsize=11, color="steelblue")
+        ax2.tick_params(axis="y", labelcolor="steelblue")
+        ax2.set_ylim(bottom=0)
+
+    h1, l1 = ax1.get_legend_handles_labels()
+    h2, l2 = ax2.get_legend_handles_labels()
+    ax1.legend(h1 + h2, l1 + l2, fontsize=9, loc="best", framealpha=0.85)
+    ax1.set_title(f"{behavior}: Best behavior match rate (best α per layer) & training d'",
+                 fontsize=11, fontweight="bold")
     plt.tight_layout()
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close()
@@ -707,6 +763,8 @@ def main():
 
     plot_match_rate_and_dprime(layer_df, requested_factors, args.behavior,
                                plot_dir / "match_rate_and_dprime.png")
+    plot_best_match_rate_by_layer(layer_df, args.behavior,
+                                  plot_dir / "best_match_rate_by_layer.png")
     plot_avg_score_and_dprime(layer_df, requested_factors, args.behavior,
                               plot_dir / "avg_score_and_dprime.png")
     plot_mcc_vs_dprime(
