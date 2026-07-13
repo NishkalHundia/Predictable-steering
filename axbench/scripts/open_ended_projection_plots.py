@@ -24,14 +24,16 @@ comparable to the existing train/baseline κ:
 Outputs, under {sweep_dir}/open_ended_projection_plots/:
   steered_kappa.csv          — one row per (layer, factor, question_idx)
   layer_summary.csv          — one row per layer: dprime, avg score / match
-                                rate / sign-MCC per factor, val-chosen-α MCC
+                                rate / sign-MCC per factor, best-α MCC
   run_summary.json           — args + which requested factors were missing
   plots/
     histogram_layer_{L}.png
     match_rate_and_dprime.png
     avg_score_and_dprime.png
-    mcc_test_best_alpha_vs_dprime.png        (circular: α chosen on test)
-    mcc_val_best_alpha_on_test_vs_dprime.png (α chosen on held-out val half)
+    mcc_test_best_alpha_vs_dprime.png (best α chosen on the same test prompts
+                                        the MCC is evaluated on — there's no
+                                        separate val split for this sweep, so
+                                        this is the only MCC-vs-α variant)
 
 Usage:
     uv run python axbench/scripts/open_ended_projection_plots.py \\
@@ -379,12 +381,6 @@ def compute_layer_summary(
         factors_here = sorted(ldf["factor"].unique())
         non_zero = [f for f in factors_here if abs(f) > FACTOR_TOL]
 
-        # val/test split of the 32 test prompts, by question_idx parity
-        qidx_all = ldf["question_idx"].unique()
-        val_mask_qidx = {q for q in qidx_all if q % 2 == 0}
-
-        val_mcc_by_factor, test_kap_lab_by_factor = {}, {}
-
         for f in factors_here:
             fdf = ldf[ldf["factor"] == f]
             scores = fdf["behavior_score"].apply(
@@ -405,12 +401,6 @@ def compute_layer_summary(
             row[f"mcc_n_used_{tag}"] = diag["n_used"]
             row[f"mcc_reason_{tag}"] = diag["reason"]
 
-            # val/test halves (only meaningful for non-zero, steered factors)
-            is_val = np.array([q in val_mask_qidx for q in fdf["question_idx"].values])
-            val_diag = sign_mcc_with_diag(kappas[is_val], labels[is_val], min_examples)
-            val_mcc_by_factor[f] = val_diag["mcc"]
-            test_kap_lab_by_factor[f] = (kappas[~is_val], labels[~is_val])
-
         # best α chosen on TEST itself (circular; matches mcqa's "test-best" variant)
         best_test_mcc, best_test_alpha = float("nan"), float("nan")
         for f in non_zero:
@@ -420,19 +410,6 @@ def compute_layer_summary(
                 best_test_mcc, best_test_alpha = mcc, f
         row["sign_mcc_test_best_alpha"] = best_test_mcc
         row["best_factor_test"] = best_test_alpha
-
-        # best α chosen on VAL half, MCC evaluated on held-out TEST half
-        best_val_mcc, best_val_alpha = float("nan"), float("nan")
-        for f in non_zero:
-            mcc = val_mcc_by_factor.get(f, float("nan"))
-            if np.isfinite(mcc) and (np.isnan(best_val_mcc) or mcc > best_val_mcc):
-                best_val_mcc, best_val_alpha = mcc, f
-        row["best_factor_val"] = best_val_alpha
-        if np.isfinite(best_val_alpha):
-            k_test, l_test = test_kap_lab_by_factor[best_val_alpha]
-            row["sign_mcc_val_best_on_test"] = sign_mcc_with_diag(k_test, l_test, min_examples)["mcc"]
-        else:
-            row["sign_mcc_val_best_on_test"] = float("nan")
 
         rows.append(row)
 
@@ -738,12 +715,6 @@ def main():
         title=f"{args.behavior}: MCC @ best α per layer (chosen on test — circular)",
         out_path=plot_dir / "mcc_test_best_alpha_vs_dprime.png",
     )
-    plot_mcc_vs_dprime(
-        layer_df, "sign_mcc_val_best_on_test",
-        mcc_label="MCC(sign κ vs steer match | val-chosen α, test prompts)",
-        title=f"{args.behavior}: MCC on held-out test @ best α per layer (α chosen on val half)",
-        out_path=plot_dir / "mcc_val_best_alpha_on_test_vs_dprime.png",
-    )
 
     with open(out_dir / "run_summary.json", "w") as f:
         json.dump({
@@ -753,7 +724,6 @@ def main():
             "requested_factors": requested_factors,
             "missing_factors_by_layer": {str(k): v for k, v in missing_by_layer.items()},
             "min_examples": args.min_examples,
-            "val_split": "question_idx even -> val, odd -> test",
         }, f, indent=2)
 
     logger.warning(f"Done → {out_dir}")
