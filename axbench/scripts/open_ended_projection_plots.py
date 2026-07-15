@@ -25,6 +25,11 @@ Outputs, under {sweep_dir}/open_ended_projection_plots/:
   steered_kappa.csv          — one row per (layer, factor, question_idx)
   layer_summary.csv          — one row per layer: dprime, avg score / match
                                 rate / sign-MCC per factor, best-α MCC
+  r_values.csv               — cross-layer Pearson r (d' vs match rate @ best α,
+                                d' vs sign-MCC @ best α), computed exactly as in
+                                mcqa_projection_link.py. Use --r_value to produce
+                                just this table (skip plots; add --replot_only to
+                                reuse cached steered_kappa.csv without GPU).
   run_summary.json           — args + which requested factors were missing
   plots/
     histogram_layer_{L}.png
@@ -55,6 +60,7 @@ import pandas as pd
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from sklearn.metrics import matthews_corrcoef
+from scipy import stats as scipy_stats
 
 import matplotlib
 matplotlib.use("Agg")
@@ -430,6 +436,62 @@ def compute_layer_summary(
 
 
 # ---------------------------------------------------------------------------
+# Cross-layer Pearson r values (mirrors mcqa_projection_link.py exactly:
+# mask both columns notna, require >= 3 layers, require nonzero std, then
+# scipy.stats.pearsonr).
+# ---------------------------------------------------------------------------
+def pearson_across_layers(layer_df: pd.DataFrame, x_col: str, y_col: str) -> dict | None:
+    if x_col not in layer_df.columns or y_col not in layer_df.columns:
+        return None
+    mask = layer_df[x_col].notna() & layer_df[y_col].notna()
+    if mask.sum() < 3:
+        return None
+    xv = layer_df.loc[mask, x_col].values.astype(float)
+    yv = layer_df.loc[mask, y_col].values.astype(float)
+    if np.nanstd(xv) <= 1e-12 or np.nanstd(yv) <= 1e-12:
+        return None
+    r, p = scipy_stats.pearsonr(xv, yv)
+    return {"pearson_r": float(r), "pearson_p": float(p), "n_layers": int(mask.sum())}
+
+
+def compute_r_values(layer_df: pd.DataFrame, behavior: str) -> tuple[pd.DataFrame, dict]:
+    """
+    Two cross-layer Pearson r values, both at the best α chosen per layer on
+    test (matching the existing 'test-best' MCC/match-rate columns):
+      - d' vs best_match_rate         ("accuracy" at best α per layer)
+      - d' vs sign_mcc_test_best_alpha (sign-MCC at best α per layer)
+    """
+    specs = [
+        ("dprime_vs_match_rate_best_alpha", "dprime", "best_match_rate",
+         "d' vs match rate @ best α per layer"),
+        ("dprime_vs_sign_mcc_best_alpha", "dprime", "sign_mcc_test_best_alpha",
+         "d' vs sign-MCC @ best α per layer"),
+    ]
+    rows = []
+    blob: dict = {}
+    for key, x_col, y_col, label in specs:
+        res = pearson_across_layers(layer_df, y_col, x_col)  # r is symmetric
+        blob[key] = res
+        rows.append({
+            "comparison": key,
+            "label": label,
+            "pearson_r": res["pearson_r"] if res else float("nan"),
+            "pearson_p": res["pearson_p"] if res else float("nan"),
+            "n_layers": res["n_layers"] if res else 0,
+        })
+        if res:
+            sig = "*" if res["pearson_p"] < 0.05 else " "
+            logger.warning(
+                f"{behavior}: Pearson across layers — {label}: "
+                f"r={res['pearson_r']:+.4f} (p={res['pearson_p']:.4g}){sig}  "
+                f"(n={res['n_layers']} layers)"
+            )
+        else:
+            logger.warning(f"{behavior}: Pearson across layers — {label}: insufficient data")
+    return pd.DataFrame(rows), blob
+
+
+# ---------------------------------------------------------------------------
 # Plots
 # ---------------------------------------------------------------------------
 def plot_projection_histograms(
@@ -696,6 +758,12 @@ def main():
     parser.add_argument("--out_dir", type=str, default=None)
     parser.add_argument("--replot_only", action="store_true",
                         help="Skip GPU extraction; reuse cached steered_kappa.csv")
+    parser.add_argument("--r_value", action="store_true",
+                        help="Only compute the cross-layer Pearson r table "
+                             "(d' vs match rate / sign-MCC at best α per layer) "
+                             "and write r_values.csv; skip all plotting. "
+                             "Combine with --replot_only to reuse cached "
+                             "steered_kappa.csv and avoid GPU extraction.")
     args = parser.parse_args()
 
     sweep_dir = Path(args.sweep_dir or f"/vol/filtered_sweep/gemma-2-9b-it/{args.behavior}-sweep")
@@ -751,6 +819,25 @@ def main():
     )
     layer_df.to_csv(out_dir / "layer_summary.csv", index=False)
 
+    # ---- Cross-layer Pearson r table (d' vs match rate / sign-MCC @ best α) ----
+    r_df, r_blob = compute_r_values(layer_df, args.behavior)
+    r_df.to_csv(out_dir / "r_values.csv", index=False)
+    logger.warning(f"Saved r-value table → {out_dir / 'r_values.csv'}")
+
+    if args.r_value:
+        with open(out_dir / "run_summary.json", "w") as f:
+            json.dump({
+                "behavior": args.behavior,
+                "sweep_dir": str(sweep_dir),
+                "layers": layers,
+                "requested_factors": requested_factors,
+                "missing_factors_by_layer": {str(k): v for k, v in missing_by_layer.items()},
+                "min_examples": args.min_examples,
+                "r_values": r_blob,
+            }, f, indent=2)
+        logger.warning(f"--r_value: r table only, skipping plots. Done → {out_dir}")
+        return
+
     # ---- Plots ----
     train_kappa = load_train_kappa(sweep_dir)
     threshold = BEHAVIOR_THRESHOLDS[args.behavior]
@@ -782,6 +869,7 @@ def main():
             "requested_factors": requested_factors,
             "missing_factors_by_layer": {str(k): v for k, v in missing_by_layer.items()},
             "min_examples": args.min_examples,
+            "r_values": r_blob,
         }, f, indent=2)
 
     logger.warning(f"Done → {out_dir}")
