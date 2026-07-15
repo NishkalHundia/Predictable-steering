@@ -25,9 +25,11 @@ Outputs, under {sweep_dir}/open_ended_projection_plots/:
   steered_kappa.csv          — one row per (layer, factor, question_idx)
   layer_summary.csv          — one row per layer: dprime, avg score / match
                                 rate / sign-MCC per factor, best-α MCC
-  r_values.csv               — cross-layer Pearson r (d' vs match rate @ best α,
-                                d' vs sign-MCC @ best α), computed exactly as in
-                                mcqa_projection_link.py. Use --r_value to produce
+  r_values.csv               — cross-layer Pearson r under the SINGLE SHARED
+                                best-α definition: α is chosen per layer by match
+                                rate, then BOTH d' vs match rate AND d' vs sign-MCC
+                                are read at that SAME α (mirrors mcqa_projection_link.py
+                                / dprime_best_alpha_corr_open_ended.py). Use --r_value to produce
                                 just this table (skip plots; add --replot_only to
                                 reuse cached steered_kappa.csv without GPU).
   run_summary.json           — args + which requested factors were missing
@@ -430,6 +432,15 @@ def compute_layer_summary(
         row["best_match_rate"] = best_match_rate
         row["best_match_rate_factor"] = best_match_rate_alpha
 
+        # sign-MCC read at the ACCURACY-chosen α (single shared best α: pick α by
+        # match rate, then read the MCC at that SAME α — matches MCQA reading its
+        # MCC at the accuracy-chosen best α, and dprime_best_alpha_corr_open_ended.py)
+        if np.isfinite(best_match_rate_alpha):
+            row["sign_mcc_at_match_rate_best_alpha"] = row.get(
+                f"sign_mcc_{best_match_rate_alpha:g}", float("nan"))
+        else:
+            row["sign_mcc_at_match_rate_best_alpha"] = float("nan")
+
         rows.append(row)
 
     return pd.DataFrame(rows).sort_values("layer").reset_index(drop=True)
@@ -456,16 +467,18 @@ def pearson_across_layers(layer_df: pd.DataFrame, x_col: str, y_col: str) -> dic
 
 def compute_r_values(layer_df: pd.DataFrame, behavior: str) -> tuple[pd.DataFrame, dict]:
     """
-    Two cross-layer Pearson r values, both at the best α chosen per layer on
-    test (matching the existing 'test-best' MCC/match-rate columns):
-      - d' vs best_match_rate         ("accuracy" at best α per layer)
-      - d' vs sign_mcc_test_best_alpha (sign-MCC at best α per layer)
+    Two cross-layer Pearson r values under the SINGLE SHARED best-α definition:
+    per layer, ONE α is chosen by match rate (argmax), and BOTH metrics are read
+    at that same α — exactly as MCQA reads its MCC at the accuracy-chosen best α
+    (and as dprime_best_alpha_corr_open_ended.py).
+      - d' vs best_match_rate                    ("accuracy" @ match-rate-best α)
+      - d' vs sign_mcc_at_match_rate_best_alpha   (sign-MCC @ that SAME α)
     """
     specs = [
         ("dprime_vs_match_rate_best_alpha", "dprime", "best_match_rate",
          "d' vs match rate @ best α per layer"),
-        ("dprime_vs_sign_mcc_best_alpha", "dprime", "sign_mcc_test_best_alpha",
-         "d' vs sign-MCC @ best α per layer"),
+        ("dprime_vs_sign_mcc_best_alpha", "dprime", "sign_mcc_at_match_rate_best_alpha",
+         "d' vs sign-MCC @ match-rate-best α per layer"),
     ]
     rows = []
     blob: dict = {}
