@@ -1,0 +1,19 @@
+---
+description: Always use the nishkalhundia Modal profile for this repo
+alwaysApply: true
+---
+
+# Modal profile
+
+For any Modal command in this repo (`modal run`, `modal app`, `modal volume`, `modal secret`, etc.), always use the **`nishkalhundia`** profile.
+
+```bash
+# ✅ GOOD
+modal run --profile nishkalhundia --detach run_modal_prompted_sweep.py
+MODAL_PROFILE=nishkalhundia modal app logs steering-prompted-sweep
+
+# ❌ BAD — default / other profiles (e.g. swastik3)
+modal run --detach run_modal_prompted_sweep.py
+```
+
+Also set `MODAL_PROFILE=nishkalhundia` in subprocess / script environments when spawning Modal jobs from this workspace.
