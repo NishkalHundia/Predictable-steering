@@ -85,6 +85,12 @@ BEHAVIOR_SCALES = {
 # Midpoint threshold for binarizing continuous scores → Sign MCC labels
 BEHAVIOR_THRESHOLDS = {b: (mn + mx) / 2.0 for b, (mn, mx, _) in BEHAVIOR_SCALES.items()}
 
+# Minimum fluency-filtered sample count for a (layer, α) metric to be trusted.
+# Metrics computed from fewer rows are masked to NaN before best-α selection
+# and correlations, so a lucky/unlucky small-n α can't win best-match-rate or
+# skew d' correlations (mirrors reanalyze_projection_filt28.py's apply_filt28).
+MIN_FILT = 28
+
 # Phase-0 prompt prefixes. Prepended to the question; DiffMean is taken at the
 # last token of that cue+question prompt (with generation prompt / assistant
 # header), *not* after a response. Matching = pos (label 1), not_matching =
@@ -1184,12 +1190,18 @@ def compute_per_layer_summary(
             "mcc_fp_0":     diag0["fp"],
             "mcc_fn_0":     diag0["fn"],
             "mcc_reason_0": diag0["reason"],                  # why NaN (gap) if not 'ok'
-            "sign_kappa_mcc":     diag0["mcc"],
+            # n_filt < MIN_FILT → mask the point-estimate metrics (not the diagnostics)
+            # so a lucky/unlucky handful of fluent rows can't masquerade as a real signal.
+            "sign_kappa_mcc":     diag0["mcc"] if n_kept0 >= MIN_FILT else float("nan"),
             "kappa_spearman_rho": rho0,
             "kappa_spearman_p":   rho0_p,
-            "avg_behavior_score_0": float(scores0[valid0].mean()) if valid0.sum() else float("nan"),
+            "avg_behavior_score_0": (
+                float(scores0[valid0].mean()) if valid0.sum() and n_kept0 >= MIN_FILT else float("nan")
+            ),
             # fraction of fluent, labelled prompts that display the behavior (score > threshold)
-            "match_rate_0": float((labels0[valid0] == 1).mean()) if valid0.sum() else float("nan"),
+            "match_rate_0": (
+                float((labels0[valid0] == 1).mean()) if valid0.sum() and n_kept0 >= MIN_FILT else float("nan")
+            ),
         }
 
         # ---- steered metrics ----
@@ -1222,7 +1234,14 @@ def compute_per_layer_summary(
             match_rate_a = float((labs[valid] == 1).mean()) if valid.sum() else float("nan")
             factor_reasons.append(diag_a["reason"])
 
-            row[f"steered_sign_mcc_{alpha:g}"]    = diag_a["mcc"]
+            # n_filt < MIN_FILT → mask the point-estimate metrics before they can
+            # win best-α selection or feed the d' correlations.
+            mcc_a = diag_a["mcc"] if n_kept_a >= MIN_FILT else float("nan")
+            if n_kept_a < MIN_FILT:
+                avg_scr = float("nan")
+                match_rate_a = float("nan")
+
+            row[f"steered_sign_mcc_{alpha:g}"]    = mcc_a
             row[f"avg_steered_behavior_{alpha:g}"] = avg_scr
             row[f"match_rate_{alpha:g}"]          = match_rate_a
             # row accounting (fluency filter) per factor
@@ -1240,8 +1259,8 @@ def compute_per_layer_summary(
             row[f"mcc_fn_{alpha:g}"]     = diag_a["fn"]
             row[f"mcc_reason_{alpha:g}"] = diag_a["reason"]
 
-            if np.isfinite(diag_a["mcc"]) and (np.isnan(best_mcc) or diag_a["mcc"] > best_mcc):
-                best_mcc   = diag_a["mcc"]
+            if np.isfinite(mcc_a) and (np.isnan(best_mcc) or mcc_a > best_mcc):
+                best_mcc   = mcc_a
                 best_alpha = alpha
             if np.isfinite(match_rate_a) and (
                 np.isnan(best_match_rate) or match_rate_a > best_match_rate
@@ -1290,6 +1309,8 @@ def build_dprime_best_alpha_points(layer_df: pd.DataFrame, behavior: str) -> pd.
             "accuracy_at_best_alpha": float(acc),
             "sign_mcc_at_best_alpha": mcc,
             "mcc_used_in_corr": bool(np.isfinite(mcc)),
+            "match_rate_1": float(r.get("match_rate_1", float("nan"))),
+            "avg_steered_behavior_1": float(r.get("avg_steered_behavior_1", float("nan"))),
         })
     return pd.DataFrame(rows)
 
@@ -1321,7 +1342,10 @@ def compute_dprime_best_alpha_corr(layer_df: pd.DataFrame, behavior: str):
         return (float(pr), float(pp), float(rho), float(sp), int(m.sum()))
 
     rows = []
-    for target in ("accuracy_at_best_alpha", "sign_mcc_at_best_alpha"):
+    for target in (
+        "accuracy_at_best_alpha", "sign_mcc_at_best_alpha",
+        "match_rate_1", "avg_steered_behavior_1",
+    ):
         pr, pp, rho, sp, n = _corr(dprime, points[target].to_numpy(float))
         rows.append({
             "behavior": behavior, "predictor": "dprime", "target": target,
