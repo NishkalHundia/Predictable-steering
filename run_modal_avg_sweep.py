@@ -74,8 +74,9 @@ OUTPUT_ROOT = "/vol/open_ended_projection_average"
 def _paths(behavior):
     train = f"/vol/prompted_datasets/generated/{behavior}/train_contrastive.json"
     test = f"/vol/prompted_datasets/generated/{behavior}/test_contrastive.json"
+    val = f"/vol/prompted_datasets/generated/{behavior}/val_contrastive.json"
     output_dir = f"{OUTPUT_ROOT}/{behavior}"
-    return train, test, output_dir
+    return train, test, val, output_dir
 
 
 def _normalize_hf_token():
@@ -109,15 +110,18 @@ def _normalize_hf_token():
     secrets=SECRETS,
     max_containers=len(BEHAVIORS),
 )
-def run_one(behavior: str) -> tuple[str, str]:
+def run_one(behavior: str, val_only: bool = False) -> tuple[str, str]:
     _normalize_hf_token()
-    train_path, test_path, output_dir = _paths(behavior)
-    verb = "REPLOT" if REPLOT_ONLY else "START"
+    train_path, test_path, val_path, output_dir = _paths(behavior)
+    verb = "VAL-ONLY" if val_only else ("REPLOT" if REPLOT_ONLY else "START")
     print(f"\n=== {verb} {DIFFMEAN_MODE} {behavior} → {output_dir} ===", flush=True)
 
-    if FORCE_RECOMPUTE:
+    # --val_only reuses cached Phase 0 + test — never wipe those caches for it.
+    force_recompute = FORCE_RECOMPUTE and not val_only
+    if force_recompute:
         for fname in ("steering_state.pt", "dprime.json",
-                      "train_projections.json", "per_prompt_results.csv"):
+                      "train_projections.json", "per_prompt_results.csv",
+                      "per_prompt_results_val.csv"):
             p = os.path.join(output_dir, fname)
             if os.path.exists(p):
                 os.remove(p)
@@ -129,6 +133,7 @@ def run_one(behavior: str) -> tuple[str, str]:
         "--behavior", behavior,
         "--train_path", train_path,
         "--test_path", test_path,
+        "--val_path", val_path,
         "--output_dir", output_dir,
         "--layers", LAYERS,
         "--factors", FACTORS,
@@ -138,9 +143,11 @@ def run_one(behavior: str) -> tuple[str, str]:
         "--min_examples", MIN_EXAMPLES,
         "--hist_layers", HIST_LAYERS,
     ]
-    if REPLOT_ONLY:
+    if val_only:
+        cmd.append("--val_only")
+    elif REPLOT_ONLY:
         cmd += ["--replot_only"]
-    if FORCE_RECOMPUTE:
+    if force_recompute:
         cmd.append("--force_recompute")
     print("Running:", " ".join(cmd), flush=True)
     try:

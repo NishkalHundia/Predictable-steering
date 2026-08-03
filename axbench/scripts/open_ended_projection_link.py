@@ -1394,6 +1394,119 @@ def compute_dprime_best_alpha_corr(layer_df: pd.DataFrame, behavior: str):
 
 
 # ---------------------------------------------------------------------------
+# Val-set-chosen α → test-set performance (avoids picking α by peeking at test)
+# ---------------------------------------------------------------------------
+def select_val_alpha_with_fallback(
+    val_layer_df: pd.DataFrame,
+    test_layer_df: pd.DataFrame,
+    non_zero_factors: list[float],
+) -> pd.DataFrame:
+    """Per layer: rank α by VAL match_rate (only α where val's own n_filt≥MIN_FILT
+    left match_rate finite — see apply_filt28-style masking in
+    compute_per_layer_summary), then walk that ranking (best first, ties broken
+    by ascending α) and pick the first α whose TEST match_rate is ALSO finite
+    (i.e. test n_filt≥MIN_FILT there too). If no candidate α clears both bars,
+    chosen_alpha is NaN for that layer — it drops out of the d' correlation
+    like any other gap.
+
+    Returns one row per layer: layer, n_val_candidates (how many α passed the
+    val-side filter), val_rank_used (1-indexed position in the ranking that
+    was finally chosen; NaN if none), chosen_alpha, val_match_rate_at_chosen.
+    """
+    val_by_layer  = val_layer_df.set_index("layer")
+    test_by_layer = test_layer_df.set_index("layer")
+    rows = []
+    for layer, vrow in val_by_layer.iterrows():
+        candidates = []
+        for a in non_zero_factors:
+            col = f"match_rate_{a:g}"
+            if col in vrow.index and pd.notna(vrow[col]):
+                candidates.append((float(vrow[col]), a))
+        candidates.sort(key=lambda t: (-t[0], t[1]))  # best match_rate first, ties → smaller α
+
+        chosen_alpha, val_mr_at_chosen, rank_used = float("nan"), float("nan"), float("nan")
+        if layer in test_by_layer.index:
+            trow = test_by_layer.loc[layer]
+            for i, (vmr, a) in enumerate(candidates, start=1):
+                tcol = f"match_rate_{a:g}"
+                if tcol in trow.index and pd.notna(trow[tcol]):
+                    chosen_alpha, val_mr_at_chosen, rank_used = a, vmr, i
+                    break
+
+        rows.append({
+            "layer": int(layer),
+            "n_val_candidates": len(candidates),
+            "val_rank_used": rank_used,
+            "chosen_alpha": chosen_alpha,
+            "val_match_rate_at_chosen": val_mr_at_chosen,
+        })
+    return pd.DataFrame(rows)
+
+
+def build_dprime_val_alpha_points(
+    selection_df: pd.DataFrame,
+    test_layer_df: pd.DataFrame,
+    dprimes: dict,
+    behavior: str,
+) -> pd.DataFrame:
+    """Per-layer (d', test performance @ val-chosen α) datapoints — the EXACT
+    rows fed to compute_dprime_val_alpha_corr."""
+    test_by_layer = test_layer_df.set_index("layer")
+    rows = []
+    for _, r in selection_df.iterrows():
+        layer = int(r["layer"])
+        a = r["chosen_alpha"]
+        a_str = None
+        test_mr = test_avg = test_mcc = float("nan")
+        if pd.notna(a) and layer in test_by_layer.index:
+            a_str = f"{a:g}"
+            trow = test_by_layer.loc[layer]
+            test_mr  = float(trow.get(f"match_rate_{a_str}", float("nan")))
+            test_avg = float(trow.get(f"avg_steered_behavior_{a_str}", float("nan")))
+            test_mcc = float(trow.get(f"steered_sign_mcc_{a_str}", float("nan")))
+        rows.append({
+            "behavior": behavior,
+            "layer": layer,
+            "dprime": float(dprimes.get(layer, float("nan"))),
+            "val_rank_used": r["val_rank_used"],
+            "chosen_alpha": a_str,
+            "val_match_rate_at_chosen": r["val_match_rate_at_chosen"],
+            "test_match_rate_at_chosen": test_mr,
+            "test_avg_behavior_at_chosen": test_avg,
+            "test_sign_mcc_at_chosen": test_mcc,
+        })
+    return pd.DataFrame(rows)
+
+
+def compute_dprime_val_alpha_corr(points_df: pd.DataFrame, behavior: str) -> pd.DataFrame:
+    """d' vs {match_rate, avg_behavior, sign-MCC} at the α chosen on the VAL
+    set (with test-fluency fallback) — the val-selection analogue of
+    compute_dprime_best_alpha_corr, which instead picks α by peeking at test."""
+    dprime = points_df["dprime"].to_numpy(float)
+
+    def _corr(x, y):
+        x = np.asarray(x, float); y = np.asarray(y, float)
+        m = ~(np.isnan(x) | np.isnan(y))
+        if m.sum() < 3 or np.std(x[m]) < 1e-9 or np.std(y[m]) < 1e-9:
+            return (float("nan"), float("nan"), float("nan"), float("nan"), int(m.sum()))
+        pr, pp = scipy_stats.pearsonr(x[m], y[m])
+        rho, sp = scipy_stats.spearmanr(x[m], y[m])
+        return (float(pr), float(pp), float(rho), float(sp), int(m.sum()))
+
+    rows = []
+    for target in (
+        "test_match_rate_at_chosen", "test_avg_behavior_at_chosen", "test_sign_mcc_at_chosen",
+    ):
+        pr, pp, rho, sp, n = _corr(dprime, points_df[target].to_numpy(float))
+        rows.append({
+            "behavior": behavior, "predictor": "dprime", "target": target,
+            "pearson_r": pr, "pearson_p": pp,
+            "spearman_rho": rho, "spearman_p": sp, "n_layers": n,
+        })
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
 # Plots
 # ---------------------------------------------------------------------------
 def plot_mcc_vs_dprime(
@@ -1750,6 +1863,54 @@ def plot_mcc_by_layer(
 
 
 # ---------------------------------------------------------------------------
+# Run Phase A/B + (optionally) LM judge for one split, save to CSV.
+# Factored out so val can reuse it (from the normal run when val needs
+# (re)generating, and from --val_only) without duplicating the test-path code.
+# ---------------------------------------------------------------------------
+def run_phase_ab_and_judge(
+    model, tokenizer, items, layers, nzero_factors,
+    steering_vecs, mu_poss, mu_negs, eos_ids, device, pad_id,
+    batch_size, max_new_tokens, prefix_length, kappa_mode,
+    behavior, judge_model, max_concurrent, skip_judge, out_csv, split_label,
+):
+    phase_a = phase_a_gpu(
+        model, tokenizer, items, layers, mu_poss, mu_negs,
+        eos_ids, device, pad_id, batch_size, max_new_tokens, kappa_mode=kappa_mode,
+    )
+    phase_b = phase_b_gpu(
+        model, tokenizer, items, layers, nzero_factors,
+        steering_vecs, mu_poss, mu_negs, eos_ids, device, pad_id,
+        batch_size, max_new_tokens, prefix_length, kappa_mode=kappa_mode,
+    )
+    df = build_per_prompt_df(phase_a, phase_b, layers, nzero_factors)
+    df.to_csv(out_csv, index=False)
+    logger.warning(f"Saved {len(df)} {split_label} rows (no scores yet) → {out_csv}")
+
+    if not skip_judge:
+        if not __import__("os").environ.get("OPENAI_API_KEY"):
+            logger.error(
+                f"OPENAI_API_KEY not set. {split_label} generations saved to {out_csv}. "
+                "Set the key and re-run (--rejudge_only for test, --val_only for val)."
+            )
+            sys.exit(1)
+        judge = AsyncJudge(model=judge_model, max_concurrent=max_concurrent)
+
+        async def _judge_all():
+            try:
+                await run_judges(phase_a, phase_b, behavior, judge)
+            finally:
+                await judge.close()
+
+        asyncio.run(_judge_all())
+        df = build_per_prompt_df(phase_a, phase_b, layers, nzero_factors)
+        df.to_csv(out_csv, index=False)
+        logger.warning(f"Saved {len(df)} {split_label} rows (with scores) → {out_csv}")
+    else:
+        logger.warning(f"Skipping judge calls for {split_label} (--skip_judge).")
+    return df
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
@@ -1764,6 +1925,10 @@ def main():
                         help="Path to train_contrastive.json (128 pairs)")
     parser.add_argument("--test_path",  default=None,
                         help="Path to test_contrastive.json  (32 examples)")
+    parser.add_argument("--val_path",  default=None,
+                        help="Path to val_contrastive.json. If missing for this "
+                             "behavior, val generation/analysis is skipped with a "
+                             "warning (not an error) unless --val_only is set.")
     parser.add_argument("--output_dir", default=None)
     parser.add_argument("--layers", default="10-32",
                         help="'10-32' or '10,15,20,32'")
@@ -1799,6 +1964,14 @@ def main():
     parser.add_argument("--replot_only", action="store_true",
                         help="Load existing per_prompt_results.csv and re-run "
                              "analysis/plots only — no GPU, no judge calls.")
+    parser.add_argument("--val_only", action="store_true",
+                        help="Skip Phase 0 and the test phase entirely — reuse the "
+                             "cached steering vectors (steering_state.pt) and cached "
+                             "test per_prompt_results.csv — and only (re)generate + "
+                             "(re)judge the val set, then recompute the val-α "
+                             "cross-layer correlations. Requires both caches to "
+                             "already exist (run the full pipeline first). Always "
+                             "regenerates val (ignores any cached per_prompt_results_val.csv).")
     parser.add_argument("--hist_layers", default=None,
                         help="Comma-separated layers for projection histograms "
                              "(default: first, middle, last)")
@@ -1828,8 +2001,13 @@ def main():
         args.test_path
         or f"datasets/generated/{args.behavior}/test_contrastive.json"
     )
+    val_path = Path(
+        args.val_path
+        or f"datasets/generated/{args.behavior}/val_contrastive.json"
+    )
 
-    per_prompt_csv = out_dir / "per_prompt_results.csv"
+    per_prompt_csv     = out_dir / "per_prompt_results.csv"
+    per_prompt_csv_val = out_dir / "per_prompt_results_val.csv"
     dprime_json    = out_dir / "dprime.json"
     train_proj_json = out_dir / "train_projections.json"
     steering_pt    = out_dir / "steering_state.pt"
@@ -1840,10 +2018,22 @@ def main():
         test_data = json.load(f)
     logger.warning(f"Train: {len(train_data)} pairs  |  Test: {len(test_data)} examples")
 
+    val_data = None
+    if val_path.exists():
+        with open(val_path) as f:
+            val_data = json.load(f)
+        logger.warning(f"Val: {len(val_data)} examples")
+    elif args.val_only:
+        logger.error(f"--val_only requires an existing val set at {val_path}")
+        sys.exit(1)
+    else:
+        logger.warning(f"No val set found at {val_path} — skipping val phase/analysis.")
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.warning(f"Device: {device}")
 
     # ── Load or recompute per_prompt_results ──────────────────────────────
+    # (--val_only never forces test regeneration — it relies on this cache existing.)
     per_prompt_df = None
     if not args.force_recompute and per_prompt_csv.exists():
         try:
@@ -1864,11 +2054,31 @@ def main():
         train_projs = {int(k): v for k, v in raw.items()}
         logger.warning(f"Loaded train projections for {len(train_projs)} layers")
 
+    # ── Load or recompute per_prompt_results (val) ────────────────────────
+    # --val_only always regenerates (that's the point of the flag); otherwise
+    # reuse the cache unless --force_recompute.
+    per_prompt_df_val = None
+    if (
+        val_data is not None and not args.force_recompute and not args.val_only
+        and per_prompt_csv_val.exists()
+    ):
+        try:
+            per_prompt_df_val = pd.read_csv(per_prompt_csv_val)
+            logger.warning(f"Loaded cached {per_prompt_csv_val} ({len(per_prompt_df_val)} rows)")
+        except Exception as e:
+            logger.warning(f"Could not load cached val CSV: {e}")
+    need_val_gen = (val_data is not None) and (per_prompt_df_val is None)
+
     # ── Replot only path (no GPU, no judge) ──────────────────────────────
     if args.replot_only:
         if per_prompt_df is None:
             logger.error(f"--replot_only requires an existing {per_prompt_csv}")
             sys.exit(1)
+        if need_val_gen:
+            logger.warning(
+                "--replot_only: no cached val results — skipping val-α analysis "
+                "(no GPU available in this mode)."
+            )
         logger.warning("--replot_only: skipping GPU and judge phases.")
         # Fall through to analysis section below.
 
@@ -1886,13 +2096,79 @@ def main():
             try:
                 # force=True overwrites all scores, not just NaN ones
                 n = await fill_missing_scores(per_prompt_df, args.behavior, judge, force=True)
-                logger.warning(f"Judged {n} generations total.")
+                logger.warning(f"Judged {n} generations (test) total.")
+                if per_prompt_df_val is not None:
+                    nv = await fill_missing_scores(per_prompt_df_val, args.behavior, judge, force=True)
+                    logger.warning(f"Judged {nv} generations (val) total.")
             finally:
                 await judge.close()
 
         asyncio.run(_rejudge())
         per_prompt_df.to_csv(per_prompt_csv, index=False)
         logger.warning(f"Overwrote {per_prompt_csv} with fresh scores.")
+        if per_prompt_df_val is not None:
+            per_prompt_df_val.to_csv(per_prompt_csv_val, index=False)
+            logger.warning(f"Overwrote {per_prompt_csv_val} with fresh scores.")
+        # Fall through to analysis section below.
+
+    # ── Val-only path: reuse cached Phase 0 + test, only (re)do val ───────
+    elif args.val_only:
+        if per_prompt_df is None:
+            logger.error(
+                f"--val_only requires an existing {per_prompt_csv} (test). "
+                "Run the full pipeline first."
+            )
+            sys.exit(1)
+        if not steering_pt.exists():
+            logger.error(
+                f"--val_only requires cached steering vectors at {steering_pt}. "
+                "Run the full pipeline first."
+            )
+            sys.exit(1)
+
+        logger.warning(f"Loading tokenizer + model: {args.model_name}")
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name, model_max_length=1024)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = "right"
+
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_name,
+            torch_dtype=torch.bfloat16 if args.use_bf16 else None,
+            device_map=device,
+        )
+        model.eval()
+        pad_id = tokenizer.pad_token_id
+        eos_ids = get_eos_ids(tokenizer)
+        prefix_length = get_prefix_length(tokenizer) if args.model_name in CHAT_MODELS else 1
+
+        blob = torch.load(steering_pt, map_location=device)
+        layers = [int(l) for l in blob["layers"] if int(l) in layers_req]
+        steering_vecs = {int(l): blob["steering_vecs"][str(l)].to(device) for l in layers}
+        mu_poss       = {int(l): blob["mu_poss"][str(l)].to(device)       for l in layers}
+        mu_negs       = {int(l): blob["mu_negs"][str(l)].to(device)       for l in layers}
+        logger.warning(f"Loaded steering tensors for {len(layers)} layers (--val_only)")
+
+        val_items = []
+        for idx, item in enumerate(val_data):
+            q = item["question"]
+            val_items.append({
+                "prompt_idx":  idx,
+                "question":    q,
+                "prompt_ids":  build_open_ended_prompt_ids(tokenizer, q),
+            })
+
+        per_prompt_df_val = run_phase_ab_and_judge(
+            model, tokenizer, val_items, layers, nzero_factors,
+            steering_vecs, mu_poss, mu_negs, eos_ids, device, pad_id,
+            args.batch_size, args.max_new_tokens, prefix_length, args.diffmean_mode,
+            args.behavior, args.judge_model, args.max_concurrent, args.skip_judge,
+            per_prompt_csv_val, "val",
+        )
+
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         # Fall through to analysis section below.
 
     elif per_prompt_df is None:
@@ -1979,10 +2255,6 @@ def main():
             kappa_mode=args.diffmean_mode,
         )
 
-        del model
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
         # ── Build DataFrame and save immediately (scores still None) ───
         # Save before judging so generations are never lost if the judge
         # phase fails (e.g. missing API key). --rejudge_only fills scores later.
@@ -2018,6 +2290,81 @@ def main():
                 "Skipping judge calls (--skip_judge). "
                 "Re-run with --rejudge_only to fill scores."
             )
+
+        # ── Val phase (same loaded model, before it's freed) ────────────
+        if need_val_gen:
+            val_items = []
+            for idx, item in enumerate(val_data):
+                q = item["question"]
+                val_items.append({
+                    "prompt_idx":  idx,
+                    "question":    q,
+                    "prompt_ids":  build_open_ended_prompt_ids(tokenizer, q),
+                })
+            per_prompt_df_val = run_phase_ab_and_judge(
+                model, tokenizer, val_items, layers, nzero_factors,
+                steering_vecs, mu_poss, mu_negs, eos_ids, device, pad_id,
+                args.batch_size, args.max_new_tokens, prefix_length, args.diffmean_mode,
+                args.behavior, args.judge_model, args.max_concurrent, args.skip_judge,
+                per_prompt_csv_val, "val",
+            )
+
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    # ── Test cached, no special flags, but val still needs (re)generating ──
+    elif need_val_gen:
+        if not steering_pt.exists():
+            logger.error(
+                f"Val generation needs cached steering vectors at {steering_pt}, "
+                "which are missing. Pass --force_recompute to rebuild Phase 0, "
+                "or remove the val set to skip val analysis."
+            )
+            sys.exit(1)
+
+        logger.warning(f"Loading tokenizer + model: {args.model_name}")
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name, model_max_length=1024)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = "right"
+
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_name,
+            torch_dtype=torch.bfloat16 if args.use_bf16 else None,
+            device_map=device,
+        )
+        model.eval()
+        pad_id = tokenizer.pad_token_id
+        eos_ids = get_eos_ids(tokenizer)
+        prefix_length = get_prefix_length(tokenizer) if args.model_name in CHAT_MODELS else 1
+
+        blob = torch.load(steering_pt, map_location=device)
+        layers = [int(l) for l in blob["layers"] if int(l) in layers_req]
+        steering_vecs = {int(l): blob["steering_vecs"][str(l)].to(device) for l in layers}
+        mu_poss       = {int(l): blob["mu_poss"][str(l)].to(device)       for l in layers}
+        mu_negs       = {int(l): blob["mu_negs"][str(l)].to(device)       for l in layers}
+        logger.warning(f"Loaded steering tensors for {len(layers)} layers (val-gen-only)")
+
+        val_items = []
+        for idx, item in enumerate(val_data):
+            q = item["question"]
+            val_items.append({
+                "prompt_idx":  idx,
+                "question":    q,
+                "prompt_ids":  build_open_ended_prompt_ids(tokenizer, q),
+            })
+        per_prompt_df_val = run_phase_ab_and_judge(
+            model, tokenizer, val_items, layers, nzero_factors,
+            steering_vecs, mu_poss, mu_negs, eos_ids, device, pad_id,
+            args.batch_size, args.max_new_tokens, prefix_length, args.diffmean_mode,
+            args.behavior, args.judge_model, args.max_concurrent, args.skip_judge,
+            per_prompt_csv_val, "val",
+        )
+
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     # ── Analysis ──────────────────────────────────────────────────────────
     layers_present = sorted(per_prompt_df["layer"].unique().astype(int))
@@ -2115,6 +2462,45 @@ def main():
             "n_layers": int(r["n_layers"]),
         })
 
+    # ── Val-chosen α → test performance (α picked without peeking at test) ──
+    val_layer_df = None
+    dprime_val_alpha_df = None
+    if per_prompt_df_val is not None:
+        per_prompt_df_val = per_prompt_df_val[per_prompt_df_val["layer"].isin(layers)].copy()
+        val_layer_df = compute_per_layer_summary(
+            per_prompt_df_val, layers, nzero_factors_csv, dprimes,
+            args.behavior, args.fluency_threshold, args.min_examples,
+        )
+        val_layer_df.to_csv(out_dir / "per_layer_summary_val.csv", index=False)
+
+        val_selection_df = select_val_alpha_with_fallback(val_layer_df, layer_df, nzero_factors_csv)
+        val_selection_df.to_csv(out_dir / "val_alpha_selection.csv", index=False)
+
+        dprime_val_alpha_points = build_dprime_val_alpha_points(
+            val_selection_df, layer_df, dprimes, args.behavior)
+        dprime_val_alpha_points.to_csv(out_dir / "dprime_val_alpha_points.csv", index=False)
+
+        dprime_val_alpha_df = compute_dprime_val_alpha_corr(dprime_val_alpha_points, args.behavior)
+        dprime_val_alpha_df.to_csv(out_dir / "dprime_val_alpha_corr.csv", index=False)
+
+        _val_alpha_target_labels = {
+            "test_match_rate_at_chosen":   "match_rate @ val-chosen α (test)",
+            "test_avg_behavior_at_chosen": "avg score @ val-chosen α (test)",
+            "test_sign_mcc_at_chosen":     "sign κ MCC @ val-chosen α (test)",
+        }
+        for _, r in dprime_val_alpha_df.iterrows():
+            cross_rows.append({
+                "predictor": "d'",
+                "target": _val_alpha_target_labels.get(r["target"], r["target"]),
+                "pearson_r": float(r["pearson_r"]) if pd.notna(r["pearson_r"]) else float("nan"),
+                "pearson_p": float(r["pearson_p"]) if pd.notna(r["pearson_p"]) else float("nan"),
+                "spearman_rho": float(r["spearman_rho"]) if pd.notna(r["spearman_rho"]) else float("nan"),
+                "spearman_p": float(r["spearman_p"]) if pd.notna(r["spearman_p"]) else float("nan"),
+                "n_layers": int(r["n_layers"]),
+            })
+    else:
+        logger.warning("No val results available — skipping val-α cross-layer correlations.")
+
     cross_df = pd.DataFrame(cross_rows)
     cross_df.to_csv(out_dir / "cross_layer_corr.csv", index=False)
     if not cross_df.empty:
@@ -2139,6 +2525,19 @@ def main():
             f"(p={r['pearson_p']:.3g})  ρ={r['spearman_rho']:+.3f}  n={int(r['n_layers'])}"
         )
 
+    if dprime_val_alpha_df is not None:
+        logger.warning(
+            "\nd' vs test performance @ val-chosen α "
+            "(α picked on val, n_filt≥28; fallback to next-best val α if test n_filt<28):"
+        )
+        for _, r in dprime_val_alpha_df.iterrows():
+            rr = r["pearson_r"]
+            rr_s = f"{rr:+.3f}" if np.isfinite(rr) else "NaN"
+            logger.warning(
+                f"  dprime → {r['target']:28s}: r={rr_s} "
+                f"(p={r['pearson_p']:.3g})  ρ={r['spearman_rho']:+.3f}  n={int(r['n_layers'])}"
+            )
+
     # ── Summary JSON ──────────────────────────────────────────────────────
     summary = {
         "behavior":    args.behavior,
@@ -2146,6 +2545,10 @@ def main():
         "layers":      list(map(int, layer_df["layer"].values)),
         "all_factors": all_factors,
         "nzero_factors": nzero_factors_csv,
+        "n_val_prompts": len(val_data) if val_data is not None else 0,
+        "dprime_val_alpha_corr": (
+            dprime_val_alpha_df.to_dict(orient="records") if dprime_val_alpha_df is not None else []
+        ),
         "fluency_threshold": args.fluency_threshold,
         "score_threshold":   BEHAVIOR_THRESHOLDS[args.behavior],
         "n_train_pairs":  len(train_data),

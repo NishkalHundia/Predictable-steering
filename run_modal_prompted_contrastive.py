@@ -7,8 +7,13 @@ for different behaviors.
     MODAL_PROFILE=nishkalhundia modal run --detach run_modal_prompted_contrastive.py \\
         --behavior hallucination
 
+    # Backfill only a val set (same size as test) for a behavior whose
+    # train/test were already generated, without touching those files:
+    MODAL_PROFILE=nishkalhundia modal run --detach run_modal_prompted_contrastive.py \\
+        --behavior hallucination --val-only
+
 Outputs:
-    /vol/prompted_datasets/generated/<behavior>/{train,test}_contrastive.json
+    /vol/prompted_datasets/generated/<behavior>/{train,test,val}_contrastive.json
     /vol/prompted_datasets/generated/<behavior>/meta.json
 """
 import os
@@ -92,11 +97,11 @@ def _normalize_hf_token():
     timeout=86400,
     secrets=SECRETS,
 )
-def run_one(behavior: str) -> tuple[str, str]:
+def run_one(behavior: str, val_only: bool = False) -> tuple[str, str]:
     """Generate prompted contrastive data for one behavior on its own GPU."""
     _normalize_hf_token()
     output_dir = f"{OUTPUT_ROOT}/{behavior}"
-    print(f"\n=== START {behavior} → {output_dir} ===", flush=True)
+    print(f"\n=== START {behavior} → {output_dir} (val_only={val_only}) ===", flush=True)
 
     cmd = [
         "uv", "run", "python",
@@ -113,6 +118,8 @@ def run_one(behavior: str) -> tuple[str, str]:
     ]
     if GREEDY:
         cmd.append("--greedy")
+    if val_only:
+        cmd.append("--val_only")
 
     print("Running:", " ".join(cmd), flush=True)
     try:
@@ -132,13 +139,13 @@ def run_one(behavior: str) -> tuple[str, str]:
 
 
 @app.local_entrypoint()
-def main(behavior: str):
+def main(behavior: str, val_only: bool = False):
     if behavior not in ALLOWED_BEHAVIORS:
         raise SystemExit(
             f"Unknown behavior {behavior!r}; choose from {ALLOWED_BEHAVIORS}"
         )
-    fc = run_one.spawn(behavior)
-    print(f"Spawned run_one({behavior}) call id={fc.object_id}")
+    fc = run_one.spawn(behavior, val_only)
+    print(f"Spawned run_one({behavior}, val_only={val_only}) call id={fc.object_id}")
     print(f"prompt_mode={PROMPT_MODE}, greedy={GREEDY}, model={MODEL_NAME}")
     print("Running detached in Modal cloud. Safe to disconnect.")
     print(f"Results → {OUTPUT_ROOT}/{behavior}/")

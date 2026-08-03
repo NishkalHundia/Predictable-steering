@@ -73,10 +73,11 @@ assert MIN_EXAMPLES == "28"
 
 
 def _paths(behavior):
-    train = f"/vol/expanded_datasets/generated/{behavior}/train_contrastive.json"
-    test = f"/vol/expanded_datasets/generated/{behavior}/test_contrastive.json"
+    train = f"/vol/prompted_datasets/generated/{behavior}/train_contrastive.json"
+    test = f"/vol/prompted_datasets/generated/{behavior}/test_contrastive.json"
+    val = f"/vol/prompted_datasets/generated/{behavior}/val_contrastive.json"
     output_dir = f"{OUTPUT_ROOT}/{behavior}"
-    return train, test, output_dir
+    return train, test, val, output_dir
 
 
 def _normalize_hf_token():
@@ -110,10 +111,10 @@ def _normalize_hf_token():
     secrets=SECRETS,
     max_containers=len(BEHAVIORS),
 )
-def run_one(behavior: str) -> tuple[str, str]:
+def run_one(behavior: str, val_only: bool = False) -> tuple[str, str]:
     _normalize_hf_token()
-    train_path, test_path, output_dir = _paths(behavior)
-    verb = "REPLOT" if REPLOT_ONLY else "START"
+    train_path, test_path, val_path, output_dir = _paths(behavior)
+    verb = "VAL-ONLY" if val_only else ("REPLOT" if REPLOT_ONLY else "START")
     print(f"\n=== {verb} cue DiffMean {behavior} → {output_dir} ===", flush=True)
     print(
         f"  batch={BATCH_SIZE}  fluency>={FLUENCY_THRESHOLD}  "
@@ -121,9 +122,12 @@ def run_one(behavior: str) -> tuple[str, str]:
         flush=True,
     )
 
-    if FORCE_RECOMPUTE:
+    # --val_only reuses cached Phase 0 + test — never wipe those caches for it.
+    force_recompute = FORCE_RECOMPUTE and not val_only
+    if force_recompute:
         for fname in ("steering_state.pt", "dprime.json",
-                      "train_projections.json", "per_prompt_results.csv"):
+                      "train_projections.json", "per_prompt_results.csv",
+                      "per_prompt_results_val.csv"):
             p = os.path.join(output_dir, fname)
             if os.path.exists(p):
                 os.remove(p)
@@ -135,6 +139,7 @@ def run_one(behavior: str) -> tuple[str, str]:
         "--behavior", behavior,
         "--train_path", train_path,
         "--test_path", test_path,
+        "--val_path", val_path,
         "--output_dir", output_dir,
         "--layers", LAYERS,
         "--factors", FACTORS,
@@ -142,11 +147,13 @@ def run_one(behavior: str) -> tuple[str, str]:
         "--fluency_threshold", FLUENCY_THRESHOLD,
         "--min_examples", MIN_EXAMPLES,
     ]
-    if REPLOT_ONLY:
+    if val_only:
+        cmd += ["--val_only", "--hist_layers", HIST_LAYERS]
+    elif REPLOT_ONLY:
         cmd += ["--replot_only", "--hist_layers", HIST_LAYERS]
     else:
         cmd += ["--hist_layers", HIST_LAYERS]
-    if FORCE_RECOMPUTE:
+    if force_recompute:
         cmd.append("--force_recompute")
     print("Running:", " ".join(cmd), flush=True)
     try:
@@ -189,7 +196,7 @@ def main():
     print(f"Spawned run_sweep (orchestrator) call id={fc.object_id}")
     print(f"Fans out {len(BEHAVIORS)} parallel {kind} workers (cue DiffMean, 1 GPU each).")
     print(f"batch={BATCH_SIZE}, fluency>={FLUENCY_THRESHOLD}, min_examples={MIN_EXAMPLES}")
-    print(f"data=/vol/expanded_datasets/generated/<behavior>/")
+    print(f"data=/vol/prompted_datasets/generated/<behavior>/")
     if REPLOT_ONLY:
         print(f"Replot only — redraws plots (histograms for layers {HIST_LAYERS}).")
     print("Running detached in Modal cloud. Safe to disconnect.")
