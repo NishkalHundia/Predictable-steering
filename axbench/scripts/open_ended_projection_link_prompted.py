@@ -48,11 +48,20 @@ from openai import AsyncOpenAI
 from scipy import stats as scipy_stats
 from sklearn.metrics import matthews_corrcoef
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer
 
 from pyvene import IntervenableConfig, IntervenableModel
 from axbench.models.interventions import AdditionIntervention
 from axbench.utils.constants import CHAT_MODELS
+from axbench.utils.lm_access import (
+    apply_chat_template,
+    clamp_layers,
+    get_decoder_layers,
+    get_decoder_module,
+    get_hidden_size,
+    load_causal_lm,
+    pyvene_layer_component,
+)
 from axbench.utils.model_utils import get_prefix_length
 
 import logging
@@ -255,23 +264,57 @@ def supports_chat_template(tok) -> bool:
 def build_open_ended_prompt_ids(tokenizer, question: str) -> list[int]:
     """Token IDs for the generation prompt (user turn + assistant header)."""
     if supports_chat_template(tokenizer):
-        return tokenizer.apply_chat_template(
+        return apply_chat_template(
+            tokenizer,
             [{"role": "user", "content": question}],
             tokenize=True, add_generation_prompt=True,
         )
     return tokenizer.encode(question + "\n\nAnswer:")
 
 
-def build_prompted_diffmean_ids(tokenizer, question: str) -> tuple[list[int], int]:
+def _think_open_ids(tokenizer) -> list[int]:
+    ids = tokenizer.encode("<think>", add_special_tokens=False)
+    return [int(x) for x in ids]
+
+
+def last_index_before_think(ids: list[int], think_ids: list[int]) -> int | None:
+    """Index of the token immediately before the last `<think>` span, or None."""
+    if not ids or not think_ids or len(ids) < len(think_ids) + 1:
+        return None
+    n, k = len(ids), len(think_ids)
+    for i in range(n - k, -1, -1):
+        if ids[i:i + k] == think_ids:
+            return i - 1 if i > 0 else None
+    return None
+
+
+def build_prompted_diffmean_ids(
+    tokenizer, question: str, cue_site: str = "last_prompt",
+) -> tuple[list[int], int]:
     """
     Prompt-only sequence for cue DiffMean: behavior cue + question (+ chat
-    assistant header). Returns (ids, last_token_position). No answer is
-    teacher-forced — the activation site is the last prompt token (cue+Q),
-    which is *not* the postgen response κ site used in Phase A/B.
+    assistant header). Returns (ids, readout_position). No answer is
+    teacher-forced.
+
+    cue_site:
+      last_prompt — last token of the generation prompt (Qwen thinking-off:
+                    usually `</think>` / trailing newlines).
+      pre_think   — token immediately before `<think>` (Qwen assistant header,
+                    the Gemma analogue).
     """
     prompt_ids = build_open_ended_prompt_ids(tokenizer, question)
     assert prompt_ids, "build_prompted_diffmean_ids: empty prompt"
-    return prompt_ids, len(prompt_ids) - 1
+    if cue_site == "last_prompt":
+        return prompt_ids, len(prompt_ids) - 1
+    if cue_site != "pre_think":
+        raise ValueError(f"unknown cue_site={cue_site!r}")
+    pos = last_index_before_think(prompt_ids, _think_open_ids(tokenizer))
+    if pos is None:
+        raise ValueError(
+            "cue_site=pre_think: no `<think>` span in the generation prompt; "
+            "cannot take the token before think-open"
+        )
+    return prompt_ids, pos
 
 
 def pad_batch(token_lists, pad_id, device, pad_side="right"):
@@ -386,14 +429,15 @@ def forward_capture_hiddens_at_positions(model, input_ids, attention_mask, layer
     float32}.
     """
     storage = {}
+    layers_mod = get_decoder_layers(model)
     handles = [
-        model.model.layers[l].register_forward_hook(
+        layers_mod[l].register_forward_hook(
             make_capture_hook(storage, l), always_call=True
         )
         for l in layers
     ]
     try:
-        _ = model.model(input_ids=input_ids, attention_mask=attention_mask)
+        _ = get_decoder_module(model)(input_ids=input_ids, attention_mask=attention_mask)
     finally:
         for h in handles:
             h.remove()
@@ -514,31 +558,45 @@ class AsyncJudge:
 # ---------------------------------------------------------------------------
 @torch.no_grad()
 def train_diffmean(model, tokenizer, train_data: list, layers: list, device, batch_size: int,
-                    behavior: str):
+                    behavior: str, cue_site: str = "last_prompt"):
     """
     Cue DiffMean: do *not* teacher-force answers. For each train question,
     build cue+question prompts (matching vs not-matching prefixes from
-    BEHAVIOR_PROMPT_PREFIXES) and take the last token of that prompt
-    (user turn + assistant header). Labels come from which cue is used.
-    Test-time generation is unaffected.
+    BEHAVIOR_PROMPT_PREFIXES) and take a single prompt token. Labels come
+    from which cue is used. Test-time generation is unaffected.
     Returns (steering_vecs, mu_poss, mu_negs, dprimes, train_projections).
     """
     assert behavior in BEHAVIOR_PROMPT_PREFIXES, (
         f"no cue DiffMean prefixes for behavior={behavior!r}"
     )
     pad_id = tokenizer.pad_token_id
+    site_label = (
+        "token before <think>" if cue_site == "pre_think"
+        else "cue+question last token"
+    )
 
-    # Prompt-only: last token of (behavior cue + question + gen prompt).
     train_flat = []
     for item in train_data:
         for label in (1, 0):
             question = apply_behavior_prompt_prefix(
                 item["question"], behavior, matching=(label == 1),
             )
-            full_ids, position = build_prompted_diffmean_ids(tokenizer, question)
+            full_ids, position = build_prompted_diffmean_ids(
+                tokenizer, question, cue_site=cue_site,
+            )
             train_flat.append({
                 "full_ids": full_ids, "position": position, "label": label,
             })
+    example = train_flat[0]
+    lo = max(0, example["position"] - 3)
+    hi = min(len(example["full_ids"]), example["position"] + 4)
+    ctx = [tokenizer.decode([t]) for t in example["full_ids"][lo:hi]]
+    logger.warning(
+        f"Phase 0 cue_site={cue_site}  readout={site_label}  "
+        f"pos={example['position']}/{len(example['full_ids'])}  "
+        f"around_site={ctx!r}  "
+        f"token={tokenizer.decode([example['full_ids'][example['position']]])!r}"
+    )
 
     pos_acts = {l: [] for l in layers}
     neg_acts = {l: [] for l in layers}
@@ -588,7 +646,7 @@ def train_diffmean(model, tokenizer, train_data: list, layers: list, device, bat
         train_projs[l] = {"pos": pp.tolist(), "neg": np_.tolist()}
         logger.warning(
             f"  L{l:2d}: d'={dprimes[l]:.3f}  ||v||={float(v.norm()):.3f}  "
-            f"(κ site=cue+question last token; ≠ postgen response site)"
+            f"(κ site={site_label}; ≠ postgen response site)"
         )
 
     del pos_acts, neg_acts
@@ -604,7 +662,7 @@ class SteeringModel:
         self.tokenizer = tokenizer
         self.device    = device
 
-        dim = model.config.hidden_size
+        dim = get_hidden_size(model)
         self.ax = AdditionIntervention(embed_dim=dim, low_rank_dimension=1)
         sv = steering_vector.unsqueeze(0) if steering_vector.dim() == 1 else steering_vector
         self.ax.proj.weight.data = sv.to(device)
@@ -617,7 +675,7 @@ class SteeringModel:
         self.layer = layer
         cfg = IntervenableConfig(representations=[{
             "layer": layer,
-            "component": f"model.layers[{layer}].output",
+            "component": pyvene_layer_component(self.model, layer),
             "low_rank_dimension": 1,
             "intervention": self.ax,
         }])
@@ -766,14 +824,15 @@ def postgen_kappa_batch(
 
     # One forward: capture full residuals, then index last vs mean span.
     storage = {}
+    layers_mod = get_decoder_layers(model)
     handles = [
-        model.model.layers[l].register_forward_hook(
+        layers_mod[l].register_forward_hook(
             make_capture_hook(storage, l), always_call=True
         )
         for l in layers
     ]
     try:
-        _ = model.model(input_ids=ids_batch, attention_mask=mask_batch)
+        _ = get_decoder_module(model)(input_ids=ids_batch, attention_mask=mask_batch)
     finally:
         for h in handles:
             h.remove()
@@ -1358,6 +1417,38 @@ def compute_dprime_best_alpha_corr(layer_df: pd.DataFrame, behavior: str):
 # ---------------------------------------------------------------------------
 # Plots
 # ---------------------------------------------------------------------------
+# Plasma-ordered colors matching the paper legend (α=1…10); baseline / d' fixed.
+_FACTOR_CMAP = plt.get_cmap("plasma")
+_BASELINE_COLOR = "gray"
+_DPRIME_COLOR = "steelblue"
+_BEST_ALPHA_COLOR = "black"
+# Match replot_mcqa_projection_plots.py default --font-scale (1.2 * 1.75).
+_PAPER_FONT_SCALE = 2.1
+_FS_AXIS = round(11 * _PAPER_FONT_SCALE, 2)  # 23.1  (steering / score / MCC dual-axis)
+_FS_TICK = round(10 * _PAPER_FONT_SCALE, 2)  # 21.0
+_AXIS_LABELPAD = round(10 + 2 * _PAPER_FONT_SCALE, 1)  # 14.2
+# Hist bases match replot hist_postgen (title 10, axes 9, ticks 10; pipeline suptitle 12).
+_FS_HIST_TITLE = round(10 * _PAPER_FONT_SCALE, 2)  # 21.0
+_FS_HIST_AXIS = round(9 * _PAPER_FONT_SCALE, 2)    # 18.9
+_FS_HIST_SUP = round(12 * _PAPER_FONT_SCALE, 2)     # 25.2
+
+
+def _factor_color(f: float, non_zero_factors: list[float]) -> str:
+    """Color for steering factor α; baseline is gray, else plasma by rank."""
+    if abs(f) < 1e-9:
+        return _BASELINE_COLOR
+    nz = [x for x in non_zero_factors if abs(x) > 1e-9]
+    if not nz:
+        return _BASELINE_COLOR
+    # Rank among the non-zero factors actually being plotted
+    try:
+        i = sorted(nz).index(float(f))
+    except ValueError:
+        i = 0
+    rgba = _FACTOR_CMAP(i / max(1, len(nz) - 1))
+    return matplotlib.colors.to_hex(rgba)
+
+
 def plot_mcc_vs_dprime(
     layer_df: pd.DataFrame,
     behavior: str,
@@ -1388,7 +1479,7 @@ def plot_mcc_vs_dprime(
         ax2.fill_between(layers, layer_df["dprime"].values, alpha=0.12, color="steelblue")
         ax2.plot(layers, layer_df["dprime"].values, "s:", color="steelblue",
                  linewidth=1.5, markersize=5, label="d' (train)", zorder=2)
-        ax2.set_ylabel("d'  (training discriminability)", fontsize=11, color="steelblue")
+        ax2.set_ylabel("d' (train)", fontsize=11, color="steelblue")
         ax2.tick_params(axis="y", labelcolor="steelblue")
         ax2.set_ylim(bottom=0)
 
@@ -1401,47 +1492,139 @@ def plot_mcc_vs_dprime(
     plt.close()
 
 
+def select_val_best_alpha_by_avg_score(
+    out_dir: Path,
+    non_zero_factors: list[float] | None = None,
+) -> dict[int, float]:
+    """Per-layer α* = argmax_α val avg behavior score; rewrite val_alpha_selection.csv.
+
+    Reads `per_layer_summary_val.csv`, picks the steered α with highest
+    `avg_steered_behavior_{α}` (finite only), writes
+    `val_alpha_selection.csv` with columns:
+      layer, n_val_candidates, chosen_alpha, val_avg_behavior_at_chosen,
+      val_match_rate_at_chosen (informational).
+
+    Returns {layer: val_avg_behavior_at_chosen} for the black dotted plot line.
+    """
+    val_sum = out_dir / "per_layer_summary_val.csv"
+    if not val_sum.exists():
+        return {}
+    df = pd.read_csv(val_sum)
+    if "layer" not in df.columns:
+        return {}
+
+    if non_zero_factors is None:
+        alphas = sorted({
+            float(c[len("avg_steered_behavior_"):])
+            for c in df.columns
+            if c.startswith("avg_steered_behavior_")
+        })
+    else:
+        alphas = [float(a) for a in non_zero_factors if abs(float(a)) > 1e-9]
+
+    rows = []
+    score_by_layer: dict[int, float] = {}
+    for _, r in df.iterrows():
+        lyr = int(r["layer"])
+        best_a, best_scr = float("nan"), float("nan")
+        n_cand = 0
+        for a in alphas:
+            col = f"avg_steered_behavior_{a:g}"
+            if col not in df.columns:
+                continue
+            scr = r[col]
+            if scr is None or (isinstance(scr, float) and np.isnan(scr)):
+                continue
+            n_cand += 1
+            scr = float(scr)
+            if np.isnan(best_scr) or scr > best_scr:
+                best_scr, best_a = scr, float(a)
+        mr = float("nan")
+        if np.isfinite(best_a):
+            mr_col = f"match_rate_{best_a:g}"
+            if mr_col in df.columns and pd.notna(r.get(mr_col)):
+                mr = float(r[mr_col])
+            score_by_layer[lyr] = best_scr
+        rows.append({
+            "layer": lyr,
+            "n_val_candidates": n_cand,
+            "chosen_alpha": best_a if np.isfinite(best_a) else float("nan"),
+            "val_avg_behavior_at_chosen": best_scr if np.isfinite(best_scr) else float("nan"),
+            "val_match_rate_at_chosen": mr,
+            "selection_criterion": "argmax_val_avg_behavior",
+        })
+
+    if rows:
+        pd.DataFrame(rows).sort_values("layer").to_csv(
+            out_dir / "val_alpha_selection.csv", index=False,
+        )
+        logger.warning(
+            f"Wrote val_alpha_selection.csv (α* = argmax val avg behavior) → {out_dir}"
+        )
+    return score_by_layer
+
+
 def plot_steering_score_and_dprime(
     layer_df: pd.DataFrame,
     non_zero_factors: list[float],
     behavior: str,
     out_path: Path,
 ):
-    """Average behavior score per factor + d' on dual axes."""
+    """Average behavior score per factor + d' on dual axes (paper style: no legend).
+
+    Coefficient colors follow the plasma legend (α=0 gray dashed diamond; α>0
+    solid circles; d' steelblue dotted squares).
+    """
     layers = layer_df["layer"].values
     fig, ax1 = plt.subplots(figsize=(13, 5))
 
-    cmap = plt.get_cmap("plasma")
-    all_factors = [0.0] + [f for f in non_zero_factors if f != 0]
-    for i, f in enumerate(all_factors):
+    # TEMP one-time replot hack: sycophancy judge was 0–10 but should display as 0–5.
+    # Remove after this replot. Does NOT touch CSVs / metrics — plot-only.
+    rescale_syc = behavior == "sycophancy"
+    score_scale = 0.5 if rescale_syc else 1.0
+
+    nz = [f for f in non_zero_factors if f != 0]
+    all_factors = [0.0] + nz
+    for f in all_factors:
         col = "avg_behavior_score_0" if f == 0 else f"avg_steered_behavior_{f:g}"
         if col not in layer_df.columns:
             continue
-        color = "gray" if f == 0 else cmap(i / max(1, len(all_factors) - 1))
-        ls    = "--" if f == 0 else "-"
-        ax1.plot(layers, layer_df[col].values, "o" + ls, color=color,
-                 linewidth=2, markersize=5, label=f"α={f:g}" if f != 0 else "Baseline (α=0)")
+        y = layer_df[col].to_numpy(dtype=float) * score_scale
+        color = _factor_color(f, nz)
+        if f == 0:
+            ax1.plot(
+                layers, y, "D--", color=color,
+                linewidth=1.5, markersize=6, alpha=0.85, zorder=3,
+            )
+        else:
+            ax1.plot(
+                layers, y, "o-", color=color,
+                linewidth=2, markersize=5, zorder=3,
+            )
 
-    scale_min, scale_max, ref = BEHAVIOR_SCALES.get(behavior, (0, 10, 5))
+    if rescale_syc:
+        scale_min, scale_max, ref = 0.0, 5.0, 2.5
+    else:
+        scale_min, scale_max, ref = BEHAVIOR_SCALES.get(behavior, (0, 10, 5))
     if ref is not None:
         ax1.axhline(ref, color="gray", linestyle=":", alpha=0.4, linewidth=0.9)
     ax1.set_ylim(scale_min - 0.5, scale_max + 0.5)
-    ax1.set_xlabel("Layer", fontsize=11)
-    ax1.set_ylabel("Avg behavior score", fontsize=11)
+    ax1.set_xlabel("Layer", fontsize=_FS_AXIS, labelpad=_AXIS_LABELPAD)
+    ax1.set_ylabel("Avg behavior score", fontsize=_FS_AXIS, labelpad=_AXIS_LABELPAD)
     ax1.set_xticks(layers)
+    ax1.tick_params(axis="both", labelsize=_FS_TICK)
 
     ax2 = ax1.twinx()
     if "dprime" in layer_df.columns and layer_df["dprime"].notna().any():
-        ax2.fill_between(layers, layer_df["dprime"].values, alpha=0.12, color="steelblue")
-        ax2.plot(layers, layer_df["dprime"].values, "s:", color="steelblue",
-                 linewidth=1.5, markersize=5, label="d'", zorder=2)
-        ax2.set_ylabel("d'  (training discriminability)", fontsize=11, color="steelblue")
-        ax2.tick_params(axis="y", labelcolor="steelblue")
+        ax2.fill_between(layers, layer_df["dprime"].values, alpha=0.12, color=_DPRIME_COLOR)
+        ax2.plot(
+            layers, layer_df["dprime"].values, "s:", color=_DPRIME_COLOR,
+            linewidth=1.5, markersize=5, zorder=2,
+        )
+        ax2.set_ylabel("d' (train)", fontsize=_FS_AXIS, color=_DPRIME_COLOR, labelpad=_AXIS_LABELPAD)
+        ax2.tick_params(axis="y", labelcolor=_DPRIME_COLOR, labelsize=_FS_TICK)
         ax2.set_ylim(bottom=0)
 
-    h1, l1 = ax1.get_legend_handles_labels()
-    h2, l2 = ax2.get_legend_handles_labels()
-    ax1.legend(h1 + h2, l1 + l2, fontsize=9, loc="best", framealpha=0.85)
     ax1.set_title(
         f"{behavior}: Avg behavior score & d' by layer (open-ended)",
         fontsize=11, fontweight="bold",
@@ -1457,31 +1640,28 @@ def plot_match_rate_by_layer(
     behavior: str,
     out_path: str,
 ):
-    """Behavior match rate (fraction of fluent prompts scoring above threshold)
-    by layer, one line per steering factor, unsteered baseline dashed. Same shape
-    as the MCQA greedy-accuracy-by-layer plot but for open-ended LM-judged match."""
+    """Behavior match rate by layer (paper style: no legend, plasma α colors)."""
     layers = layer_df["layer"].values
     fig, ax = plt.subplots(figsize=(13, 5))
+    nz = [f for f in non_zero_factors if abs(f) > 1e-9]
     ax.plot(
         layers, layer_df.get("match_rate_0", pd.Series(dtype=float)).values,
-        "D--", color="gray", linewidth=1.5, markersize=6,
-        label="Baseline (α=0)", alpha=0.85, zorder=3,
+        "D--", color=_BASELINE_COLOR, linewidth=1.5, markersize=6,
+        alpha=0.85, zorder=3,
     )
-    cmap = plt.get_cmap("plasma")
-    non_zero = [f for f in non_zero_factors if abs(f) > 1e-9]
-    for i, f in enumerate(non_zero):
+    for f in nz:
         col = f"match_rate_{f:g}"
         if col not in layer_df.columns:
             continue
-        color = cmap(i / max(1, len(non_zero) - 1))
-        ax.plot(layers, layer_df[col].values, "o-", color=color,
-                linewidth=2, markersize=5, label=f"α={f:g}", zorder=3)
+        ax.plot(
+            layers, layer_df[col].values, "o-", color=_factor_color(f, nz),
+            linewidth=2, markersize=5, zorder=3,
+        )
     ax.set_xlabel("Layer", fontsize=11)
     ax.set_ylabel("Behavior match rate (fraction of prompts)", fontsize=11)
     ax.set_ylim(0, 1.05)
     ax.set_xticks(layers)
     ax.grid(True, alpha=0.3)
-    ax.legend(title="Steering factor", fontsize=9, loc="best", framealpha=0.85)
     ax.set_title(
         f"{behavior}: Behavior match rate by layer\n"
         f"score > {BEHAVIOR_THRESHOLDS[behavior]:g} (LM judge); fluency-filtered",
@@ -1498,45 +1678,63 @@ def plot_match_rate_and_dprime(
     behavior: str,
     out_path: str,
 ):
-    """Behavior match rate per steering factor + training d' on a twin axis, by
-    layer — the 'match rate vs d'' view (does high d' predict a big steered lift)."""
+    """Behavior match rate per steering factor + training d' (paper style: no legend).
+
+    Same plasma colors as the α legend image; black dotted envelope = per-layer
+    best match rate (argmax_α match_rate) — the series correlated against d'.
+    """
     layers = layer_df["layer"].values
     fig, ax1 = plt.subplots(figsize=(13, 5))
+    nz = [f for f in non_zero_factors if abs(f) > 1e-9]
     ax1.plot(
         layers, layer_df.get("match_rate_0", pd.Series(dtype=float)).values,
-        "D--", color="gray", linewidth=1.5, markersize=6,
-        label="Baseline (α=0)", alpha=0.85, zorder=3,
+        "D--", color=_BASELINE_COLOR, linewidth=1.5, markersize=6,
+        alpha=0.85, zorder=3,
     )
-    cmap = plt.get_cmap("plasma")
-    non_zero = [f for f in non_zero_factors if abs(f) > 1e-9]
-    for i, f in enumerate(non_zero):
+    rate_cols = []
+    for f in nz:
         col = f"match_rate_{f:g}"
         if col not in layer_df.columns:
             continue
-        color = cmap(i / max(1, len(non_zero) - 1))
-        ax1.plot(layers, layer_df[col].values, "o-", color=color,
-                 linewidth=2, markersize=5, label=f"α={f:g}", zorder=3)
-    ax1.set_xlabel("Layer", fontsize=11)
-    ax1.set_ylabel("Behavior match rate (fraction of prompts)", fontsize=11)
+        ax1.plot(
+            layers, layer_df[col].values, "o-", color=_factor_color(f, nz),
+            linewidth=2, markersize=5, zorder=3,
+        )
+        rate_cols.append(col)
+
+    # Best α per layer (upper envelope / correlation target)
+    if "best_match_rate" in layer_df.columns and layer_df["best_match_rate"].notna().any():
+        best = layer_df["best_match_rate"].to_numpy(dtype=float)
+    elif rate_cols:
+        best = np.nanmax(layer_df[rate_cols].to_numpy(dtype=float), axis=1)
+    else:
+        best = None
+    if best is not None:
+        ax1.plot(
+            layers, best, ":", color=_BEST_ALPHA_COLOR,
+            linewidth=2.2, zorder=5,
+        )
+
+    ax1.set_xlabel("Layer", fontsize=_FS_AXIS, labelpad=_AXIS_LABELPAD)
+    ax1.set_ylabel("Behavior match rate (fraction of prompts)", fontsize=_FS_AXIS, labelpad=_AXIS_LABELPAD)
     ax1.set_ylim(0, 1.05)
     ax1.set_xticks(layers)
+    ax1.tick_params(axis="both", labelsize=_FS_TICK)
 
     ax2 = ax1.twinx()
     if layer_df["dprime"].notna().any():
-        ax2.fill_between(layers, layer_df["dprime"].values, alpha=0.12, color="steelblue")
-        ax2.plot(layers, layer_df["dprime"].values, "s:", color="steelblue",
-                 linewidth=1.5, markersize=5, label="d' (train)", zorder=2)
-        ax2.set_ylabel("d'  (training discriminability)", fontsize=11, color="steelblue")
-        ax2.tick_params(axis="y", labelcolor="steelblue")
+        ax2.fill_between(layers, layer_df["dprime"].values, alpha=0.12, color=_DPRIME_COLOR)
+        ax2.plot(
+            layers, layer_df["dprime"].values, "s:", color=_DPRIME_COLOR,
+            linewidth=1.5, markersize=5, zorder=2,
+        )
+        ax2.set_ylabel("d' (train)", fontsize=_FS_AXIS, color=_DPRIME_COLOR, labelpad=_AXIS_LABELPAD)
+        ax2.tick_params(axis="y", labelcolor=_DPRIME_COLOR, labelsize=_FS_TICK)
         ax2.set_ylim(bottom=0)
 
-    h1, l1 = ax1.get_legend_handles_labels()
-    h2, l2 = ax2.get_legend_handles_labels()
-    ax1.legend(h1 + h2, l1 + l2, title="Steering factor / metric", fontsize=9,
-               loc="best", framealpha=0.85)
     ax1.set_title(
         f"{behavior}: Behavior match rate & training d' by layer (open-ended)",
-        fontsize=11, fontweight="bold",
+        fontsize=_FS_AXIS, fontweight="bold",
     )
     plt.tight_layout()
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
@@ -1573,8 +1771,13 @@ def plot_projection_histograms_oe(
 
     ncols = 4
     nrows = (n_panels + ncols - 1) // ncols
-    fig, axes = plt.subplots(nrows, ncols, figsize=(16, 4 * nrows))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(18, 5 * nrows))
     axes_flat = axes.flatten()
+
+    # Same scaled fonts as replot_mcqa_projection_plots hist_postgen; no in-panel legends.
+    title_fs, label_fs, tick_fs, sup_fs = (
+        _FS_HIST_TITLE, _FS_HIST_AXIS, _FS_TICK, _FS_HIST_SUP,
+    )
 
     # ---- Train panel (cue+question last token; ≠ postgen response site) ----
     tp = train_projections.get(layer, {})
@@ -1587,17 +1790,17 @@ def plot_projection_histograms_oe(
         bins  = np.linspace(all_t.min() - pad, all_t.max() + pad, 25)
         if len(neg_proj):
             train_ax.hist(neg_proj, bins=bins, color="#d62728", alpha=0.55,
-                          edgecolor="#a01010", linewidth=0.5, label="Non-matching")
+                          edgecolor="#a01010", linewidth=0.5)
         if len(pos_proj):
             train_ax.hist(pos_proj, bins=bins, color="#1f77b4", alpha=0.55,
-                          edgecolor="#104e8b", linewidth=0.5, label="Matching")
+                          edgecolor="#104e8b", linewidth=0.5)
         lo, hi = bins[0], bins[-1]
         if lo <= 0 <= hi:
             train_ax.axvline(0, color="black", linestyle="--", linewidth=0.9, alpha=0.5)
-    train_ax.set_title("Train (cue+question)", fontsize=10, fontweight="bold")
-    train_ax.set_xlabel("κ (cue+Q last tok)", fontsize=9)
-    train_ax.set_ylabel("# examples", fontsize=9)
-    train_ax.legend(fontsize=7)
+    train_ax.set_title("Train (cue + question)", fontsize=title_fs, fontweight="bold")
+    train_ax.set_xlabel("κ (cue + question last tok)", fontsize=label_fs)
+    train_ax.set_ylabel("# prompts", fontsize=label_fs)
+    train_ax.tick_params(axis="both", labelsize=tick_fs)
 
     # ---- Factor panels ----
     for panel_i, alpha in enumerate(all_factors):
@@ -1647,31 +1850,31 @@ def plot_projection_histograms_oe(
 
         if len(k_unk):
             ax.hist(k_unk,   bins=bins, color="#aaaaaa", alpha=0.5,
-                    edgecolor="#888888", linewidth=0.5, label="Unknown")
+                    edgecolor="#888888", linewidth=0.5)
         if len(k_below):
             ax.hist(k_below, bins=bins, color="#d62728", alpha=0.55,
-                    edgecolor="#a01010", linewidth=0.5, label="Below threshold")
+                    edgecolor="#a01010", linewidth=0.5)
         if len(k_above):
             ax.hist(k_above, bins=bins, color="#1f77b4", alpha=0.55,
-                    edgecolor="#104e8b", linewidth=0.5, label="Above threshold")
+                    edgecolor="#104e8b", linewidth=0.5)
 
         lo, hi = bins[0], bins[-1]
         if lo <= 0 <= hi:
             ax.axvline(0, color="black", linestyle="--", linewidth=0.9, alpha=0.5)
 
-        ax.set_title(f"α={alpha:g} (postgen)", fontsize=10, fontweight="bold")
-        ax.set_xlabel(f"κ_postgen ({kappa_site_label})", fontsize=9)
-        if panel_i == 0:
-            ax.set_ylabel("# prompts", fontsize=9)
-            ax.legend(fontsize=7)
+        ax.set_title(f"α={alpha:g}", fontsize=title_fs, fontweight="bold")
+        ax.set_xlabel(f"κ_postgen ({kappa_site_label})", fontsize=label_fs)
+        ax.tick_params(axis="both", labelsize=tick_fs)
+        # if panel_i == 0:
+        #     ax.set_ylabel("# prompts", fontsize=label_fs)
 
     for ax in axes_flat[1 + n_factor_panels:]:
         ax.set_visible(False)
 
     fig.suptitle(
-        f"{behavior} — Layer {layer}: Train=cue+Q last tok; α=postgen "
+        f"{behavior} — Layer {layer}: Train=cue + question last tok; α=postgen "
         f"{kappa_site_label} (fluency≥{fluency_threshold})",
-        fontsize=11, fontweight="bold",
+        fontsize=sup_fs, fontweight="bold",
     )
     plt.tight_layout()
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
@@ -1989,6 +2192,15 @@ def main():
     parser.add_argument("--hist_layers", default=None,
                         help="Comma-separated layers for projection histograms "
                              "(default: first, middle, last)")
+    parser.add_argument(
+        "--cue_site", default="last_prompt", choices=["last_prompt", "pre_think"],
+        help="Phase-0 DiffMean readout: last generation-prompt token "
+             "(last_prompt) or the token immediately before `<think>` (pre_think).",
+    )
+    parser.add_argument(
+        "--phase0_only", action="store_true",
+        help="Fit and save cue DiffMean vectors / d' then exit (no generate/judge).",
+    )
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -2021,10 +2233,28 @@ def main():
     train_proj_json = out_dir / "train_projections.json"
     steering_pt    = out_dir / "steering_state.pt"
 
-    with open(train_path) as f:
-        train_data = json.load(f)
-    with open(test_path) as f:
-        test_data = json.load(f)
+    # --replot_only / --rejudge_only only need the cached CSV (+ d'/train proj);
+    # train/test JSONs are optional metadata for summary counts.
+    if args.replot_only or args.rejudge_only:
+        train_data, test_data = [], []
+        if train_path.exists():
+            with open(train_path) as f:
+                train_data = json.load(f)
+        else:
+            logger.warning(f"replot/rejudge: missing {train_path} (ok; n_train=0)")
+        if test_path.exists():
+            with open(test_path) as f:
+                test_data = json.load(f)
+        else:
+            logger.warning(f"replot/rejudge: missing {test_path} (ok; n_test=0)")
+    else:
+        with open(train_path) as f:
+            train_data = json.load(f)
+        if args.phase0_only and not test_path.exists():
+            test_data = []
+        else:
+            with open(test_path) as f:
+                test_data = json.load(f)
     logger.warning(f"Train: {len(train_data)} pairs  |  Test: {len(test_data)} examples")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -2090,15 +2320,19 @@ def main():
             tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = "right"
 
-        model = AutoModelForCausalLM.from_pretrained(
+        model = load_causal_lm(
             args.model_name,
             torch_dtype=torch.bfloat16 if args.use_bf16 else None,
             device_map=device,
+            probe_pyvene_layer=layers_req[0],
         )
+        layers_req = clamp_layers(layers_req, model)
         model.eval()
         pad_id = tokenizer.pad_token_id
         eos_ids = get_eos_ids(tokenizer)
-        prefix_length = get_prefix_length(tokenizer) if args.model_name in CHAT_MODELS else 1
+        prefix_length = get_prefix_length(tokenizer) if (
+            args.model_name in CHAT_MODELS or supports_chat_template(tokenizer)
+        ) else 1
 
         # ── Phase 0 ────────────────────────────────────────────────────
         need_phase0 = (not dprimes) or (not train_projs) or (not steering_pt.exists())
@@ -2106,8 +2340,8 @@ def main():
 
         if need_phase0:
             logger.warning(
-                "=== Phase 0: cue DiffMean @ cue+question last token "
-                "(≠ Phase A/B postgen response κ site) ==="
+                f"=== Phase 0: cue DiffMean @ {args.cue_site} "
+                f"(≠ Phase A/B postgen response κ site) ==="
             )
             if args.behavior not in BEHAVIOR_PROMPT_PREFIXES:
                 logger.error(
@@ -2118,6 +2352,7 @@ def main():
             steering_vecs, mu_poss, mu_negs, dprimes, train_projs = train_diffmean(
                 model, tokenizer, train_data, layers_req, device, args.batch_size,
                 behavior=args.behavior,
+                cue_site=args.cue_site,
             )
             layers = [l for l in layers_req if l in steering_vecs]
 
@@ -2128,13 +2363,36 @@ def main():
                 "mu_poss":           {str(l): mu_poss[l].float().cpu()       for l in layers},
                 "mu_negs":           {str(l): mu_negs[l].float().cpu()       for l in layers},
                 "prompted_diffmean": True,
-                "diffmean_mode":     "cue_last_token",
+                "diffmean_mode":     f"cue_{args.cue_site}",
+                "cue_site":          args.cue_site,
             }, steering_pt)
             with open(dprime_json, "w") as f:
                 json.dump({str(l): v for l, v in dprimes.items()}, f, indent=2)
             with open(train_proj_json, "w") as f:
                 json.dump({str(l): v for l, v in train_projs.items()}, f)
+            q0 = apply_behavior_prompt_prefix(
+                train_data[0]["question"], args.behavior, matching=True,
+            )
+            ids0, pos0 = build_prompted_diffmean_ids(
+                tokenizer, q0, cue_site=args.cue_site,
+            )
+            lo, hi = max(0, pos0 - 3), min(len(ids0), pos0 + 4)
+            with open(out_dir / "cue_site.json", "w") as f:
+                json.dump({
+                    "cue_site": args.cue_site,
+                    "position": pos0,
+                    "n_tokens": len(ids0),
+                    "token": tokenizer.decode([ids0[pos0]]),
+                    "around": [tokenizer.decode([t]) for t in ids0[lo:hi]],
+                    "tail": tokenizer.decode(ids0[max(0, len(ids0) - 16):]),
+                }, f, indent=2)
             logger.warning(f"Saved steering tensors / d' / train projections → {out_dir}")
+            if args.phase0_only:
+                logger.warning(
+                    f"=== --phase0_only done  cue_site={args.cue_site}  "
+                    f"layers={len(layers)}  → {out_dir} ==="
+                )
+                return
         else:
             blob = torch.load(steering_pt, map_location=device)
             layers = [int(l) for l in blob["layers"] if int(l) in layers_req]

@@ -1,18 +1,18 @@
 """
-Self-contained Modal runner for avg_token open-ended projection-link sweep.
+Self-contained Modal runner for the vanilla open-ended projection-link sweep.
 
-Calls open_ended_projection_link.py with --diffmean_mode avg_token:
-  Phase 0: mean over response tokens → DiffMean
-  Phase B: inject steering on all generated tokens (prefix_length onward)
-  Post-gen κ: mean over all generated content tokens
+Calls open_ended_projection_link.py with --diffmean_mode last_token:
+  Phase 0: last response token → DiffMean
+  Phase B: inject steering on generated tokens (prefix_length onward)
+  Post-gen κ: last generated content token
 
 Uses prompted_datasets (Gemma-cued pos/neg answers).
-Outputs: /vol/open_ended_projection_average/<behavior>
+Outputs: /vol/open_ended_projection_last_token/<behavior>
 
-    MODAL_PROFILE=nishkalhundia modal run --detach run_modal_avg_sweep.py
+    MODAL_PROFILE=nishkalhundia modal run --detach modal_runs/run_modal_sweep.py
 
 Monitor:
-    MODAL_PROFILE=nishkalhundia modal app logs steering-avg-sweep
+    MODAL_PROFILE=nishkalhundia modal app logs steering-last-sweep
     MODAL_PROFILE=nishkalhundia modal app list
 """
 import os
@@ -20,7 +20,7 @@ import subprocess
 
 import modal
 
-app = modal.App("steering-avg-sweep")
+app = modal.App("steering-last-sweep")
 
 vol = modal.Volume.from_name("steering")
 
@@ -35,9 +35,7 @@ image = (
         ignore=[
             "datasets", "results", "gemma2_2b_l10_steering", "paper_plots",
             ".git", ".venv", "__pycache__", "*.pyc", "*.png", "wandb",
-            "run_modal_sweep.py", "run_modal_avg_sweep.py",
-            "run_modal_prompted_sweep.py", "run_modal_sleep.py",
-            "run_modal_prompted_contrastive.py",
+            "modal_runs",
         ],
     )
     .run_commands("cd /root/axbench && uv sync --frozen")
@@ -50,6 +48,7 @@ SECRETS = [
 
 BEHAVIORS = [
     "myopic-reward",
+    "sycophancy",
     "hallucination",
     "survival-instinct",
     "corrigible-neutral-HHH",
@@ -57,9 +56,9 @@ BEHAVIORS = [
 
 LAYERS = "10-32"
 FACTORS = "0,1,2,3,5,10"
-DIFFMEAN_MODE = "avg_token"
-FORCE_RECOMPUTE = True
-REPLOT_ONLY = False
+DIFFMEAN_MODE = "last_token"
+FORCE_RECOMPUTE = False
+REPLOT_ONLY = True
 HIST_LAYERS = ",".join(str(l) for l in range(10, 33))
 BATCH_SIZE = "32"
 FLUENCY_THRESHOLD = "1.0"
@@ -68,7 +67,7 @@ MIN_EXAMPLES = "28"
 assert not (REPLOT_ONLY and FORCE_RECOMPUTE), \
     "REPLOT_ONLY needs the cached CSV — set FORCE_RECOMPUTE = False."
 
-OUTPUT_ROOT = "/vol/open_ended_projection_average"
+OUTPUT_ROOT = "/vol/open_ended_projection_last_token"
 
 
 def _paths(behavior):
@@ -188,6 +187,6 @@ def main():
     if REPLOT_ONLY:
         print(f"Replot only — redraws plots (histograms for layers {HIST_LAYERS}).")
     print("Running detached in Modal cloud. Safe to disconnect.")
-    print("Watch:  MODAL_PROFILE=nishkalhundia modal app logs steering-avg-sweep")
+    print("Watch:  MODAL_PROFILE=nishkalhundia modal app logs steering-last-sweep")
     print(f"Results land under {OUTPUT_ROOT}/<behavior> for:")
     print("  " + ", ".join(BEHAVIORS))

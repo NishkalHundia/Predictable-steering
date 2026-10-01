@@ -1,24 +1,26 @@
 """
-Self-contained Modal runner for the cue DiffMean open-ended projection-link sweep.
+Self-contained Modal runner for avg_token open-ended projection-link sweep.
 
-Calls open_ended_projection_link_prompted.py (cue+question last-token DiffMean;
-no response teacher-forcing in Phase 0).
-Outputs: /vol/open_ended_projection_link_prompted/<behavior>
+Calls open_ended_projection_link.py with --diffmean_mode avg_token:
+  Phase 0: mean over response tokens → DiffMean
+  Phase B: inject steering on all generated tokens (prefix_length onward)
+  Post-gen κ: mean over all generated content tokens
 
-    MODAL_PROFILE=nishkalhundia modal run --detach run_modal_prompted_sweep.py
+Uses prompted_datasets (Gemma-cued pos/neg answers).
+Outputs: /vol/open_ended_projection_average/<behavior>
+
+    MODAL_PROFILE=nishkalhundia modal run --detach modal_runs/run_modal_avg_sweep.py
 
 Monitor:
-    MODAL_PROFILE=nishkalhundia modal app logs steering-prompted-sweep
+    MODAL_PROFILE=nishkalhundia modal app logs steering-avg-sweep
     MODAL_PROFILE=nishkalhundia modal app list
-
-For vanilla DiffMean, use run_modal_sweep.py instead.
 """
 import os
 import subprocess
 
 import modal
 
-app = modal.App("steering-prompted-sweep")
+app = modal.App("steering-avg-sweep")
 
 vol = modal.Volume.from_name("steering")
 
@@ -33,7 +35,7 @@ image = (
         ignore=[
             "datasets", "results", "gemma2_2b_l10_steering", "paper_plots",
             ".git", ".venv", "__pycache__", "*.pyc", "*.png", "wandb",
-            "run_modal_sweep.py", "run_modal_prompted_sweep.py", "run_modal_sleep.py",
+            "modal_runs",
         ],
     )
     .run_commands("cd /root/axbench && uv sync --frozen")
@@ -54,27 +56,23 @@ BEHAVIORS = [
 
 LAYERS = "10-32"
 FACTORS = "0,1,2,3,5,10"
-FORCE_RECOMPUTE = True  # dual last/avg κ + new prompted_datasets
-REPLOT_ONLY = False
+DIFFMEAN_MODE = "avg_token"
+FORCE_RECOMPUTE = False  # keep cached CSV for replot
+REPLOT_ONLY = True
 HIST_LAYERS = ",".join(str(l) for l in range(10, 33))
+BATCH_SIZE = "32"
+FLUENCY_THRESHOLD = "1.0"
+MIN_EXAMPLES = "28"
 
 assert not (REPLOT_ONLY and FORCE_RECOMPUTE), \
     "REPLOT_ONLY needs the cached CSV — set FORCE_RECOMPUTE = False."
 
-OUTPUT_ROOT = "/vol/open_ended_projection_link_prompted"
-BATCH_SIZE = "32"
-FLUENCY_THRESHOLD = "1.0"   # keep prompts with fluency >= 1 (AxBench)
-MIN_EXAMPLES = "28"          # require ≥28 fluent labelled prompts for valid MCC
-
-assert len(BEHAVIORS) == 5, BEHAVIORS
-assert BATCH_SIZE == "32"
-assert FLUENCY_THRESHOLD == "1.0"
-assert MIN_EXAMPLES == "28"
+OUTPUT_ROOT = "/vol/open_ended_projection_average"
 
 
 def _paths(behavior):
-    train = f"/vol/expanded_datasets/generated/{behavior}/train_contrastive.json"
-    test = f"/vol/expanded_datasets/generated/{behavior}/test_contrastive.json"
+    train = f"/vol/prompted_datasets/generated/{behavior}/train_contrastive.json"
+    test = f"/vol/prompted_datasets/generated/{behavior}/test_contrastive.json"
     output_dir = f"{OUTPUT_ROOT}/{behavior}"
     return train, test, output_dir
 
@@ -114,12 +112,7 @@ def run_one(behavior: str) -> tuple[str, str]:
     _normalize_hf_token()
     train_path, test_path, output_dir = _paths(behavior)
     verb = "REPLOT" if REPLOT_ONLY else "START"
-    print(f"\n=== {verb} cue DiffMean {behavior} → {output_dir} ===", flush=True)
-    print(
-        f"  batch={BATCH_SIZE}  fluency>={FLUENCY_THRESHOLD}  "
-        f"min_examples={MIN_EXAMPLES}  (1 GPU / behavior)",
-        flush=True,
-    )
+    print(f"\n=== {verb} {DIFFMEAN_MODE} {behavior} → {output_dir} ===", flush=True)
 
     if FORCE_RECOMPUTE:
         for fname in ("steering_state.pt", "dprime.json",
@@ -131,21 +124,21 @@ def run_one(behavior: str) -> tuple[str, str]:
 
     cmd = [
         "uv", "run", "python",
-        "axbench/scripts/open_ended_projection_link_prompted.py",
+        "axbench/scripts/open_ended_projection_link.py",
         "--behavior", behavior,
         "--train_path", train_path,
         "--test_path", test_path,
         "--output_dir", output_dir,
         "--layers", LAYERS,
         "--factors", FACTORS,
+        "--diffmean_mode", DIFFMEAN_MODE,
         "--batch_size", BATCH_SIZE,
         "--fluency_threshold", FLUENCY_THRESHOLD,
         "--min_examples", MIN_EXAMPLES,
+        "--hist_layers", HIST_LAYERS,
     ]
     if REPLOT_ONLY:
-        cmd += ["--replot_only", "--hist_layers", HIST_LAYERS]
-    else:
-        cmd += ["--hist_layers", HIST_LAYERS]
+        cmd += ["--replot_only"]
     if FORCE_RECOMPUTE:
         cmd.append("--force_recompute")
     print("Running:", " ".join(cmd), flush=True)
@@ -175,7 +168,7 @@ def run_sweep():
     done   = [b for b, s in results if s == "done"]
     failed = [f"{b}:{s}" for b, s in results if s != "done"]
     print(
-        f"\n=== {'REPLOT' if REPLOT_ONLY else 'PROMPTED SWEEP'} SUMMARY ===\n"
+        f"\n=== {'REPLOT' if REPLOT_ONLY else 'SWEEP'} SUMMARY ===\n"
         f"  done:   {done or '-'}\n"
         f"  failed: {failed or '-'}",
         flush=True,
@@ -187,12 +180,13 @@ def main():
     kind = "CPU replot" if REPLOT_ONLY else "GPU"
     fc = run_sweep.spawn()
     print(f"Spawned run_sweep (orchestrator) call id={fc.object_id}")
-    print(f"Fans out {len(BEHAVIORS)} parallel {kind} workers (cue DiffMean, 1 GPU each).")
-    print(f"batch={BATCH_SIZE}, fluency>={FLUENCY_THRESHOLD}, min_examples={MIN_EXAMPLES}")
-    print(f"data=/vol/expanded_datasets/generated/<behavior>/")
+    print(f"Fans out {len(BEHAVIORS)} parallel {kind} workers (one per behavior).")
+    print(f"diffmean_mode={DIFFMEAN_MODE}, batch={BATCH_SIZE}, "
+          f"fluency>={FLUENCY_THRESHOLD}, min_examples={MIN_EXAMPLES}")
+    print(f"data=/vol/prompted_datasets/generated/<behavior>/")
     if REPLOT_ONLY:
         print(f"Replot only — redraws plots (histograms for layers {HIST_LAYERS}).")
     print("Running detached in Modal cloud. Safe to disconnect.")
-    print("Watch:  MODAL_PROFILE=nishkalhundia modal app logs steering-prompted-sweep")
+    print("Watch:  MODAL_PROFILE=nishkalhundia modal app logs steering-avg-sweep")
     print(f"Results land under {OUTPUT_ROOT}/<behavior> for:")
     print("  " + ", ".join(BEHAVIORS))

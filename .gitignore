@@ -219,7 +219,9 @@ cython_debug/
 axbench/scripts/paper/
 .claude 
 
-results/gemma-2-9b-it/correlation_summaries
+
 paper_plots/
 
 plot_data/
+
+results/

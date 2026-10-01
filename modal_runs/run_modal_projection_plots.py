@@ -12,12 +12,12 @@ eval/eval_results.parquet, projection_analysis/{centroids,train_projections}.csv
 — is already on disk; this job does NOT re-run the sweep or re-derive train
 statistics, it only forward-passes the existing steered generations to get κ.
 
-Unlike run_modal_sweep.py (which processed behaviors sequentially inside one
+Unlike modal_runs/run_modal_sweep.py (which processed behaviors sequentially inside one
 container), this spins up ONE container per behavior so all 4 run in parallel.
 
 Run it detached so it survives your laptop sleeping/closing:
 
-    modal run --detach run_modal_projection_plots.py
+    modal run --detach modal_runs/run_modal_projection_plots.py
 
 Monitor (read-only, no new container):
     modal app logs open-ended-projection-plots
@@ -33,7 +33,7 @@ app = modal.App("open-ended-projection-plots")
 # Datasets + outputs live on the "steering" volume, mounted at /vol.
 vol = modal.Volume.from_name("steering")
 
-# Bake code + deps into the image (same recipe as run_modal_sweep.py).
+# Bake code + deps into the image (same recipe as modal_runs/run_modal_sweep.py).
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("git")
@@ -45,8 +45,7 @@ image = (
         ignore=[
             "datasets", "results", "gemma2_2b_l10_steering", "paper_plots",
             ".git", ".venv", "__pycache__", "*.pyc", "*.png", "wandb",
-            "run_modal_sweep.py", "run_modal_sleep.py",
-            "run_modal_projection_plots.py",
+            "modal_runs",
         ],
     )
     .run_commands("cd /root/axbench && uv sync --frozen")
@@ -102,7 +101,7 @@ def run_behavior(behavior: str):
     else:
         print(f"[{behavior}] WARNING: no HF token found — gated model load will 401", flush=True)
 
-    # Reuse the model weights already cached on the volume by run_modal_sweep.py.
+    # Reuse the model weights already cached on the volume by modal_runs/run_modal_sweep.py.
     os.environ.setdefault("HF_HOME", "/vol/hf_cache")
 
     sweep_dir, out_dir = _paths(behavior)

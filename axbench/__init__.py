@@ -33,12 +33,17 @@ from .models.concept_lora import *
 from .models.concept_reft import *
 from .models.preference_vector import *
 from .models.concept_vector import *
-from .models.hypersteer import *
 
-from .models.hypernet.configuration_hypernet import *
-from .models.hypernet.layers import *
-from .models.hypernet.modeling_hypernet import *
-from .models.hypernet.utils import *
+# Hypersteer pulls a Gemma2 private attention helper that was removed in
+# transformers 5.x. Keep the rest of the package importable on Qwen3.5 runs.
+try:
+    from .models.hypersteer import *
+    from .models.hypernet.configuration_hypernet import *
+    from .models.hypernet.layers import *
+    from .models.hypernet.modeling_hypernet import *
+    from .models.hypernet.utils import *
+except ImportError:
+    pass
 
 from .scripts.args.eval_args import *
 from .scripts.args.training_args import *

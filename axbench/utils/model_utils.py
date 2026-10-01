@@ -114,11 +114,12 @@ def calculate_l1_losses(latent, non_topk_latent, labels=None, mask=None):
 
 
 def get_prefix_length(tokenizer, common_prefix=None):
+    from axbench.utils.lm_access import apply_chat_template
     if common_prefix is None:
         message_a = [{"role": "user", "content": "1"}]
         message_b = [{"role": "user", "content": "2"}]
-        tokens_a = tokenizer.apply_chat_template(message_a, tokenize=True)
-        tokens_b = tokenizer.apply_chat_template(message_b, tokenize=True)
+        tokens_a = apply_chat_template(tokenizer, message_a, tokenize=True)
+        tokens_b = apply_chat_template(tokenizer, message_b, tokenize=True)
         print("Detecting sequence a:", tokens_a)
         print("Detecting sequence b:", tokens_b)
         prefix_length = 0
@@ -128,17 +129,18 @@ def get_prefix_length(tokenizer, common_prefix=None):
                 break
     else:
         message = [{"role": "user", "content": common_prefix}]
-        tokens = tokenizer.apply_chat_template(
-            message, tokenize=True, add_generation_prompt=True)
+        tokens = apply_chat_template(
+            tokenizer, message, tokenize=True, add_generation_prompt=True)
         prefix_length = len(tokens)
     return prefix_length
 
 
 def get_suffix_length(tokenizer):
+    from axbench.utils.lm_access import apply_chat_template
     message_a = [{"role": "user", "content": "1"}]
     message_b = [{"role": "user", "content": "2"}]
-    tokens_a = tokenizer.apply_chat_template(message_a, tokenize=True)
-    tokens_b = tokenizer.apply_chat_template(message_b, tokenize=True)
+    tokens_a = apply_chat_template(tokenizer, message_a, tokenize=True)
+    tokens_b = apply_chat_template(tokenizer, message_b, tokenize=True)
     suffix_length = 0
     for i, (ta, tb) in enumerate(zip(reversed(tokens_a), reversed(tokens_b))):
         if ta != tb:

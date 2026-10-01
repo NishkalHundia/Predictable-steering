@@ -26,7 +26,9 @@ import torch
 import random
 from pathlib import Path
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer
+
+from axbench.utils.lm_access import apply_chat_template, load_causal_lm
 
 import logging
 logging.basicConfig(
@@ -89,8 +91,8 @@ def format_prompt(
 
     if prompt_mode == "prefix":
         messages = [{"role": "user", "content": f"{cue} {question}"}]
-        return tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
+        return apply_chat_template(
+            tokenizer, messages, tokenize=False, add_generation_prompt=True
         )
 
     # system mode — try true system role, else prefix into user content
@@ -99,15 +101,15 @@ def format_prompt(
         {"role": "user", "content": question},
     ]
     try:
-        return tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
+        return apply_chat_template(
+            tokenizer, messages, tokenize=False, add_generation_prompt=True
         )
     except Exception as e:
         if "System role not supported" not in str(e):
             raise
         messages = [{"role": "user", "content": f"{cue} {question}"}]
-        return tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
+        return apply_chat_template(
+            tokenizer, messages, tokenize=False, add_generation_prompt=True
         )
 
 
@@ -159,7 +161,10 @@ def generate_completions(
         for i, output in enumerate(outputs):
             input_length = inputs.input_ids[i].shape[0]
             completion = tokenizer.decode(output[input_length:], skip_special_tokens=True)
-            all_completions.append(completion.strip())
+            completion = re.sub(
+                r"<think>.*?</think>", "", completion, flags=re.DOTALL
+            ).strip()
+            all_completions.append(completion)
 
     return all_completions
 
@@ -339,7 +344,7 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
 
     logger.warning(f"Loading model {args.model_name}...")
-    model = AutoModelForCausalLM.from_pretrained(
+    model = load_causal_lm(
         args.model_name,
         torch_dtype=torch.bfloat16 if args.use_bf16 else None,
         device_map=device,

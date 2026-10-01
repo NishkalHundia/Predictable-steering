@@ -4,7 +4,7 @@ Modal runner for create_prompted_open_ended_contrastive.py.
 One behavior per run, one A100 GPU. Launch multiple detached runs in parallel
 for different behaviors.
 
-    MODAL_PROFILE=nishkalhundia modal run --detach run_modal_prompted_contrastive.py \\
+    MODAL_PROFILE=nishkalhundia modal run --detach modal_runs/run_modal_prompted_contrastive.py \\
         --behavior hallucination
 
 Outputs:
@@ -31,9 +31,7 @@ image = (
         ignore=[
             "datasets", "results", "gemma2_2b_l10_steering", "paper_plots",
             ".git", ".venv", "__pycache__", "*.pyc", "*.png", "wandb",
-            "run_modal_sweep.py", "run_modal_sleep.py",
-            "run_modal_projection_plots.py",
-            "run_modal_prompted_contrastive.py",
+            "modal_runs",
         ],
     )
     .add_local_dir("datasets/test", "/root/axbench/datasets/test", copy=True)

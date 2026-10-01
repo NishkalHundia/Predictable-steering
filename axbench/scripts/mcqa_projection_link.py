@@ -68,9 +68,17 @@ import torch
 from scipy import stats as scipy_stats
 from sklearn.metrics import matthews_corrcoef
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer
 
 from axbench.utils.constants import CHAT_MODELS
+from axbench.utils.lm_access import (
+    apply_chat_template,
+    clamp_layers,
+    get_decoder_layers,
+    get_decoder_module,
+    is_qwen35,
+    load_causal_lm,
+)
 from axbench.utils.model_utils import get_prefix_length
 
 import logging
@@ -115,6 +123,24 @@ def supports_chat_template(tok) -> bool:
     return getattr(tok, "chat_template", None) not in (None, "")
 
 
+def _append_answer_to_prompt(tokenizer, prompt_ids, cand: str) -> list:
+    """Teacher-force `cand` onto the generation prompt (same tokens generate() sees)."""
+    answer_ids = list(tokenizer.encode(cand, add_special_tokens=False))
+    full_ids = list(prompt_ids) + answer_ids
+    eos_id = getattr(tokenizer, "eos_token_id", None)
+    if eos_id is not None and (not full_ids or full_ids[-1] != eos_id):
+        full_ids = full_ids + [int(eos_id)]
+    return full_ids
+
+
+def _find_letter_pos(tokenizer, full_ids, prompt_ids, answer_letter: str):
+    lo = max(len(prompt_ids) - 1, 0)
+    for i in range(len(full_ids) - 1, lo, -1):
+        if tokenizer.decode([full_ids[i]]).strip() == answer_letter:
+            return i
+    return None
+
+
 def build_full_ids(tokenizer, question: str, answer_letter: str):
     """
     Returns (prompt_ids, full_ids, open_paren_pos) where open_paren_pos is the
@@ -123,25 +149,34 @@ def build_full_ids(tokenizer, question: str, answer_letter: str):
     """
     cand = f" ({answer_letter})"
     if supports_chat_template(tokenizer):
-        prompt_ids = tokenizer.apply_chat_template(
+        prompt_ids = list(apply_chat_template(
+            tokenizer,
             [{"role": "user", "content": question}],
             tokenize=True, add_generation_prompt=True,
-        )
-        full_ids = tokenizer.apply_chat_template(
-            [{"role": "user", "content": question},
-             {"role": "assistant", "content": cand}],
-            tokenize=True, add_generation_prompt=False,
-        )
+        ))
+        # Qwen3.5 thinking-off ends the generation prompt with empty
+        # <think></think>. The completed-turn template then fuses assistant
+        # " (A)" into a single '(A' token — no standalone letter / '(' site,
+        # and OOD vs generate(). Always append encode(" (A)") onto that prefix.
+        if is_qwen35(tokenizer):
+            full_ids = _append_answer_to_prompt(tokenizer, prompt_ids, cand)
+        else:
+            full_ids = list(apply_chat_template(
+                tokenizer,
+                [{"role": "user", "content": question},
+                 {"role": "assistant", "content": cand}],
+                tokenize=True, add_generation_prompt=False,
+            ))
+            if full_ids[:len(prompt_ids)] != prompt_ids:
+                full_ids = _append_answer_to_prompt(tokenizer, prompt_ids, cand)
     else:
         prompt_ids = tokenizer.encode(question)
         full_ids = tokenizer.encode(question + cand)
 
-    # Find '(' position (the token just before the answer letter).
-    letter_pos = None
-    for i in range(len(full_ids) - 1, max(len(prompt_ids) - 1, 0), -1):
-        if tokenizer.decode([full_ids[i]]).strip() == answer_letter:
-            letter_pos = i
-            break
+    letter_pos = _find_letter_pos(tokenizer, full_ids, prompt_ids, answer_letter)
+    if letter_pos is None and supports_chat_template(tokenizer):
+        full_ids = _append_answer_to_prompt(tokenizer, prompt_ids, cand)
+        letter_pos = _find_letter_pos(tokenizer, full_ids, prompt_ids, answer_letter)
     if letter_pos is None:
         raise RuntimeError(f"Cannot find '{answer_letter}' in suffix of full_ids")
     open_paren_pos = letter_pos - 1
@@ -222,14 +257,15 @@ def forward_capture(model, input_ids, attention_mask, layers, open_paren_positio
     Returns: (next_token_ids [B], layer_hiddens {layer: tensor [B,L,H] cpu float32})
     """
     storage = {}
+    layers_mod = get_decoder_layers(model)
     handles = [
-        model.model.layers[l].register_forward_hook(
+        layers_mod[l].register_forward_hook(
             make_capture_hook(storage, l), always_call=True
         )
         for l in layers
     ]
     try:
-        hs = model.model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+        hs = get_decoder_module(model)(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
     finally:
         for h in handles:
             h.remove()
@@ -247,14 +283,15 @@ def forward_capture(model, input_ids, attention_mask, layers, open_paren_positio
 def forward_capture_hiddens_at_positions(model, input_ids, attention_mask, layers, positions):
     """Unsteered forward; for each batch row i, return hidden state at token index positions[i]."""
     storage = {}
+    layers_mod = get_decoder_layers(model)
     handles = [
-        model.model.layers[l].register_forward_hook(
+        layers_mod[l].register_forward_hook(
             make_capture_hook(storage, l), always_call=True
         )
         for l in layers
     ]
     try:
-        _ = model.model(input_ids=input_ids, attention_mask=attention_mask)
+        _ = get_decoder_module(model)(input_ids=input_ids, attention_mask=attention_mask)
     finally:
         for h in handles:
             h.remove()
@@ -267,7 +304,10 @@ def forward_capture_hiddens_at_positions(model, input_ids, attention_mask, layer
 
 
 def batch_kappa_cpu(acts: torch.Tensor, mu_pos: torch.Tensor, mu_neg: torch.Tensor) -> np.ndarray:
-    """Project row-wise activations onto DiffMean line (Braun κ_a). acts, μ: float CPU tensors."""
+    """Project row-wise activations onto DiffMean line (Braun κ_a). All math on CPU."""
+    acts = acts.detach().float().cpu()
+    mu_pos = mu_pos.detach().float().cpu()
+    mu_neg = mu_neg.detach().float().cpu()
     mu = 0.5 * (mu_pos + mu_neg)
     v = mu_pos - mu_neg
     vns = float(v.dot(v).item())
@@ -280,11 +320,11 @@ def batch_kappa_cpu(acts: torch.Tensor, mu_pos: torch.Tensor, mu_neg: torch.Tens
 def forward_steered(model, input_ids, attention_mask, open_paren_positions,
                     layer, sv, factor, prefix_length):
     """Steered forward pass; returns greedy next-token ids at open_paren_positions."""
-    handle = model.model.layers[layer].register_forward_hook(
+    handle = get_decoder_layers(model)[layer].register_forward_hook(
         make_steering_hook(sv, factor, prefix_length), always_call=True
     )
     try:
-        hs = model.model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+        hs = get_decoder_module(model)(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
     finally:
         handle.remove()
 
@@ -399,11 +439,13 @@ def save_steering_state(path: Path, steering_vecs, mu_poss, mu_negs, layers: lis
 
 
 def load_steering_state(path: Path, device):
-    blob = torch.load(path, map_location=device)
+    blob = torch.load(path, map_location="cpu")
     layers = [int(l) for l in blob["layers"]]
+    # Steering vectors go to the model device (hook adds them). Centroids stay
+    # on CPU — κ math uses CPU activations from forward_capture.
     steering_vecs = {int(l): blob["steering_vecs"][str(l)].to(device) for l in layers}
-    mu_poss = {int(l): blob["mu_poss"][str(l)].to(device) for l in layers}
-    mu_negs = {int(l): blob["mu_negs"][str(l)].to(device) for l in layers}
+    mu_poss = {int(l): blob["mu_poss"][str(l)].float().cpu() for l in layers}
+    mu_negs = {int(l): blob["mu_negs"][str(l)].float().cpu() for l in layers}
     return layers, steering_vecs, mu_poss, mu_negs
 
 
@@ -456,7 +498,8 @@ def run_phase_ab_mcqa(
             continue
         try:
             _, full_ids, letter_pos, open_paren_pos = build_full_ids(tokenizer, item["question"], ml)
-        except Exception:
+        except Exception as e:
+            logger.warning(f"[{phase_label}] skip prompt {j}: {e}")
             continue
         flat_items.append({
             "prompt_idx": j,
@@ -503,15 +546,10 @@ def run_phase_ab_mcqa(
 
     kappa_map = {}
     for l in layers:
-        mu_pos, mu_neg = mu_poss[l], mu_negs[l]
-        v = mu_pos - mu_neg
-        v_norm_sq = float(v.dot(v))
-        mu = 0.5 * (mu_pos + mu_neg)
-        for b in flat_items:
-            j = b["prompt_idx"]
-            act = act_at_letter[(j, l)]
-            kappa_map[(l, j)] = float(2.0 * (act - mu).dot(v) / v_norm_sq) \
-                if v_norm_sq > 1e-12 else float("nan")
+        stacked = torch.stack([act_at_letter[(b["prompt_idx"], l)] for b in flat_items])
+        kbatch = batch_kappa_cpu(stacked, mu_poss[l], mu_negs[l])
+        for ii, b in enumerate(flat_items):
+            kappa_map[(l, b["prompt_idx"])] = float(kbatch[ii])
     del act_at_letter
 
     logger.warning(f"\n=== [{phase_label}] Phase A2: Post-gen κ baseline ({n_items} prompts) ===")
@@ -1227,15 +1265,19 @@ def main():
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 
-        prefix_length = get_prefix_length(tokenizer) if args.model_name in CHAT_MODELS else 1
+        prefix_length = get_prefix_length(tokenizer) if (
+            args.model_name in CHAT_MODELS or supports_chat_template(tokenizer)
+        ) else 1
         logger.warning(f"prefix_length = {prefix_length}")
 
         logger.warning(f"Loading model {args.model_name}...")
-        model = AutoModelForCausalLM.from_pretrained(
+        model = load_causal_lm(
             args.model_name,
             torch_dtype=torch.bfloat16 if args.use_bf16 else None,
             device_map=device,
         )
+        layers_req = clamp_layers(layers_req, model)
+        layers = list(layers_req)
         model.eval()
         pad_id = tokenizer.pad_token_id
         B = args.batch_size
@@ -1254,8 +1296,8 @@ def main():
                         letter = extract_letter(answer)
                         _, full_ids, letter_pos, open_paren_pos = build_full_ids(tokenizer, q, letter)
                         train_flat.append({"full_ids": full_ids, "letter_pos": letter_pos, "label": label})
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.warning(f"skip train pair: {e}")
 
             pos_acts = {l: [] for l in layers}
             neg_acts = {l: [] for l in layers}
@@ -1359,7 +1401,7 @@ def main():
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    if per_prompt_df is None:
+    if per_prompt_df is None or per_prompt_df.empty:
         logger.error("No test per-prompt results available.")
         sys.exit(1)
 

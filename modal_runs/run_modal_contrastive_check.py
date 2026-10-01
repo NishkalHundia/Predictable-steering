@@ -13,7 +13,7 @@ Runs on CPU (no GPU bill), uses the openai-secret, and writes per behavior to
 
 Run it detached so it survives your laptop sleeping/closing:
 
-    modal run --detach axbench/scripts/run_modal_contrastive_check.py
+    modal run --detach modal_runs/run_modal_contrastive_check.py
 
 Monitor (read-only, no new container):
     modal app logs contrastive-check
